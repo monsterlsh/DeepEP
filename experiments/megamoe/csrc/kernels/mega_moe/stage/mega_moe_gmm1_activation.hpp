@@ -22,6 +22,7 @@
 #include "tensor_api/tensor.h"
 #include "../epilogue/block_epilogue_activation_mx_quant.hpp"
 #include "../common/mega_moe_gmm_common.hpp"
+#include "../common/mega_moe_a8w8_policy.hpp"
 
 namespace MegaMoeImpl {
 
@@ -189,7 +190,8 @@ __aicore__ inline void Gmm1AicPrefetchMmadGeneric(WorkSet& workSet, const Params
 }
 
 // 非 Prefetch 路径的 AIC 将 GMM1 tile 写入 UB，并维持与 AIV 的 ping-pong 同步。
-template <typename MmadContext, bool IsShared, bool IsGmm1Interleaved, typename WorkSet, typename Config>
+template <typename MmadContext, bool IsShared, bool IsGmm1Interleaved, uint32_t UbTileM, typename WorkSet,
+          typename Config>
 __aicore__ inline void Gmm1AicMmadGeneric(WorkSet& workSet, const GMMAddrInfo& gmmAddrInfo, const Config& config,
                                           uint32_t startLoopIdx, uint32_t tileNum, int32_t& vecSetSyncCom,
                                           uint16_t& pingpongIdx, MmadContext* blockMmadContext)
@@ -201,10 +203,11 @@ __aicore__ inline void Gmm1AicMmadGeneric(WorkSet& workSet, const GMMAddrInfo& g
     using KernelConfig = typename Config::KernelConfig;
     using ElementC = typename KernelConfig::ElementCType;
     using MakeLayoutC = typename KernelConfig::MakeLayoutC;
-    uint32_t ubBufSize = config.tileM == L1_TILE_M_128 ? MAX_SINGLE_MN_ALIGN32_NUM_128 : MAX_SINGLE_MN_ALIGN32_NUM_256;
+    static_assert(UbTileM > 0U && UbTileM <= L1_TILE_M_256, "Invalid GMM1 UB tile height");
+    constexpr uint32_t ubBufSize = UbTileM * L1_TILE_N;
     int64_t ubOffsetFirst = 0;
     int64_t ubOffsetSecond = static_cast<int64_t>(ubBufSize) * sizeof(ElementC);
-    auto ubLayout = MakeLayoutC{}(config.tileM, L1_TILE_N);
+    auto ubLayout = MakeLayoutC{}(UbTileM, L1_TILE_N);
     auto l0cOutUbFirst = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetFirst), ubLayout);
     auto l0cOutUbSecond = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetSecond), ubLayout);
 
@@ -215,34 +218,42 @@ __aicore__ inline void Gmm1AicMmadGeneric(WorkSet& workSet, const GMMAddrInfo& g
         uint32_t mLoc = Get<M_VALUE>(blockCoord);
         uint32_t nLoc = Get<N_VALUE>(blockCoord);
         uint32_t kLoc = Get<K_VALUE>(blockCoord);
-        auto gmBlockA = workSet.gmA.Slice(Te::MakeCoord(mLoc, kLoc),
-                                          Te::MakeShape(Get<M_VALUE>(actualShape), Get<K_VALUE>(actualShape)));
-        auto gmBlockScaleA =
-            workSet.gmScaleA.Slice(Te::MakeCoord(mLoc, 0), Te::MakeShape(Get<M_VALUE>(actualShape), config.scaleK));
         uint32_t waveIdx = mLoc / config.tileM;
         if (waveIdx != lastWaveWaited) {
             WaitForGmm1InputReady<IsShared>(gmmAddrInfo, config, mLoc);
             lastWaveWaited = waveIdx;
         }
-        if constexpr (IsGmm1Interleaved) {
-            if (vecSetSyncCom >= 2) {
-                WaitForVector(pingpongIdx);
+        // Dispatch and the scheduler still operate on M256. Only the paired
+        // AIC/AIV0 transfer is split, keeping both planar BF16 inputs inside UB.
+        const uint32_t tileRows = Get<M_VALUE>(actualShape);
+        for (uint32_t subOffset = 0U; subOffset < tileRows; subOffset += UbTileM) {
+            const uint32_t subRows = Gmm1UbSubtileRows(tileRows, subOffset, UbTileM);
+            auto subShape = actualShape;
+            Get<M_VALUE>(subShape) = subRows;
+            auto gmBlockA = workSet.gmA.Slice(Te::MakeCoord(mLoc + subOffset, kLoc),
+                                              Te::MakeShape(subRows, Get<K_VALUE>(actualShape)));
+            auto gmBlockScaleA =
+                workSet.gmScaleA.Slice(Te::MakeCoord(mLoc + subOffset, 0), Te::MakeShape(subRows, config.scaleK));
+            if constexpr (IsGmm1Interleaved) {
+                if (vecSetSyncCom >= 2) {
+                    WaitForVector(pingpongIdx);
+                }
+            } else if (vecSetSyncCom != 0) {
+                WaitForVector();
             }
-        } else if (vecSetSyncCom != 0) {
-            WaitForVector();
-        }
 
-        Gmm1AicMmadTileToUbGeneric<BlockMmad, IsGmm1Interleaved>(
-            blockMmad, config, workSet.gmB, workSet.gmScaleB, workSet.gmBias, actualShape, nLoc, kLoc, gmBlockA,
-            gmBlockScaleA, l0cOutUbFirst, l0cOutUbSecond, pingpongIdx);
+            Gmm1AicMmadTileToUbGeneric<BlockMmad, IsGmm1Interleaved>(
+                blockMmad, config, workSet.gmB, workSet.gmScaleB, workSet.gmBias, subShape, nLoc, kLoc, gmBlockA,
+                gmBlockScaleA, l0cOutUbFirst, l0cOutUbSecond, pingpongIdx);
 
-        if constexpr (IsGmm1Interleaved) {
-            NotifyVector(pingpongIdx);
-            vecSetSyncCom++;
-            pingpongIdx = 1U - pingpongIdx;
-        } else {
-            NotifyVector();
-            vecSetSyncCom = 1;
+            if constexpr (IsGmm1Interleaved) {
+                NotifyVector(pingpongIdx);
+                vecSetSyncCom++;
+                pingpongIdx = 1U - pingpongIdx;
+            } else {
+                NotifyVector();
+                vecSetSyncCom = 1;
+            }
         }
     }
 }
@@ -423,7 +434,7 @@ __aicore__ inline void Gmm1Aiv0PrefetchEpilogueTileGeneric(const Config& config,
 template <bool IsWaveFlagGrained, typename Config, typename ActivationQuantOp, typename ActualShape>
 __aicore__ inline void Gmm1Aiv0EpilogueTileGeneric(const Config& config, ActivationQuantOp& activationQuantOp,
                                                    const GMMAddrInfo& gmmAddrInfo, const ActualShape& actualShape,
-                                                   uint32_t mLoc, uint32_t nLoc)
+                                                   uint32_t mLoc, uint32_t nLoc, bool completesLogicalTile = true)
 {
     if (Get<M_VALUE>(actualShape) == 0U) {
         return;
@@ -440,7 +451,9 @@ __aicore__ inline void Gmm1Aiv0EpilogueTileGeneric(const Config& config, Activat
         0};
     AscendC::SetCtrlSpr<60, 60>(0);
     activationQuantOp(epilogueShape, epilogueOffset);
-    NotifyGmm2InputReady<IsWaveFlagGrained>(gmmAddrInfo.activationToGmm2Flag, mLoc / L1_TILE_M_256);
+    if (completesLogicalTile) {
+        NotifyGmm2InputReady<IsWaveFlagGrained>(gmmAddrInfo.activationToGmm2Flag, mLoc / L1_TILE_M_256);
+    }
 }
 
 // Prefetch 路径的 AIV1 从 GM 取回 A8W4 GMM1 子 tile，执行 SwiGLU/量化并发布完成状态。
@@ -620,10 +633,20 @@ __aicore__ inline void Gmm1Aiv0EpilogueGeneric(WorkSet& workSet, const GMMAddrIn
             NotifyCube(pingpongIdx);
             pingpongIdx = 1U - pingpongIdx;
         } else {
-            WaitForCube();
-            Gmm1Aiv0EpilogueTileGeneric<IsWaveFlagGrained>(config, activationQuantOp, gmmAddrInfo, actualShape, mLoc,
-                                                           nLoc);
-            NotifyCube();
+            constexpr uint32_t ubTileM = ActivationQuantOp::TILE_M;
+            const uint32_t tileRows = Get<M_VALUE>(actualShape);
+            for (uint32_t subOffset = 0U; subOffset < tileRows; subOffset += ubTileM) {
+                const uint32_t subRows = Gmm1UbSubtileRows(tileRows, subOffset, ubTileM);
+                auto subShape = actualShape;
+                Get<M_VALUE>(subShape) = subRows;
+                WaitForCube();
+                // GMM2 counts logical N tiles per M256 group. Publishing each
+                // half would make it read the second half before it is written.
+                Gmm1Aiv0EpilogueTileGeneric<IsWaveFlagGrained>(config, activationQuantOp, gmmAddrInfo, subShape,
+                                                               mLoc + subOffset, nLoc,
+                                                               IsLastGmm1UbSubtile(tileRows, subOffset, subRows));
+                NotifyCube();
+            }
         }
     }
 }
@@ -680,7 +703,7 @@ __aicore__ inline void Gmm1ExecGeneric(Scheduler& scheduler, const Params& param
                 Gmm1AicPrefetchMmadGeneric<BlockMmadContext<BlockMmad>, IsShared, IsGmm1Interleaved>(
                     workSet, params, gmmAddrInfo, config, startLoopIdx, tileNum, expertIdx, blockMmadContext);
             } else {
-                Gmm1AicMmadGeneric<BlockMmadContext<BlockMmad>, IsShared, IsGmm1Interleaved>(
+                Gmm1AicMmadGeneric<BlockMmadContext<BlockMmad>, IsShared, IsGmm1Interleaved, ActivationQuantOp::TILE_M>(
                     workSet, gmmAddrInfo, config, startLoopIdx, tileNum, vecSetSyncCom, pingpongIdx, blockMmadContext);
             }
         } else {
@@ -689,7 +712,7 @@ __aicore__ inline void Gmm1ExecGeneric(Scheduler& scheduler, const Params& param
                 Gmm1AicPrefetchMmadGeneric<BlockMmadContext<BlockMmad>, IsShared, IsGmm1Interleaved>(
                     workSet, params, gmmAddrInfo, config, startLoopIdx, tileNum, expertIdx, &localBlockMmadContext);
             } else {
-                Gmm1AicMmadGeneric<BlockMmadContext<BlockMmad>, IsShared, IsGmm1Interleaved>(
+                Gmm1AicMmadGeneric<BlockMmadContext<BlockMmad>, IsShared, IsGmm1Interleaved, ActivationQuantOp::TILE_M>(
                     workSet, gmmAddrInfo, config, startLoopIdx, tileNum, vecSetSyncCom, pingpongIdx,
                     &localBlockMmadContext);
             }

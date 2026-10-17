@@ -3,6 +3,7 @@
 
 #include "forward.hpp"
 #include "kernel_launch.hpp"
+#include "send_route_policy.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -12,6 +13,7 @@
 #include "shmem.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
+#include "torch_npu/csrc/core/npu/NPUFormat.h"
 #include "tiling/platform/platform_ascendc.h"
 
 #include "check.hpp"
@@ -85,14 +87,7 @@ MegaMoeSendMaskBufferConfig SendMaskConfig(const MegaMoeTilingData& t, uint32_t 
     const uint64_t aligned = AlignUp(total, uint64_t{256});
     c.routeItemsPerBatch = static_cast<int32_t>(std::min<uint64_t>(aligned, BASE_SEND_ROUTE_ITEMS_PER_BATCH));
     c.routeBatchCount = static_cast<int32_t>(CeilDiv(total, static_cast<uint64_t>(c.routeItemsPerBatch)));
-    auto route_slot_bytes = [&](uint32_t route_items) {
-        // A batch can begin in the middle of a token's top-k segment.  Reserve
-        // one matched index per covered token, including both boundary tokens.
-        const uint64_t matched = CeilDiv<uint64_t>(static_cast<uint64_t>(route_items) + t.topK - 1U, t.topK);
-        const uint64_t valid_index_bytes = AlignUp<uint64_t>(matched * sizeof(int32_t), 32U);
-        return static_cast<uint32_t>(route_items / 8U + valid_index_bytes);
-    };
-    c.bufferBytes = route_slot_bytes(static_cast<uint32_t>(c.routeItemsPerBatch));
+    c.bufferBytes = static_cast<uint32_t>(SendRouteSlotBytes(static_cast<uint32_t>(c.routeItemsPerBatch), t.topK));
     const uint32_t route_bytes = static_cast<uint32_t>(c.routeItemsPerBatch) * 4U;
     const uint32_t without_masks = fixed + 2U * route_bytes;
     const uint32_t budget = ub > without_masks ? ub - without_masks : 0U;
@@ -102,22 +97,13 @@ MegaMoeSendMaskBufferConfig SendMaskConfig(const MegaMoeTilingData& t, uint32_t 
         c.bufferCount = static_cast<int32_t>(pushes);
     }
     c.bufferCount = std::max(c.bufferCount, MIN_SEND_MASK_BUFFER_COUNT);
-    if (static_cast<uint64_t>(c.routeItemsPerBatch) < total) {
-        const uint64_t fixed_with_padding =
-            static_cast<uint64_t>(fixed) + static_cast<uint64_t>(c.bufferCount) * (32U + 2U * sizeof(int32_t));
-        const uint64_t route_budget = ub > fixed_with_padding ? ub - fixed_with_padding : 0U;
-        const uint64_t ring_bits =
-            static_cast<uint64_t>(c.bufferCount) +
-            CeilDiv<uint64_t>(static_cast<uint64_t>(c.bufferCount) * sizeof(int32_t) * 8U, t.topK);
-        uint64_t expanded = route_budget * 8U / (2U * sizeof(int32_t) * 8U + ring_bits);
-        expanded = expanded / 256U * 256U;
-        expanded = std::min<uint64_t>(expanded, aligned);
-        if (expanded > static_cast<uint64_t>(c.routeItemsPerBatch)) {
-            c.routeItemsPerBatch = static_cast<int32_t>(expanded);
-            c.routeBatchCount = static_cast<int32_t>(CeilDiv(total, static_cast<uint64_t>(expanded)));
-            c.bufferBytes = route_slot_bytes(static_cast<uint32_t>(expanded));
-        }
-    }
+    const uint32_t fitted =
+        FitSendRouteBatch(static_cast<uint32_t>(aligned), t.topK, fixed, static_cast<uint32_t>(c.bufferCount), ub);
+    TORCH_CHECK(fitted != 0U, "MegaMoE send-route buffers do not fit UB: need at least ",
+                SendRouteUbBytes(256U, t.topK, fixed, static_cast<uint32_t>(c.bufferCount)), " bytes, got ", ub);
+    c.routeItemsPerBatch = static_cast<int32_t>(fitted);
+    c.routeBatchCount = static_cast<int32_t>(CeilDiv(total, static_cast<uint64_t>(fitted)));
+    c.bufferBytes = static_cast<uint32_t>(SendRouteSlotBytes(fitted, t.topK));
     return c;
 }
 
@@ -283,11 +269,25 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     return t;
 }
 
-void CheckTensor(const torch::Tensor& t, int64_t dims, const char* name)
+enum class TensorLayout { Plain, Weight };
+
+void CheckTensor(const torch::Tensor& t, int64_t dims, const char* name, TensorLayout layout = TensorLayout::Plain)
 {
     TORCH_CHECK(t.defined() && t.device().type() == c10::DeviceType::PrivateUse1, name, " must be an NPU tensor");
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
     TORCH_CHECK(t.dim() == dims, name, " must be ", dims, "D");
+    const int64_t format = at_npu::native::get_npu_format(t);
+    if (layout == TensorLayout::Weight) {
+        const bool packed_fp4 = t.scalar_type() == torch::kUInt8;
+        TORCH_CHECK(packed_fp4 ? (format == 29 || format == 50) : format == ACL_FORMAT_ND, name,
+                    packed_fp4 ? " requires packed FP4 NZ format 29 or 50" : " requires FP8 ND format 2",
+                    "; got format=", format);
+    } else {
+        // NCHW is also linear for contiguous rank<=4 tensors (notably 4D MX
+        // scales). Logical contiguity alone does not reject padded NZ storage.
+        TORCH_CHECK(format == ACL_FORMAT_ND || format == ACL_FORMAT_NCHW, name,
+                    " requires plain ND/NCHW storage (format 2 or 0); got format=", format);
+    }
 }
 
 }  // namespace
@@ -347,8 +347,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     CheckTensor(x, 2, "x");
     CheckTensor(topk_ids, 2, "topk_ids");
     CheckTensor(topk_weights, 2, "topk_weights");
-    CheckTensor(weight1, 3, "weight1");
-    CheckTensor(weight2, 3, "weight2");
+    CheckTensor(weight1, 3, "weight1", TensorLayout::Weight);
+    CheckTensor(weight2, 3, "weight2", TensorLayout::Weight);
     CheckTensor(weight_scales1, 4, "weight_scales1");
     CheckTensor(weight_scales2, 4, "weight_scales2");
     const bool prequantized = x_scales.has_value();
@@ -388,7 +388,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     }
     const int64_t bs = x.size(0), h = x.size(1), topk = topk_ids.size(1);
     const int64_t experts = weight1.size(0), hidden = weight1.size(1);
-    TORCH_CHECK(bs > 0 && h >= 1024 && h <= 8192 && h % 32 == 0, "invalid x shape for A5 MegaMoE");
+    TORCH_CHECK(bs > 0 && h >= 1024 && h <= 8192 && h % 64 == 0, "invalid x shape for A5 MegaMoE");
     TORCH_CHECK(topk >= 1 && topk <= 32 && topk_ids.sizes() == topk_weights.sizes() && topk_ids.size(0) == bs,
                 "top-k tensors must have matching [bs, topk] shapes");
     TORCH_CHECK(hidden >= 512 && hidden <= 8192 && hidden % 256 == 0, "invalid weight1 hiddenDim");
@@ -416,8 +416,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     int64_t shared_experts = 0;
     if (has_shared) {
         TORCH_CHECK(is_a8w4, "shared experts currently require A8W4 weights");
-        CheckTensor(*shared_weight1, 3, "shared_weight1");
-        CheckTensor(*shared_weight2, 3, "shared_weight2");
+        CheckTensor(*shared_weight1, 3, "shared_weight1", TensorLayout::Weight);
+        CheckTensor(*shared_weight2, 3, "shared_weight2", TensorLayout::Weight);
         CheckTensor(*shared_weight_scales1, 4, "shared_weight_scales1");
         CheckTensor(*shared_weight_scales2, 4, "shared_weight_scales2");
         shared_experts = shared_weight1->size(0);

@@ -23,6 +23,7 @@
 #include "mc2_common/mc2_kernel_utils.hpp"
 #include "kernel_operator_list_tensor_intf.h"
 #include "common/mega_moe_types.hpp"
+#include "common/mega_moe_a8w8_policy.hpp"
 #include "common/mega_moe_workspace.hpp"
 #include "common/mega_moe_utils.hpp"
 #include "common/mega_moe_exception_dump_policy.hpp"
@@ -169,7 +170,9 @@ private:
     TokenUnpermuteScratch tokenUnpermuteScratch_;
 
     static constexpr uint32_t GMM1_TILE_M = L1_TILE_M_256;
-    static constexpr uint32_t EPILOGUE_TILE_M = TopkWeightsPrefetch ? L1_TILE_M_128 : L1_TILE_M_256;
+    static constexpr uint32_t EPILOGUE_TILE_M =
+        (TopkWeightsPrefetch || !GMM1_INTERLEAVED) ? A8W8_GMM1_UB_TILE_M : L1_TILE_M_256;
+    static_assert(L1_TILE_N == A8W8_GMM1_UB_TILE_N, "A8W8 UB policy must match the GMM1 tile width");
 
     using BlockEpilogue = BlockEpilogueActivationMxQuant<ActivationType, bfloat16_t, EPILOGUE_TILE_M, L1_TILE_N,
                                                          TopkWeightsPrefetch, GMM1_INTERLEAVED>;
@@ -653,12 +656,14 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTyp
          */
         bool isWholeExpert =
             gmm1Position.tokenIndexInExpert == 0U && static_cast<uint64_t>(waveEndTokenIndexInExpert) == expertRowCount;
+        // Planar GMM1 reloads weights for each M128 UB piece of one logical M256 tile.
+        const bool allowWeightL2Bypass = isWholeExpert && waveRowCount <= EPILOGUE_TILE_M;
         uint32_t waveTokenStartIndex =
             static_cast<uint32_t>(gmm1ExpertState.globalTokenStartIndex) + gmm1Position.tokenIndexInExpert;
         RunGmm1GenericByWeightFormat<QuantOutType, ActivationType, QuantScaleOutType, GMM1_TILE_M, EPILOGUE_TILE_M,
                                      TopkWeightsPrefetch, GMM1_INTERLEAVED, true>(
             gmmExecutionConfig_, params_, epilogueOp_, gmm1AddrInfo, gmm1WaveProblemShape, waveTokenStartIndex,
-            runtimeState, gmm1Position.expertIdx, nullptr, isWholeExpert);
+            runtimeState, gmm1Position.expertIdx, nullptr, allowWeightL2Bypass);
 
         processedMGroupCount += problemMGroupCount;
         gmm1Position.tokenIndexInExpert = waveEndTokenIndexInExpert;

@@ -22,6 +22,8 @@
 #include "mega_moe_gmm_utils.hpp"
 #include "mega_moe_block_scheduler.hpp"
 
+#include "mega_moe_weight_cache_policy.hpp"
+
 namespace MegaMoeImpl {
 
 using namespace AscendC;
@@ -259,7 +261,6 @@ template <bool IsWeightNz, typename MatmulConfig, typename TensorB, typename Ten
 __aicore__ inline void SetWaveWeightL2CacheHint(const typename MatmulConfig::ProblemConfig& config,
                                                 bool coversWholeExpert, TensorB& gmB, TensorScaleB& gmScaleB)
 {
-    constexpr uint64_t cacheLineBytes = 128U;
     // coversWholeExpert 防止跨 Wave 复用；m <= tileM 防止同一 problem 内跨 M tile 复用。
     bool hasNoLaterWeightReuse = coversWholeExpert && config.m <= config.tileM;
 
@@ -274,16 +275,10 @@ __aicore__ inline void SetWaveWeightL2CacheHint(const typename MatmulConfig::Pro
     }
     gmB.SetL2CacheHint(bypassWeightL2 ? Te::CacheMode::CACHE_MODE_DISABLE : Te::CacheMode::CACHE_MODE_NORMAL);
 
-    /*
-     * ScaleBDN 的连续维是 N，每个 logical N 含 C0_SIZE_SCALE 个 scale。这里检查完整 N 行跨度；
-     * tile-N 固定为 256，其 tile 行跨度天然满足 128B 对齐，因此无需再做动态 baseN 检查。
-     */
-    constexpr uint64_t scaleTileNStrideBytes = static_cast<uint64_t>(L1_TILE_N) * MatmulConfig::C0_SIZE_SCALE *
-                                               sizeof(typename MatmulConfig::ElementMxScaleBType);
-    static_assert(scaleTileNStrideBytes % cacheLineBytes == 0U, "ScaleB tile-N stride must be cache-line aligned");
-    uint64_t scaleNStrideBytes = static_cast<uint64_t>(config.n) * MatmulConfig::C0_SIZE_SCALE *
-                                 sizeof(typename MatmulConfig::ElementMxScaleBType);
-    bool bypassScaleL2 = hasNoLaterWeightReuse && scaleNStrideBytes % cacheLineBytes == 0U;
+    // ScaleBDN 的实际存储为 [N, ceil(K/64), 2]；每个 N 行的字节跨度由 K 决定，不能用 N*2。
+    // K256/K512 的 scale 行只有 8/16B，继续使用 L2，避免窗口分段读取时绕过可复用 cache line。
+    bool bypassScaleL2 = CanBypassScaleBDNL2(coversWholeExpert, config.m, config.tileM, config.scaleK,
+                                             sizeof(typename MatmulConfig::ElementMxScaleBType));
     gmScaleB.SetL2CacheHint(bypassScaleL2 ? Te::CacheMode::CACHE_MODE_DISABLE : Te::CacheMode::CACHE_MODE_NORMAL);
 }
 

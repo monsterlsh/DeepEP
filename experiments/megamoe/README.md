@@ -81,6 +81,10 @@ scale 仍为 E8M0 `[L,2I,H/64,2]` / `[L,H,I/64,2]`；GMM1 保持 `[gate | up]`�
 `transform_weights_for_mega_moe` 只保证连续 ND，不做 FP4 的 NZ 或 gate/up 重排。
 输入可选 FP8 或 BF16（内部量化），输出均为 BF16。两个专用入口各自要求对应的 buffer 模式。
 W8A8 当前要求 S=0，不支持设备 timer；支持 profiler 性能采样。
+A8W8 GMM1 保留 M256 调度和 Dispatch/GMM2 就绪粒度，gate/up 计算及 SwiGLU 按 M128
+子块传递，避免两份 M256×N256 BF16 中间结果超出可用 UB。只有一个逻辑 tile 的全部
+子块写回后才发布一次 GMM2 就绪通知。发送路由的 batch 大小按实际 UB 预算选择。
+原生入口也检查物理格式：W8 权重只允许 ND2，其余线性输入、scale、路由和输出支持 ND2/NCHW0。
 benchmark 和 Golden 均通过 `--mma-type fp8xfp4|fp8xfp8` 选择权重，默认保持 W4A8。
 单机 EP8 的构建、精度、边界和性能验收命令见 [测试方案](tests/README.md)。
 

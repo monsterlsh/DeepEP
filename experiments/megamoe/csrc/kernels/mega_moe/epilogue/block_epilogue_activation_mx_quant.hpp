@@ -54,6 +54,7 @@ class BlockEpilogueActivationMxQuant {
 public:
     __aicore__ inline BlockEpilogueActivationMxQuant() {}
 
+    static constexpr uint32_t TILE_M = TileM;
     static constexpr uint32_t MAX_SINGLE_MN = TileM * TileN;
 
     struct Arguments {

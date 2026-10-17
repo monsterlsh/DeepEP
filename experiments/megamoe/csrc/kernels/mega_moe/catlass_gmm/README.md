@@ -49,6 +49,11 @@ GMM2 写回行主序结果。共享专家的 A8W4 调用也复用此 kernel。
 通用 A8W8/A4W4 GMM 使用 `mega_moe_mx_matmul.hpp` 和 `block_mmad_mx.hpp` 的 CATLASS MX 流水。
 适配层保留 tensor-API slice 起始地址和父矩阵行距，支持 ND/NZ 权重、GM 输出及指定 AIV0 的 UB 输出。
 通用路径固定使用 K256 数据窗口及 K512 scale 窗口。
+当前 A8W8 planar GMM1 的逻辑调度仍为 M256，AIC/AIV0 按 M128 子块交换 gate/up
+结果；两份 BF16 UB 输入共 128 KiB。每个子块独立握手，最后一个子块完成后才发布该
+逻辑 N tile 的 GMM2 就绪计数，保留 M256 的 Dispatch 和 GMM2 粒度。
+超过 M128 的专家会在子块间重复读取权重，因此保持 L2 cache；E8M0 scale 的 bypass
+判据使用 `[N, ceil(K/64), 2]` 的实际 K-scale 行距。
 所有 GMM 后端均使用 CATLASS。
 后处理位于 `../epilogue`。
 
