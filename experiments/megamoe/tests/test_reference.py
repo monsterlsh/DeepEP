@@ -14,6 +14,7 @@ from deep_ep_experimental.megamoe.reference import (
     fp8_decode,
     fp8_encode,
     local_reference,
+    make_weights,
     quantize_input,
     unpack_weight,
 )
@@ -52,6 +53,51 @@ def test_fp4_nibble_and_scale_order():
     np.testing.assert_array_equal(result[:32:2], FP4)
     np.testing.assert_array_equal(result[1:32:2], FP4[::-1])
     np.testing.assert_array_equal(result[32:], result[:32] * 2)
+
+
+def test_fp8_weight_codes_and_block_scale_order():
+    values = np.tile(np.array([0, 0.5, 1, 2, -1, -2, 3, 6], np.float32), 8).reshape(1, 1, 64)
+    codes = fp8_encode(values)
+    scales = np.array([[[[127, 128]]]], dtype=np.uint8)
+    result = unpack_weight((codes, scales), "fp8xfp8")
+    assert result.shape == (1, 1, 64)
+    np.testing.assert_array_equal(result[..., :32], values[..., :32])
+    np.testing.assert_array_equal(result[..., 32:], 2 * values[..., 32:])
+
+
+@pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8"])
+def test_generated_weights_are_reproducible_finite_and_scaled(mma_type):
+    first = make_weights(2, 128, 64, 13, mma_type)
+    repeated = make_weights(2, 128, 64, 13, mma_type)
+    for (data, scales), (repeat_data, repeat_scales), (n, k) in zip(first, repeated, [(128, 128), (128, 64)]):
+        assert data.shape == (2, n, k // 2 if mma_type == "fp8xfp4" else k)
+        assert scales.shape == (2, n, k // 64, 2)
+        assert data.dtype == scales.dtype == np.uint8
+        np.testing.assert_array_equal(data, repeat_data)
+        np.testing.assert_array_equal(scales, repeat_scales)
+        dense = unpack_weight((data, scales), mma_type)
+        assert dense.shape == (2, n, k) and np.isfinite(dense).all()
+        assert (dense < 0).any() and (dense > 0).any()
+        assert 0.6 < np.sqrt(np.mean(dense**2) * k) < 1.6
+        assert np.unique(scales).size == 3
+        if mma_type == "fp8xfp8":
+            assert np.unique((data & 127) >> 3).size >= 5
+            assert not np.any((data & 127) == 127)
+
+
+def test_default_weights_preserve_fp4_generator():
+    default, explicit = make_weights(2, 64, 64, 7), make_weights(2, 64, 64, 7, "fp8xfp4")
+    for a, b in zip(default, explicit):
+        for data_a, data_b in zip(a, b):
+            np.testing.assert_array_equal(data_a, data_b)
+        np.testing.assert_array_equal(unpack_weight(a), unpack_weight(b, "fp8xfp4"))
+
+
+def test_weight_helpers_reject_unknown_mma_type():
+    with pytest.raises(ValueError, match="Unsupported MMA type"):
+        make_weights(1, 64, 64, 13, "int8")
+    with pytest.raises(ValueError, match="Unsupported MMA type"):
+        unpack_weight((np.zeros((1, 64), np.uint8), np.zeros((1, 2), np.uint8)), "int8")
 
 
 def test_local_moe_decomposition_and_empty_expert():

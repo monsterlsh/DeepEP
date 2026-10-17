@@ -59,22 +59,42 @@ def dequantize_input(codes, scales):
     return fp8_decode(codes) * np.repeat(scale, 32, axis=-1)
 
 
-def unpack_weight(pair):
+def unpack_weight(pair, mma_type="fp8xfp4"):
     packed, scales = pair
     packed = np.asarray(packed, dtype=np.uint8)
-    values = np.empty((*packed.shape[:-1], packed.shape[-1] * 2), dtype=np.float32)
-    values[..., ::2], values[..., 1::2] = FP4[packed & 15], FP4[packed >> 4]
+    if mma_type == "fp8xfp4":
+        values = np.empty((*packed.shape[:-1], packed.shape[-1] * 2), dtype=np.float32)
+        values[..., ::2], values[..., 1::2] = FP4[packed & 15], FP4[packed >> 4]
+    elif mma_type == "fp8xfp8":
+        values = fp8_decode(packed)
+    else:
+        raise ValueError(f"Unsupported MMA type: {mma_type}")
     shape = (*values.shape[:-1], values.shape[-1] // 32)
     scale = np.exp2(np.asarray(scales, dtype=np.int16).reshape(shape) - 127).astype(np.float32)
     return values * np.repeat(scale, 32, axis=-1)
 
 
-def make_weights(experts, hidden, intermediate, seed):
-    """Generate packed FP4 and non-uniform E8M0 scales; never quantize weights on the hot path."""
+def make_weights(experts, hidden, intermediate, seed, mma_type="fp8xfp4"):
+    """Generate FP4/FP8 bytes and E8M0 scales before timed device execution.
+
+    FP8 codes sample both signs and several exponents over the FP4 test range.
+    The codebook conversion uses bounded temporary storage, never dense float32
+    copies of every expert. Device callers must view FP8 bytes as E4M3, not cast.
+    """
+    if mma_type not in ("fp8xfp4", "fp8xfp8"):
+        raise ValueError(f"Unsupported MMA type: {mma_type}")
+    if experts < 1 or hidden <= 0 or intermediate <= 0 or hidden % 64 or intermediate % 64:
+        raise ValueError("Positive experts and weight dimensions divisible by 64 are required")
     rng = np.random.default_rng(seed)
     result = []
     for n, k in ((2 * intermediate, hidden), (hidden, intermediate)):
-        packed = rng.integers(0, 256, (experts, n, k // 2), dtype=np.uint8)
+        packed = rng.integers(0, 256, (experts, n, k // 2 if mma_type == "fp8xfp4" else k), dtype=np.uint8)
+        if mma_type == "fp8xfp8":
+            codebook = fp8_encode(np.linspace(-6, 6, 256, dtype=np.float32))
+            flattened = packed.reshape(-1)
+            for start in range(0, flattened.size, 1 << 20):
+                block = flattened[start : start + (1 << 20)]
+                block[:] = codebook[block]
         exponent = int(np.floor(-0.5 * np.log2(k))) - 2
         scales = rng.integers(127 + exponent - 1, 127 + exponent + 2, (experts, n, k // 64, 2), dtype=np.uint8)
         result.append((packed, scales))

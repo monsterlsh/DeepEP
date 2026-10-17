@@ -45,6 +45,9 @@ def parse_args(argv=None):
     parser.add_argument("--config", default="deepseek_v4_pro")
     parser.add_argument("--bs-values", default=os.environ.get("BS_VALUES"))
     parser.add_argument("--input", choices=("fp8", "bf16"), default="fp8")
+    parser.add_argument(
+        "--mma-type", choices=("fp8xfp4", "fp8xfp8"), default="fp8xfp4", help="Activation/weight compute format"
+    )
     parser.add_argument("--routing", choices=("balanced", "random", "skewed"), default="balanced")
     parser.add_argument("--mode", choices=("perf", "accuracy"), default="perf")
     parser.add_argument("--no-timer", action="store_true", help="Disable timer collection and parsing")
@@ -91,6 +94,11 @@ def make_plan(args):
         raise ValueError("BS values must be distinct integers in [1,65536]")
     if config["model"]["num_experts"] % args.ep_size:
         raise ValueError("Global experts must divide EP size")
+    if args.mma_type == "fp8xfp8":
+        if config["model"].get("num_shared_experts", 0):
+            raise ValueError("fp8xfp8 (A8W8) does not support shared experts; use num_shared_experts=0")
+        if not args.no_timer:
+            raise ValueError("fp8xfp8 (A8W8) does not support device timers; pass --no-timer")
     if (
         not all(1024 <= port <= 65535 for port in (args.master_port, args.shmem_port))
         or args.master_port == args.shmem_port
@@ -118,6 +126,7 @@ def make_plan(args):
         hosts=hosts,
         config=config,
         input=args.input,
+        mma_type=args.mma_type,
         routing=args.routing,
         mode=args.mode,
         timer=not args.no_timer,

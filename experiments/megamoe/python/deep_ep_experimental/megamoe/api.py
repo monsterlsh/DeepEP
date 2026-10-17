@@ -60,6 +60,18 @@ def _check_fp4_weight_format(weight, name):
         )
 
 
+def _check_fp8_weight_format(weight, name):
+    import torch_npu
+
+    actual = torch_npu.get_npu_format(weight)
+    if actual != 2:
+        raise ValueError(
+            f"{name}: FP8 weights require ND format 2, got format={actual}, "
+            f"dtype={weight.dtype}, shape={tuple(weight.shape)}; "
+            "use raw ND [E,N,K] weights for A8W8"
+        )
+
+
 class SymmBuffer:
     """Collective resource owner. All ranks construct/call/destroy in the same order.
 
@@ -311,12 +323,13 @@ class _RoutedWeightPair(tuple):
 def transform_weights_for_mega_moe(
     l1_weights: WeightPair, l2_weights: WeightPair, activation: str = "swiglu", *, shared: bool = False
 ) -> tuple[WeightPair, WeightPair]:
-    """Convert raw Ascend packed weights to NZ once, without quantizing again.
+    """Prepare Ascend weights once, without quantizing again.
 
     Raw inputs use [gate | up]. Routed FP4 GMM1 prepares both planar Prefill and
     [gate128, up128] Decode layouts. Keep the returned l1 pair intact and immutable;
     the API selects its layout by actual BS without a timed conversion. Pass shared=True for
-    shared experts, whose GMM1 remains planar. FP8 and GMM2 keep their layout.
+    shared experts, whose GMM1 remains planar. FP8 stays contiguous ND [E,N,K]
+    with planar [gate | up] GMM1; only packed FP4 weights are converted to NZ.
     This is not the CUDA UTCCP transform. Old prepared FP4 routed weights must
     be regenerated from raw ND inputs; do not transform prepared NZ twice.
     """
@@ -375,6 +388,10 @@ def transform_weights_for_mega_moe(
                 input_dtype=torch_npu.float4_e2m1fn_x2,
             )
             _check_fp4_weight_format(weight, name)
+        else:
+            _check_fp8_weight_format(weight, name)
+            if not weight.is_contiguous():
+                weight = weight.contiguous()
         transformed.append((weight, scale))
     return tuple(transformed)
 
@@ -392,7 +409,7 @@ def mega_moe(
     out=None,
     timer=None,
 ):
-    """Explicit-input convenience API; prefer fp8_fp4_mega_moe for DeepGEMM-style use.
+    """Explicit-input API; buffered callers may use fp8_fp4/fp8_fp8_mega_moe.
 
     x: BF16 [B,H], or (FP8 E4M3 [B,H], E8M0 [B,H/32]).
     FP8 is copied into the original communication record, never dequantized/requantized.
@@ -452,7 +469,7 @@ def _run(
     if (shared[0].shape[0] if shared[0] is not None else 0) != b.num_shared_experts:
         raise ValueError("Shared expert count does not match the buffer configuration")
     expected_dtype = torch.uint8 if b.mma_type == "fp8xfp4" else torch.float8_e4m3fn
-    if w1.dtype != expected_dtype:
+    if w1.dtype != expected_dtype or w2.dtype != expected_dtype:
         raise TypeError("Weight dtype differs from buffer mma_type")
     prepared_inputs = ()
     if w1.dtype == torch.uint8:
@@ -484,6 +501,9 @@ def _run(
         ):
             if weight is not None:
                 _check_fp4_weight_format(weight, name)
+    else:
+        for name, weight in (("l1_weights", w1), ("l2_weights", w2)):
+            _check_fp8_weight_format(weight, name)
     if cumulative_stats is not None:
         stats = cumulative_stats
         if (
@@ -540,10 +560,93 @@ def fp8_fp4_mega_moe(
     timer is a fresh buffer.allocate_timer() for a separate diagnostic call.
     Routed weights are applied after GMM2; see README numerical compatibility.
     """
+    _buffered_mega_moe(
+        y,
+        l1_weights,
+        l2_weights,
+        sym_buffer,
+        shared_l1_weights,
+        shared_l2_weights,
+        cumulative_local_expert_recv_stats,
+        recipe,
+        activation,
+        activation_clamp,
+        fast_math,
+        x=x,
+        timer=timer,
+        mma_type="fp8xfp4",
+    )
+
+
+def fp8_fp8_mega_moe(
+    y: Tensor,
+    l1_weights: WeightPair,
+    l2_weights: WeightPair,
+    sym_buffer: SymmBuffer,
+    shared_l1_weights: WeightPair | None = None,
+    shared_l2_weights: WeightPair | None = None,
+    cumulative_local_expert_recv_stats: Tensor | None = None,
+    recipe: tuple[int, int, int] = (1, 1, 32),
+    activation: str = "swiglu",
+    activation_clamp: float | None = None,
+    fast_math: bool = True,
+    *,
+    x: Tensor | None = None,
+    timer: Tensor | None = None,
+) -> None:
+    """Write BF16 y using MXFP8 E4M3 activations and weights (A8W8).
+
+    Weights remain ND [E,N,K], with E8M0 scales [E,N,K/64,2]. GMM1
+    is planar [gate | up]. Omit x to consume the buffer's FP8 input, or pass
+    BF16 [BS,H] to quantize it inside the kernel. Stats accumulate in place.
+    Shared experts and device timer traces are not supported by this kernel.
+    """
+    _buffered_mega_moe(
+        y,
+        l1_weights,
+        l2_weights,
+        sym_buffer,
+        shared_l1_weights,
+        shared_l2_weights,
+        cumulative_local_expert_recv_stats,
+        recipe,
+        activation,
+        activation_clamp,
+        fast_math,
+        x=x,
+        timer=timer,
+        mma_type="fp8xfp8",
+    )
+
+
+def _buffered_mega_moe(
+    y,
+    l1_weights,
+    l2_weights,
+    sym_buffer,
+    shared_l1_weights,
+    shared_l2_weights,
+    cumulative_local_expert_recv_stats,
+    recipe,
+    activation,
+    activation_clamp,
+    fast_math,
+    *,
+    x,
+    timer,
+    mma_type,
+):
     if recipe != (1, 1, 32) or activation != "swiglu" or activation_clamp is not None or fast_math is not True:
         raise NotImplementedError("Beta supports recipe=(1,1,32), SwiGLU, no clamp, default math only")
     if not isinstance(sym_buffer, SymmBuffer):
         raise TypeError("sym_buffer must be this installation's MegaMoE SymmBuffer")
+    if sym_buffer.mma_type != mma_type:
+        raise ValueError(f"This entry point requires SymmBuffer(mma_type={mma_type!r})")
+    if mma_type == "fp8xfp8":
+        if shared_l1_weights is not None or shared_l2_weights is not None:
+            raise NotImplementedError("A8W8 shared experts are not supported")
+        if timer is not None:
+            raise NotImplementedError("A8W8 device timer traces are not supported; use the profiler")
     import torch
 
     sym_buffer._runtime.ensure_alive()

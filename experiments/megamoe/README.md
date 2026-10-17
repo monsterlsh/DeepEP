@@ -32,7 +32,7 @@ def fp8_fp4_mega_moe(
 | `x` | 可选 BF16 `[B,H]`，覆盖 buffer 中的 FP8 输入；内部量化为 FP8，**不是 BF16 GEMM** |
 | `sym_buffer.topk_idx` | int32 `[B,K]`，全局专家 ID，同 token 不重复且不能为 -1 |
 | `sym_buffer.topk_weights` | FP32 `[B,K]` 路由权重；BF16/FP8 输入均从 buffer 读取路由 |
-| `l1_weights / l2_weights` | 两对 `(weight, scale)`，当前测试使用 FP4 E2M1 权重 + E8M0 scale |
+| `l1_weights / l2_weights` | 两对 `(weight, scale)`，使用 FP4 E2M1 或 FP8 E4M3 权重 + E8M0 scale，与 buffer 的 `mma_type` 一致 |
 | `shared_l1_weights / shared_l2_weights` | 共享专家的两对权重，必须同时传入，数量与 buffer 的 S 一致；默认不使用 |
 | `cumulative_local_expert_recv_stats` | 可选 int32 `[L]`，在原值上累加专家接收 token 数 |
 | `timer` | 可选 `buffer.allocate_timer()`；仅在单独诊断调用中传入 |
@@ -75,7 +75,14 @@ buffer = SymmBuffer(
 约束：EP=2～128，E 可整除 EP 且每卡最多 128 个路由专家；S=0～8；B=1～65536；
 H=1024～8192 且为64的倍数，I=256～4096 且为128的倍数，1≤K≤min(32,E)。
 各 rank 必须同序、同 B 调用；仅推理，不支持反向、空/不等长 B 或图捕获。
-`mma_type="fp8xfp8"` 是保留入口，不支持共享专家/timer；**下文 benchmark 固定测试 W4A8，不提供权重 dtype 开关**。
+W8A8 使用 `mma_type="fp8xfp8"` 和公开入口 `fp8_fp8_mega_moe`，调用签名与上面的
+`fp8_fp4_mega_moe` 相同。W8 权重为 FP8 E4M3 ND `[L,2I,H]` / `[L,H,I]`，
+scale 仍为 E8M0 `[L,2I,H/64,2]` / `[L,H,I/64,2]`；GMM1 保持 `[gate | up]`，
+`transform_weights_for_mega_moe` 只保证连续 ND，不做 FP4 的 NZ 或 gate/up 重排。
+输入可选 FP8 或 BF16（内部量化），输出均为 BF16。两个专用入口各自要求对应的 buffer 模式。
+W8A8 当前要求 S=0，不支持设备 timer；支持 profiler 性能采样。
+benchmark 和 Golden 均通过 `--mma-type fp8xfp4|fp8xfp8` 选择权重，默认保持 W4A8。
+单机 EP8 的构建、精度、边界和性能验收命令见 [测试方案](tests/README.md)。
 
 兼容入口 `mega_moe(x, ids, weights, w1, w2, buffer, ...)` 返回 `(y, per_call_counts)`。
 接口签名参照 DeepGEMM `78b6900`。本实现使用 int32 路由 ID、E8M0 输入 scale，
@@ -172,7 +179,8 @@ python experiments/megamoe/scripts/batch_launch.py --hosts-file "$HOSTS_FILE" --
 | 参数 | 默认 / 作用 |
 | --- | --- |
 | `--mode perf\|accuracy` | 默认 perf 执行性能测试；accuracy 检查全量输出和专家计数 |
-| `--input fp8\|bf16` | 默认 fp8；只改变输入类型，权重仍为 FP4 |
+| `--input fp8\|bf16` | 默认 fp8；只改变输入类型，权重由 `--mma-type` 选择 |
+| `--mma-type fp8xfp4\|fp8xfp8` | 默认 fp8xfp4（W4A8）；fp8xfp8（W8A8）要求 S=0 和 `--no-timer` |
 | `--config NAME或路径` | 默认 `deepseek_v4_pro`；可传模型 JSON 路径 |
 | `--bs-values 96,4096` | 覆盖 JSON 中 BS 列表；每个 BS 单独启动 |
 | `--routing balanced\|random\|skewed` | 默认 balanced；random/skewed 用于精度压力测试 |
@@ -229,6 +237,9 @@ python experiments/megamoe/scripts/batch_launch.py --hosts-file "$HOSTS_FILE" --
 精度测试以相同输入、权重和路由生成的 CPU Golden 为参考，生成输出和专家计数的校验报告。
 CPU Golden 缓存位于 `benchmark-golden/`，相同配置可复用。
 性能测试根据关闭 timer 时 profiler 采集的算子 kernel Duration，生成耗时统计报告。
+Golden 缓存包含 `mma_type`，不同权重类型不会混用；manifest、精度与性能报告也记录该字段。
+`mean_us` 为后半轮的逐轮最小 rank 耗时均值，`rank_max_mean_us` 为逐轮最大 rank 耗时均值；
+二者均为融合 kernel 的设备 Duration，性能比较需保持模型、BS、输入、路由和轮次一致。
 流水分析根据独立采集的设备 timer 数据，生成流水 JSON 和阶段耗时报告，默认解析主节点 rank0～7。
 
 终端输出各 BS 的 `[PERF]` 耗时或 `[ACCURACY SUMMARY]` 精度摘要，结果保存至：

@@ -299,6 +299,8 @@ Each EP group uses a shared SHMEM initialization endpoint and an explicit rank-t
 
 MegaMoE combines dispatch, expert computation, activation/quantization, and combine into W4A8 fused inference for prefill and decode. See [experiments/megamoe/](experiments/megamoe/README.md) for configuration and usage.
 
+The experimental runner also offers W8A8 (`--mma-type fp8xfp8`) with FP8/BF16 inputs and separate Golden validation. Shared experts and device timer traces are currently unsupported for W8A8. See the [single-node EP8 test plan](experiments/megamoe/tests/README.md) for build, accuracy, and performance checks; device results require validation on the target Ascend950 environment.
+
 ## Acknowledgement
 
 ---
