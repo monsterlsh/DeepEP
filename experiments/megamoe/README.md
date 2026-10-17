@@ -87,6 +87,9 @@ A8W8 GMM1 保留 M256 调度和 Dispatch/GMM2 就绪粒度，gate/up 计算及 S
 原生入口也检查物理格式：W8 权重只允许 ND2，其余线性输入、scale、路由和输出支持 ND2/NCHW0。
 benchmark 和 Golden 均通过 `--mma-type fp8xfp4|fp8xfp8` 选择权重，默认保持 W4A8。
 单机 EP8 的构建、精度、边界和性能验收命令见 [测试方案](tests/README.md)。
+统一入口为 `bash experiments/megamoe/scripts/run_ep8.sh --build`，默认执行 W8 首轮验收；
+增加 `--suite full` 执行 W4 回归、全部路由和原生形状边界。脚本自动生成 Golden、
+保存逐项日志并输出 `summary.json` / `summary.txt`；`--dry-run` 可先查看计划。
 
 兼容入口 `mega_moe(x, ids, weights, w1, w2, buffer, ...)` 返回 `(y, per_call_counts)`。
 接口签名参照 DeepGEMM `78b6900`。本实现使用 int32 路由 ID、E8M0 输入 scale，
