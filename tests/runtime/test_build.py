@@ -305,8 +305,9 @@ def test_cache_survives_source_edits_but_not_toolchain_changes(build):
         assert build.build_cache_key({**configuration, name: value}) != key
 
 
-@pytest.mark.parametrize("beta,timer", [(False, False), (True, False), (True, True)])
-def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkeypatch, tmp_path, beta, timer):
+@pytest.mark.parametrize("beta,timer,sanitizer", [(False, False, False), (True, False, False),
+                                               (True, True, False), (True, False, True)])
+def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkeypatch, tmp_path, beta, timer, sanitizer):
     from setuptools import Distribution, Extension
 
     # This CPU-only test mocks the build tools, including their discovery paths.
@@ -328,6 +329,8 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
         "python_executable": "/private/python",
         "build_environment": {"CXXFLAGS": "-I/private/include"},
     }
+    if sanitizer:
+        configuration["megamoe"]["ub_probe_sanitizer"] = True
     monkeypatch.setattr(build, "build_configuration", lambda: configuration)
     monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", "6")
     ext = Extension("deep_ep._C", sources=[])
@@ -361,6 +364,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     assert "-DDEEPEP_DEVICE_JOBS=6" in calls[0]
     assert f"-DDEEPEP_BUILD_MEGAMOE={'ON' if beta else 'OFF'}" in calls[0]
     assert f"-DDEEPEP_MEGAMOE_TIMER={'ON' if timer else 'OFF'}" in calls[0]
+    assert f"-DDEEPEP_UB_PROBE_SANITIZER={'ON' if sanitizer else 'OFF'}" in calls[0]
     assert f"-Dpybind11_DIR={pybind11_cmake_dir}" in calls[0]
     assert calls[1][-2:] == ["--parallel", "6"]
     assert not (destination / "libdeepep_notify.so").exists()
@@ -368,9 +372,19 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     info = json.loads((destination / "_build_info.json").read_text())
     assert info["capabilities"] == capabilities["capabilities"]
     assert info["source_sha256"] == "current"
-    assert info["megamoe"] == {"enabled": beta, "timer": timer}
+    assert info["megamoe"] == configuration["megamoe"]
     assert "CATLASS_ROOT" not in info
     assert not {"cmake_path", "compiler_path", "python_executable", "build_environment"}.intersection(info)
+
+
+def test_ub_probe_build_requires_beta_without_timer_and_separate_cache(build):
+    for beta, timer in (("OFF", "OFF"), ("ON", "ON")):
+        with pytest.raises(RuntimeError, match="UB probe sanitizer"):
+            build.build_configuration(dict(DEEPEP_NPU_ARCH="Ascend950", DEEPEP_BUILD_MEGAMOE=beta,
+                                           DEEPEP_MEGAMOE_TIMER=timer, DEEPEP_UB_PROBE_SANITIZER="ON"))
+    normal = {"megamoe": {"enabled": True, "timer": False}}
+    sanitized = {"megamoe": {"enabled": True, "timer": False, "ub_probe_sanitizer": True}}
+    assert build.build_cache_key(normal) != build.build_cache_key(sanitized)
 
 
 def test_compiler_symlink_keeps_invocation_name(build, monkeypatch, tmp_path):

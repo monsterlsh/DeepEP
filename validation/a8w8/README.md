@@ -1,5 +1,9 @@
 # MegaMoE A8W8：CPU 与 NPU 验证
 
+本诊断分支基于 `b6ab763`，保留旧 GMM1 M256 内核。验证 BS128/4096 的 UB 容量、
+精度、性能或 msSanitizer 报告，请使用 [UB_PROBE.md](UB_PROBE.md) 中的 `run_ub_probe.sh`。
+本分支 wheel 版本为 `0.1.0.dev5+ub.probe.b6ab763`；下文原有两分支说明保留作背景。
+
 本目录在 `fix-megamoe-a8w8` 和 `megamoe-a8w8-ep8` 两个分支中提供相同的测试入口。
 脚本自动适配前者的 `--weights fp8` 和后者的 `--mma-type fp8xfp8`。
 这里的 A8W8 是 MXFP8 E4M3 激活与权重，配 E8M0 scale，支持 BF16/FP8 输入、BF16 输出；

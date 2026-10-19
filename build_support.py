@@ -194,6 +194,9 @@ def build_configuration(environment=None):
         raise RuntimeError("MegaMoE build options accept ON or OFF only")
     if timer == "ON" and beta != "ON":
         raise RuntimeError("MegaMoE timer requires DEEPEP_BUILD_MEGAMOE=ON")
+    ub_probe_sanitizer = enabled("DEEPEP_UB_PROBE_SANITIZER", env)
+    if ub_probe_sanitizer and (beta != "ON" or timer != "OFF"):
+        raise RuntimeError("UB probe sanitizer requires MegaMoE ON and timer OFF")
     ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED", env)
     lineinfo = ep_gmm_fused and enabled("DEEPEP_LINEINFO", env)
     result = {"arch": "Ascend950", "python": sys.version, "machine": platform.machine()}
@@ -272,6 +275,8 @@ def build_configuration(environment=None):
     compiler, compiler_version = find_host_compiler(env)
     result["compiler_path"] = compiler
     result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON"}
+    if ub_probe_sanitizer:
+        result["megamoe"]["ub_probe_sanitizer"] = True
     if beta == "ON":
         catlass = Path(env.get("CATLASS_ROOT", str(ROOT / "third-party/catlass")))
         if not (catlass / "include/catlass/gemm/tile/copy_l1_to_l0a.hpp").is_file():
@@ -396,6 +401,7 @@ class CMakeBuild(build_ext):
             f"-DSHMEM_ROOT={configuration['SHMEM_ROOT']}",
             f"-DDEEPEP_BUILD_MEGAMOE={'ON' if megamoe.get('enabled', False) else 'OFF'}",
             f"-DDEEPEP_MEGAMOE_TIMER={'ON' if megamoe.get('timer', False) else 'OFF'}",
+            f"-DDEEPEP_UB_PROBE_SANITIZER={'ON' if megamoe.get('ub_probe_sanitizer', False) else 'OFF'}",
             f"-DCATLASS_ROOT={configuration.get('CATLASS_ROOT', '')}",
             f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}",
             f"-DCMAKE_INSTALL_PREFIX={destination}",
