@@ -28,15 +28,16 @@ git clone --branch megamoe-a8w8-ep8 --single-branch \
 
 ### 安装版本与分支对应关系
 
-两个分支使用不同的、带分支标识的 Python 包版本。`setup.py` 从根目录 `VERSION` 读取版本，
+两个分支统一使用 `0.1.0.dev5` 基线，通过分支标识区分 Python 包版本。`setup.py` 从根目录 `VERSION` 读取版本，
 因此 wheel 文件名、`pip show` 和测试预检显示的版本保持一致：
 
 | 分支 | `pip show ascend-deepep` 的 Version |
 | --- | --- |
 | `fix-megamoe-a8w8` | `0.1.0.dev5+fix.megamoe.a8w8` |
-| `megamoe-a8w8-ep8` | `0.1.0.dev7+megamoe.a8w8.ep8` |
+| `megamoe-a8w8-ep8` | `0.1.0.dev5+megamoe.a8w8.ep8` |
 
-`+` 后是 Python 包规范支持的本地版本标识。发行包名为 `ascend-deepep`，Python 导入名为 `deep_ep`。
+`+` 后是 Python 包规范支持的本地版本标识，分支名中的连字符规范化为点号。
+发行包名为 `ascend-deepep`，Python 导入名为 `deep_ep`。
 安装后使用同一个解释器查询，避免查到其他虚拟环境：
 
 ```bash
@@ -45,13 +46,26 @@ python -I -c 'from importlib.metadata import version; print(version("ascend-deep
 ```
 
 每次切换分支后运行 `bash validation/a8w8/run_npu.sh --build`。构建脚本使用
-`python -I -m pip install --no-user --force-reinstall --no-deps` 安装本次生成的 wheel，允许从 dev7 切回 dev5。
+`python -I -m pip install --no-user --force-reinstall --no-deps` 安装本次生成的确切 wheel，
+支持两个分支版本互相替换，以及从历史 EP8 dev7 版本切换到统一的 dev5 基线。
 NPU 预检同时校验完整版本字符串和源码指纹；同一分支再次修改源码后也会检查 wheel 是否需要重建。
+
+### 版本统一对功能和安装的影响
+
+统一版本基线不回退源码，不改变 A8W8 算法、Python API、内核协议或构建开关。
+两个分支原有的实现差异仍然保留；相同 `dev5` 不表示它们的功能完全相同。
+`VERSION` 参与构建元数据和源码指纹计算，因此修改它后必须重新生成并安装 wheel，
+旧 wheel 会被版本或源码指纹校验拒绝。
+
+历史 dev7 在包管理器的版本排序中高于 dev5；两个 dev5 后缀之间也有排序。
+不要依赖 `pip install --upgrade ascend-deepep` 来选择分支，应使用上面的 `--build`
+入口强制安装当前源码生成的 wheel。两个版本仍属于同一个发行包，后安装的版本替换前一个。
 
 ### 已加 `--build` 仍报版本不匹配
 
 CPU 测试运行源码，不检查 NPU wheel 是否已安装，因此 CPU 通过与安装版本不匹配可以同时发生。
-若源码是 dev7、安装显示 dev5，先在服务器本地检查，不需要导出日志：
+若源码带有分支后缀，而安装显示无后缀的 `0.1.0.dev5`、历史版本或另一分支后缀，
+先在服务器本地检查，不需要导出日志：
 
 ```bash
 git branch --show-current
@@ -79,7 +93,7 @@ PY
 
 ```bash
 # 使用本次 logs/build.log 中的完整 wheel 路径，不要用 dist/**/*.whl 通配混装两个分支。
-WHEEL=/absolute/path/to/DeepEP/dist/build-XXXX/ascend_deepep-0.1.0.dev7+megamoe.a8w8.ep8-cp311-cp311-linux_aarch64.whl
+WHEEL=/absolute/path/to/DeepEP/dist/build-XXXX/ascend_deepep-0.1.0.dev5+megamoe.a8w8.ep8-cp311-cp311-linux_aarch64.whl
 python -I -m pip install --no-user --force-reinstall --no-deps "$WHEEL"
 python -I -m pip show ascend-deepep
 
@@ -89,7 +103,7 @@ bash validation/a8w8/run_npu.sh --suite quick --python "$(python -I -c 'import s
 
 上面的 wheel 名称只是示例，Python ABI、平台和路径以本次构建实际输出为准。
 若仍不匹配，检查当前环境的 pip `user`、`target`、`prefix` 配置及重复元数据；
-不要改小 `VERSION` 或跳过版本校验。两分支应依次安装、依次测试。
+不要为绕过报错临时修改 `VERSION` 或跳过版本校验。两分支应依次安装、依次测试。
 
 ## 2. CPU 测试
 

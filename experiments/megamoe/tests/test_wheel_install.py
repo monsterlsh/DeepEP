@@ -15,8 +15,10 @@ import zipfile
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-OLD_VERSION = "0.1.0.dev5"
-NEW_VERSION = "0.1.0.dev7+megamoe.a8w8.ep8"
+BASE_VERSION = "0.1.0.dev5"
+FIX_VERSION = f"{BASE_VERSION}+fix.megamoe.a8w8"
+EP8_VERSION = f"{BASE_VERSION}+megamoe.a8w8.ep8"
+CURRENT_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 
 
 def write_wheel(directory, version):
@@ -37,7 +39,8 @@ def write_wheel(directory, version):
 
 
 @pytest.fixture
-def install_case(tmp_path, monkeypatch):
+def install_case(tmp_path, monkeypatch, request):
+    old_version, new_version = getattr(request, "param", (BASE_VERSION, CURRENT_VERSION))
     pytest.importorskip("ensurepip", reason="Offline pip regression needs Python's bundled ensurepip")
     environment = tmp_path / "environment"
     subprocess.run([sys.executable, "-I", "-m", "venv", str(environment)], check=True, timeout=90)
@@ -56,7 +59,7 @@ def install_case(tmp_path, monkeypatch):
     for name in ("SHMEM_ROOT", "CATLASS_ROOT"):
         monkeypatch.setenv(name, str(dependency))
 
-    old_wheel = write_wheel(tmp_path, OLD_VERSION)
+    old_wheel = write_wheel(tmp_path, old_version)
     subprocess.run(
         [str(python), "-I", "-m", "pip", "install", "--no-index", "--no-deps", str(old_wheel)],
         check=True,
@@ -64,14 +67,14 @@ def install_case(tmp_path, monkeypatch):
     )
     source = tmp_path / "source"
     source.mkdir()
-    (source / "VERSION").write_text(NEW_VERSION, encoding="utf-8")
+    (source / "VERSION").write_text(new_version, encoding="utf-8")
     (source / "dependencies.lock.json").write_text(
         json.dumps({"cann_version": "synthetic", "target": "Ascend950"}), encoding="utf-8"
     )
     egg_info = source / "ascend_deepep.egg-info"
     egg_info.mkdir()
     (egg_info / "PKG-INFO").write_text(
-        f"Metadata-Version: 2.1\nName: ascend-deepep\nVersion: {NEW_VERSION}\n", encoding="utf-8"
+        f"Metadata-Version: 2.1\nName: ascend-deepep\nVersion: {new_version}\n", encoding="utf-8"
     )
     package = source / "deep_ep"
     package.mkdir()
@@ -92,8 +95,8 @@ def install_case(tmp_path, monkeypatch):
             )
         )
 
-    assert installed_versions() == [OLD_VERSION]
-    assert installed_versions(isolated=False)[0] == NEW_VERSION
+    assert installed_versions() == [old_version]
+    assert installed_versions(isolated=False)[0] == new_version
 
     spec = importlib.util.spec_from_file_location(
         "test_megamoe_wheel_builder", ROOT / "experiments/megamoe/scripts/build.py"
@@ -106,7 +109,7 @@ def install_case(tmp_path, monkeypatch):
     monkeypatch.setattr(builder, "cann_version", lambda lock: None)
     monkeypatch.setitem(sys.modules, "build_support", SimpleNamespace(build_configuration=lambda env: None))
 
-    def build(wheel_version=NEW_VERSION, *, duplicate_metadata=False):
+    def build(wheel_version=new_version, *, duplicate_metadata=False):
         def run(command, **kwargs):
             if "pip" in command and "wheel" in command:
                 write_wheel(Path(command[command.index("-w") + 1]), wheel_version)
@@ -124,29 +127,42 @@ def install_case(tmp_path, monkeypatch):
                         timeout=30,
                     ).strip()
                 )
-                stale = site / f"ascend_deepep-{OLD_VERSION}.dist-info"
+                stale = site / f"ascend_deepep-{BASE_VERSION}.dist-info"
                 stale.mkdir()
-                (stale / "METADATA").write_text(f"Metadata-Version: 2.1\nName: ascend-deepep\nVersion: {OLD_VERSION}\n")
+                (stale / "METADATA").write_text(
+                    f"Metadata-Version: 2.1\nName: ascend-deepep\nVersion: {BASE_VERSION}\n"
+                )
             return result
 
         monkeypatch.setattr(builder, "subprocess", SimpleNamespace(run=run))
         return builder.build(source)
 
-    return build, installed_versions
+    return build, installed_versions, new_version
 
 
+@pytest.mark.parametrize(
+    "install_case",
+    [
+        pytest.param((BASE_VERSION, CURRENT_VERSION), id="bare-dev5-to-current-branch"),
+        # Historical EP8 wheels used dev7; the forced reinstall must permit this downgrade.
+        pytest.param(("0.1.0.dev7+megamoe.a8w8.ep8", EP8_VERSION), id="historical-dev7-to-dev5-ep8"),
+        pytest.param((FIX_VERSION, EP8_VERSION), id="dev5-fix-to-ep8"),
+        pytest.param((EP8_VERSION, FIX_VERSION), id="dev5-ep8-to-fix"),
+    ],
+    indirect=True,
+)
 def test_build_replaces_old_install_despite_source_egg_info(install_case):
-    build, installed_versions = install_case
+    build, installed_versions, new_version = install_case
     wheel = build()
-    assert wheel.name == f"ascend_deepep-{NEW_VERSION}-py3-none-any.whl"
-    assert installed_versions() == [NEW_VERSION]
+    assert wheel.name == f"ascend_deepep-{new_version}-py3-none-any.whl"
+    assert installed_versions() == [new_version]
 
 
 @pytest.mark.parametrize("fault", ["wrong_version", "duplicate_metadata"])
 def test_build_rejects_inconsistent_installed_metadata(install_case, fault):
-    build, _ = install_case
+    build, _, new_version = install_case
     with pytest.raises(subprocess.CalledProcessError) as error:
         build(
-            "0.1.0.dev7" if fault == "wrong_version" else NEW_VERSION, duplicate_metadata=fault == "duplicate_metadata"
+            BASE_VERSION if fault == "wrong_version" else new_version, duplicate_metadata=fault == "duplicate_metadata"
         )
     assert error.value.cmd[1:3] == ["-I", "-c"]
