@@ -190,7 +190,7 @@ SHMEM SDK 必须包含匹配的 `deepep-sdk.json`、头文件和库；CATLASS �
 
 ## 4. NPU 测试：先 quick，再 full
 
-默认单机 8 卡（EP8）。首次测试以及每次换分支后都使用 `--build`，
+支持单机 EP2、EP4、EP8，默认 EP8。首次测试以及每次换分支后都使用 `--build`，
 在当前环境构建并重新安装对应 wheel：
 
 ```bash
@@ -219,16 +219,31 @@ bash validation/a8w8/run_npu.sh --suite quick --mma-type fp4xfp8 \
 脚本在源码目录之外运行，清除测试子进程的 `PYTHONPATH`，检查安装版本和对应源码，
 避免测到旧 wheel 或源码遮蔽安装包。
 
-两卡环境可用 EP2；显式选择两张空闲卡：
+使用 `--ep-size` 修改 EP，并显式选择对应数量的空闲卡：
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0,1 \
   bash validation/a8w8/run_npu.sh --ep-size 2 --build --skip-perf \
   --output-dir /data/megamoe-results/fix-ep2-01
+
+# EP4：A4W8 快速回归；已安装当前源码的 wheel 时无需 --build。
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+  bash validation/a8w8/run_npu.sh --ep-size 4 --mma-type fp4xfp8 --suite quick \
+  --output-dir /data/megamoe-results/ep4-a4w8-quick-01
+
+# EP4：完整回归；改成 --mma-type all 可同时测试三种模式。
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+  bash validation/a8w8/run_npu.sh --ep-size 4 --mma-type fp4xfp8 --suite full \
+  --output-dir /data/megamoe-results/ep4-a4w8-full-01
 ```
 
+仅改变 EP 不需要重新编译。未设置 `ASCEND_RT_VISIBLE_DEVICES` 时，脚本根据 EP 自动选择
+从 0 开始的对应数量设备；若环境已设置该变量，脚本保留它，因此从 EP8 切到 EP4 时也应同步修改。
+本目录的测试脚本、文档和回归测试不参与 wheel 源码指纹；仅更新这些文件无需重新构建。
+
 EP 表示进程/rank 数，不是全局专家数。默认 smoke 配置 H=1024、I=256、E=8、TopK=2、S=0，
-EP8 每卡一个专家，EP2 每卡四个专家。EP2 不能代替 EP8 验证。
+EP8 每卡一个专家，EP4 每卡两个专家，EP2 每卡四个专家。各 EP 的结果需分别验收，不能互相替代。
+EP4 已覆盖本地主机侧的命令生成和四个 rank 的报告校验，实际 NPU 精度、同步和性能仍需在服务器验证。
 
 | 套件 | 精度覆盖 | 性能覆盖 |
 | --- | --- | --- |

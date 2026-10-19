@@ -22,7 +22,7 @@ Activate the pinned Torch/torch_npu environment and source CANN first.
   --suite quick|full  quick: all selected precision modes and input paths (default).
                       full: routing/BS matrix + native boundaries + performance.
   --mma-type MODE     all (default), fp8xfp4 (A8W4), fp8xfp8 (A8W8), fp4xfp8 (A4W8).
-  --ep-size 2|8       Single-host EP world size (default: 8).
+  --ep-size 2|4|8     Single-host EP world size (default: 8).
   --skip-perf         Generate CPU Golden and run NPU accuracy only.
   --timeout SECONDS   Limit each distributed launch (default: 1800; kill grace: 30s).
                       Build and CPU Golden generation have no wrapper timeout.
@@ -60,7 +60,7 @@ while (($#)); do
     esac
 done
 [[ $SUITE == quick || $SUITE == full ]] || die '--suite must be quick or full'
-[[ $EP_SIZE == 2 || $EP_SIZE == 8 ]] || die '--ep-size must be 2 or 8'
+[[ $EP_SIZE == 2 || $EP_SIZE == 4 || $EP_SIZE == 8 ]] || die '--ep-size must be 2, 4 or 8'
 [[ $TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] || die '--timeout must be a positive integer (seconds)'
 case "$MMA_SELECTION" in
     all) MMAS=(fp8xfp4 fp8xfp8 fp4xfp8) ;;
@@ -83,7 +83,11 @@ if [[ $CLI_MODE == weights && ( $MMA_SELECTION == all || $MMA_SELECTION == fp4xf
     die 'A4W8 requires an updated checkout with --mma-type; legacy --weights only supports explicit fp8xfp4/fp8xfp8'
 fi
 
-if [[ $EP_SIZE == 8 ]]; then DEFAULT_DEVICES=0,1,2,3,4,5,6,7; else DEFAULT_DEVICES=0,1; fi
+case "$EP_SIZE" in
+    2) DEFAULT_DEVICES=0,1 ;;
+    4) DEFAULT_DEVICES=0,1,2,3 ;;
+    8) DEFAULT_DEVICES=0,1,2,3,4,5,6,7 ;;
+esac
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-$DEFAULT_DEVICES}
 export DEEPEP_SHMEM_ENDPOINT=${DEEPEP_SHMEM_ENDPOINT:-tcp://127.0.0.1:26733}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
@@ -127,8 +131,9 @@ print(output)
 fi
 LOG_DIR="$OUTPUT_DIR/logs"
 trap 'status=$?; printf "FAILED (exit %s). Reports and logs: %s\n" "$status" "$OUTPUT_DIR" >&2; exit "$status"' ERR
-printf 'EP%s suite=%s modes=%s CLI=%s version=%s timeout=%ss output=%s\n' \
-    "$EP_SIZE" "$SUITE" "$SELECTED_MMAS" "$CLI_MODE" "$EXPECTED_VERSION" "$TIMEOUT_SECONDS" "$OUTPUT_DIR"
+printf 'EP%s suite=%s modes=%s CLI=%s version=%s timeout=%ss devices=%s output=%s\n' \
+    "$EP_SIZE" "$SUITE" "$SELECTED_MMAS" "$CLI_MODE" "$EXPECTED_VERSION" "$TIMEOUT_SECONDS" \
+    "$ASCEND_RT_VISIBLE_DEVICES" "$OUTPUT_DIR"
 
 run_logged() {
     local label=$1
@@ -300,7 +305,7 @@ for name, (h, i, e, k) in {
     "topk32": (1024, 256, 64, 32),
     "route_ub": (8192, 256, 32, 1),
 }.items():
-    # All four shapes are legal at EP2 and EP8: experts divide EP, local experts <=128.
+    # All four shapes are legal at EP2/EP4/EP8: experts divide EP, local experts <=128.
     assert e % ep == 0 and e // ep <= 128 and k <= min(e, 32)
     config = dict(schema_version=1, model=dict(hidden=h, intermediate_hidden=i,
                   num_experts=e, num_topk=k, num_shared_experts=0),
