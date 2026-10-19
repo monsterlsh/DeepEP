@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Run either A8W8 branch through its installed wheel, outside the source checkout.
+# Run both branches' precision modes through the installed wheel, outside the checkout.
 set -Eeuo pipefail
 
 REPO_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 PYTHON_BIN=${PYTHON:-python}
 SUITE=quick
+MMA_SELECTION=all
 EP_SIZE=8
 BUILD=0
 SKIP_PERF=0
@@ -18,8 +19,9 @@ Usage: bash validation/a8w8/run_npu.sh [options]
 
 Activate the pinned Torch/torch_npu environment and source CANN first.
   --build             Build and install this checkout (required after changing branches).
-  --suite quick|full  quick: A8W8 FP8/BF16 boundary checks + performance (default).
-                      full: W4/W8 routing/BS matrix + native boundaries + performance.
+  --suite quick|full  quick: all selected precision modes and input paths (default).
+                      full: routing/BS matrix + native boundaries + performance.
+  --mma-type MODE     all (default), fp8xfp4 (A8W4), fp8xfp8 (A8W8), fp4xfp8 (A4W8).
   --ep-size 2|8       Single-host EP world size (default: 8).
   --skip-perf         Generate CPU Golden and run NPU accuracy only.
   --timeout SECONDS   Limit each distributed launch (default: 1800; kill grace: 30s).
@@ -29,7 +31,8 @@ Activate the pinned Torch/torch_npu environment and source CANN first.
   --dry-run           Print commands; do not create files, import Torch or access the network.
   -h, --help          Show this help.
 
-The CLI is detected from this checkout: --weights fp8/fp4 or --mma-type fp8xfp8/fp8xfp4.
+The CLI is detected from this checkout. Legacy --weights supports A8 modes only.
+A4W8 rounds both GEMM activations to MXFP4, then expands them losslessly for FP8 MMAD.
 Overrides: ASCEND_RT_VISIBLE_DEVICES (exactly EP_SIZE devices), DEEPEP_SHMEM_ENDPOINT,
 SHMEM_ROOT, CATLASS_ROOT, CONDA_PREFIX, OMP_NUM_THREADS. Device timer stays disabled.
 HELP
@@ -41,10 +44,11 @@ while (($#)); do
         --build) BUILD=1; shift ;;
         --skip-perf) SKIP_PERF=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
-        --suite|--ep-size|--timeout|--output-dir|--python)
+        --suite|--mma-type|--ep-size|--timeout|--output-dir|--python)
             (($# >= 2)) && [[ -n $2 && $2 != --* ]] || die "$1 requires a value"
             case "$1" in
                 --suite) SUITE=$2 ;;
+                --mma-type) MMA_SELECTION=$2 ;;
                 --ep-size) EP_SIZE=$2 ;;
                 --timeout) TIMEOUT_SECONDS=$2 ;;
                 --output-dir) OUTPUT_DIR=$2 ;;
@@ -58,6 +62,12 @@ done
 [[ $SUITE == quick || $SUITE == full ]] || die '--suite must be quick or full'
 [[ $EP_SIZE == 2 || $EP_SIZE == 8 ]] || die '--ep-size must be 2 or 8'
 [[ $TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] || die '--timeout must be a positive integer (seconds)'
+case "$MMA_SELECTION" in
+    all) MMAS=(fp8xfp4 fp8xfp8 fp4xfp8) ;;
+    fp8xfp4|fp8xfp8|fp4xfp8) MMAS=("$MMA_SELECTION") ;;
+    *) die '--mma-type must be all, fp8xfp4, fp8xfp8 or fp4xfp8' ;;
+esac
+SELECTED_MMAS=$(IFS=,; printf '%s' "${MMAS[*]}")
 
 MODULE_DIR="$REPO_DIR/experiments/megamoe/python/deep_ep_experimental/megamoe"
 if grep -Fq '"--mma-type", choices=' "$MODULE_DIR/benchmark.py" &&
@@ -68,6 +78,9 @@ elif grep -Fq '"--weights", choices=' "$MODULE_DIR/benchmark.py" &&
     CLI_MODE=weights
 else
     die 'Unsupported or inconsistent benchmark/Golden CLI in this checkout'
+fi
+if [[ $CLI_MODE == weights && ( $MMA_SELECTION == all || $MMA_SELECTION == fp4xfp8 ) ]]; then
+    die 'A4W8 requires an updated checkout with --mma-type; legacy --weights only supports explicit fp8xfp4/fp8xfp8'
 fi
 
 if [[ $EP_SIZE == 8 ]]; then DEFAULT_DEVICES=0,1,2,3,4,5,6,7; else DEFAULT_DEVICES=0,1; fi
@@ -114,8 +127,8 @@ print(output)
 fi
 LOG_DIR="$OUTPUT_DIR/logs"
 trap 'status=$?; printf "FAILED (exit %s). Reports and logs: %s\n" "$status" "$OUTPUT_DIR" >&2; exit "$status"' ERR
-printf 'EP%s suite=%s CLI=%s version=%s timeout=%ss output=%s\n' \
-    "$EP_SIZE" "$SUITE" "$CLI_MODE" "$EXPECTED_VERSION" "$TIMEOUT_SECONDS" "$OUTPUT_DIR"
+printf 'EP%s suite=%s modes=%s CLI=%s version=%s timeout=%ss output=%s\n' \
+    "$EP_SIZE" "$SUITE" "$SELECTED_MMAS" "$CLI_MODE" "$EXPECTED_VERSION" "$TIMEOUT_SECONDS" "$OUTPUT_DIR"
 
 run_logged() {
     local label=$1
@@ -133,7 +146,7 @@ if ((BUILD)); then
 fi
 
 run_logged preflight env -u PYTHONPATH "$PYTHON_BIN" -I - "$EXPECTED_VERSION" "$REPO_DIR" \
-    "$CLI_MODE" "$EP_SIZE" "$SUITE" "$SKIP_PERF" "$TIMEOUT_SECONDS" "$BUILD" <<'PY'
+    "$CLI_MODE" "$EP_SIZE" "$SUITE" "$SKIP_PERF" "$TIMEOUT_SECONDS" "$BUILD" "$SELECTED_MMAS" <<'PY'
 from datetime import datetime, timezone
 import importlib.util
 from importlib.metadata import distributions, version
@@ -145,7 +158,8 @@ import platform
 import subprocess
 import sys
 
-expected, source, cli, ep, suite, skip_perf, timeout, built = sys.argv[1:]
+expected, source, cli, ep, suite, skip_perf, timeout, built, selected = sys.argv[1:]
+modes = selected.split(",")
 ep = int(ep)
 root = Path(source).resolve()
 import torch
@@ -174,9 +188,13 @@ if not info["megamoe"]["enabled"] or native.api_protocol != 4:
     raise SystemExit("Rebuild the complete MegaMoE wheel with --build")
 if info["megamoe"].get("timer"):
     raise SystemExit("Tests require a timer-OFF wheel; rerun with --build")
-entrypoint = "fp8_fp8_mega_moe" if cli == "mma-type" else "fp8_fp4_mega_moe"
-if not callable(getattr(megamoe, entrypoint, None)):
-    raise SystemExit(f"Installed wheel lacks {entrypoint}; rerun with --build")
+for mode in modes:
+    entrypoint = {"fp8xfp4": "fp8_fp4_mega_moe", "fp8xfp8": "fp8_fp8_mega_moe",
+                  "fp4xfp8": "fp4_fp8_mega_moe"}[mode] if cli == "mma-type" else "fp8_fp4_mega_moe"
+    if not callable(getattr(megamoe, entrypoint, None)):
+        raise SystemExit(f"Installed wheel lacks {entrypoint}; rerun with --build")
+if "fp4xfp8" in modes and not getattr(native, "a4w8_supported", False):
+    raise SystemExit("Installed native extension lacks A4W8 support; rerun with --build")
 installed_benchmark = files(megamoe).joinpath("benchmark.py").read_text()
 if f'"--{cli}", choices=' not in installed_benchmark:
     raise SystemExit("Installed benchmark CLI differs from checkout; rerun with --build")
@@ -204,7 +222,7 @@ metadata = dict(
     python=sys.version, executable=sys.executable, platform=platform.platform(),
     torch=torch.__version__, torch_npu=torch_npu.__version__,
     devices=[dict(local_rank=rank, name=torch.npu.get_device_name(rank)) for rank in range(ep)],
-    arguments=dict(cli=cli, suite=suite, ep_size=ep, skip_perf=skip_perf == "1",
+    arguments=dict(cli=cli, suite=suite, mma_types=modes, ep_size=ep, skip_perf=skip_perf == "1",
                    timeout_seconds=int(timeout), build=built == "1", timer=False),
     environment={key: os.environ.get(key) for key in (
         "ASCEND_RT_VISIBLE_DEVICES", "DEEPEP_SHMEM_ENDPOINT", "SHMEM_ROOT", "CATLASS_ROOT",
@@ -233,6 +251,11 @@ mode_args() {
     fi
 }
 
+input_args() {
+    if [[ $1 == fp4xfp8 ]]; then ENCODED_INPUT=fp4; else ENCODED_INPUT=fp8; fi
+    INPUTS=("$ENCODED_INPUT" bf16)
+}
+
 accuracy_case() {
     local name=$1 config=$2 mma=$3 input=$4 routing=$5 batches=$6 samples=$7
     mode_args "$mma"
@@ -250,14 +273,16 @@ accuracy_case() {
 }
 
 if [[ $SUITE == quick ]]; then
-    for input in fp8 bf16; do
-        accuracy_case "fp8xfp8_${input}_balanced" smoke fp8xfp8 "$input" balanced 96,120,121,128,129,257 0
-    done
-    MMAS=(fp8xfp8)
-else
-    MMAS=(fp8xfp4 fp8xfp8)
     for mma in "${MMAS[@]}"; do
-        for input in fp8 bf16; do
+        input_args "$mma"
+        for input in "${INPUTS[@]}"; do
+            accuracy_case "${mma}_${input}_balanced" smoke "$mma" "$input" balanced 96,120,121,128,129,257 0
+        done
+    done
+else
+    for mma in "${MMAS[@]}"; do
+        input_args "$mma"
+        for input in "${INPUTS[@]}"; do
             for routing in balanced random skewed; do
                 accuracy_case "${mma}_${input}_${routing}" smoke "$mma" "$input" "$routing" \
                     1,17,96,119,120,121,127,128,129,255,256,257,512,4096 0
@@ -289,9 +314,12 @@ PY
             topk32) batches=17,129; samples=17 ;;
             route_ub) batches=16384; samples=17 ;;
         esac
-        for input in fp8 bf16; do
-            accuracy_case "native_${shape}_${input}" "$OUTPUT_DIR/native_$shape.json" \
-                fp8xfp8 "$input" balanced "$batches" "$samples"
+        for mma in "${MMAS[@]}"; do
+            input_args "$mma"
+            for input in "${INPUTS[@]}"; do
+                accuracy_case "native_${shape}_${mma}_${input}" "$OUTPUT_DIR/native_$shape.json" \
+                    "$mma" "$input" balanced "$batches" "$samples"
+            done
         done
     done
 fi
@@ -299,20 +327,21 @@ fi
 if ((!SKIP_PERF)); then
     for mma in "${MMAS[@]}"; do
         mode_args "$mma"
+        input_args "$mma"
         for bs in 96 4096; do
             for repeat in 1 2 3; do
                 name="perf_${mma}_bs${bs}_r${repeat}"
                 run_ep "$name" --config smoke "${MODE_ARGS[@]}" --mode perf \
-                    --bs-values "$bs" --input fp8 --routing balanced --output-dir "$OUTPUT_DIR/$name"
+                    --bs-values "$bs" --input "$ENCODED_INPUT" --routing balanced --output-dir "$OUTPUT_DIR/$name"
                 if ((!DRY_RUN)); then
-                    printf '%s\t%s\tfp8\tbalanced\t%s\t0\n' "$name" "$mma" "$bs" >> "$OUTPUT_DIR/expected.tsv"
+                    printf '%s\t%s\t%s\tbalanced\t%s\t0\n' "$name" "$mma" "$ENCODED_INPUT" "$bs" >> "$OUTPUT_DIR/expected.tsv"
                 fi
             done
         done
     done
 fi
 
-run_logged summary "$PYTHON_BIN" -I - "$OUTPUT_DIR" "$SUITE" "$SKIP_PERF" "$EP_SIZE" <<'PY'
+run_logged summary "$PYTHON_BIN" -I - "$OUTPUT_DIR" "$SUITE" "$SKIP_PERF" "$EP_SIZE" "$SELECTED_MMAS" <<'PY'
 import csv
 import json
 import math
@@ -320,13 +349,33 @@ from pathlib import Path
 import sys
 
 root, suite, skip_perf, ep = Path(sys.argv[1]), sys.argv[2], sys.argv[3] == "1", int(sys.argv[4])
+modes = sys.argv[5].split(",")
 accuracy, performance, lines, errors = [], [], [], []
-expected_accuracy = 12 if suite == "quick" else 184
-expected_performance = 0 if skip_perf else (6 if suite == "quick" else 12)
+if (suite not in ("quick", "full") or not modes or len(set(modes)) != len(modes) or
+        any(mode not in ("fp8xfp4", "fp8xfp8", "fp4xfp8") for mode in modes)):
+    raise SystemExit("Invalid summary suite or precision selection")
+expected_accuracy = (12 if suite == "quick" else 100) * len(modes)
+expected_performance = 0 if skip_perf else 6 * len(modes)
+expected_full_call = 0 if skip_perf or "fp4xfp8" not in modes else 6
 expected_paths = set()
+expected_full_call_paths = set()
+
+def timing_stats(report):
+    rounds = report["per_rank_rounds_us"]
+    if (len(rounds) != ep or not rounds or not rounds[0] or
+            any(len(row) != len(rounds[0]) for row in rounds)):
+        raise ValueError("performance report rank/round count differs from EP size")
+    values = [report["mean_us"], report["rank_max_mean_us"], *(value for row in rounds for value in row)]
+    if not all(math.isfinite(value) and value > 0 for value in values):
+        raise ValueError("nonfinite or nonpositive timing")
+    return dict(mean_us=report["mean_us"], rank_max_mean_us=report["rank_max_mean_us"])
+
 with (root / "expected.tsv").open(newline="", encoding="utf-8") as stream:
     cases = list(csv.reader(stream, delimiter="\t"))
 for name, mma, input_kind, routing, batches, samples in cases:
+    allowed_inputs = ("fp4", "bf16") if mma == "fp4xfp8" else ("fp8", "bf16")
+    if mma not in modes or input_kind not in allowed_inputs:
+        errors.append(f"{name}: unexpected precision/input selection {mma}/{input_kind}")
     kind = "accuracy" if name.startswith("accuracy_") else "profiling"
     for rank in range(ep):
         manifest_path = root / name / f"rank_{rank}" / "manifest.json"
@@ -356,26 +405,59 @@ for name, mma, input_kind, routing, batches, samples in cases:
                           all(r["passed"] and r["counts_equal"] and r["cumulative_counts_equal"] and
                               r["checked_token_count"] == checked and r["total_tokens"] == int(batch)
                               for r in report))
-                accuracy.append(dict(path=str(path), passed=passed))
+                accuracy.append(dict(path=str(path), passed=passed, mma_type=mma, input=input_kind))
                 lines.append(f"ACCURACY {'PASS' if passed else 'FAIL'} {name}/bs_{batch}")
             else:
-                if len(report["per_rank_rounds_us"]) != ep:
-                    raise ValueError("performance report rank count differs from EP size")
-                entry = dict(path=str(path), mma_type=mma, bs=int(batch),
-                             mean_us=report["mean_us"], rank_max_mean_us=report["rank_max_mean_us"])
-                if not all(math.isfinite(entry[k]) and entry[k] > 0 for k in ("mean_us", "rank_max_mean_us")):
-                    raise ValueError("nonfinite or nonpositive timing")
+                if report.get("timing_scope", "fused_kernel") != "fused_kernel":
+                    raise ValueError("unexpected fused-kernel timing scope")
+                entry = dict(path=str(path), mma_type=mma, bs=int(batch), timing_scope="fused_kernel",
+                             **timing_stats(report))
+                if mma == "fp4xfp8":
+                    complete = report["full_call_device"]
+                    if (complete["metric"] != "megamoe_full_call_device_duration_us" or
+                            complete["measurement"] != "caller_stream_npu_events" or
+                            complete["mma_type"] != mma or complete["input"] != input_kind or
+                            complete["includes_fp4_expansion"] is not (input_kind == "fp4")):
+                        raise ValueError("A4W8 full-call timing metadata differs from requested input")
+                    for rank in range(ep):
+                        complete_path = root / name / f"rank_{rank}" / f"bs_{batch}" / "full_call_profiling.json"
+                        expected_full_call_paths.add(complete_path)
+                        if json.loads(complete_path.read_text()) != complete:
+                            raise ValueError(f"rank {rank} full-call report differs from profiling.json")
+                    entry["full_call_device"] = dict(
+                        metric=complete["metric"], measurement=complete["measurement"],
+                        includes_fp4_expansion=complete["includes_fp4_expansion"], **timing_stats(complete))
                 performance.append(entry)
-                lines.append(f"PERF {name}: min-mean={entry['mean_us']:.3f} us, max-mean={entry['rank_max_mean_us']:.3f} us")
+                lines.append(f"PERF fused-kernel {name}: min-mean={entry['mean_us']:.3f} us, "
+                             f"max-mean={entry['rank_max_mean_us']:.3f} us")
+                if mma == "fp4xfp8":
+                    complete = entry["full_call_device"]
+                    lines.append(f"PERF full-call-device {name}: min-mean={complete['mean_us']:.3f} us, "
+                                 f"max-mean={complete['rank_max_mean_us']:.3f} us, "
+                                 f"includes_fp4_expansion={complete['includes_fp4_expansion']}")
         except (OSError, ValueError, KeyError, TypeError) as error:
             errors.append(f"{path}: {error}")
 actual_paths = set(root.glob("accuracy_*/rank_0/bs_*/accuracy.json")) | set(root.glob("perf_*/rank_0/bs_*/profiling.json"))
 if actual_paths != expected_paths:
     errors.append("Missing or unexpected report paths")
+if set(root.glob("perf_*/rank_*/bs_*/full_call_profiling.json")) != expected_full_call_paths:
+    errors.append("Missing or unexpected full-call report paths")
+if sum("full_call_device" in entry for entry in performance) != expected_full_call:
+    errors.append("Missing or unexpected A4W8 full-call timing reports")
+for mode in modes:
+    mode_accuracy = [entry for entry in accuracy if entry["mma_type"] == mode]
+    mode_performance = [entry for entry in performance if entry["mma_type"] == mode]
+    if (len(mode_accuracy) != (12 if suite == "quick" else 100) or
+            len(mode_performance) != (0 if skip_perf else 6)):
+        errors.append(f"{mode}: missing or unexpected precision-mode reports")
+    for input_kind in (("fp4", "bf16") if mode == "fp4xfp8" else ("fp8", "bf16")):
+        if sum(entry["input"] == input_kind for entry in mode_accuracy) != (6 if suite == "quick" else 50):
+            errors.append(f"{mode}/{input_kind}: missing or unexpected input-path reports")
 passed = (not errors and len(accuracy) == expected_accuracy and len(performance) == expected_performance and
           all(entry["passed"] for entry in accuracy))
-summary = dict(passed=passed, suite=suite, ep_size=ep, expected_accuracy=expected_accuracy,
-               expected_performance=expected_performance, accuracy=accuracy, performance=performance, errors=errors)
+summary = dict(passed=passed, suite=suite, mma_types=modes, ep_size=ep, expected_accuracy=expected_accuracy,
+               expected_performance=expected_performance, expected_full_call=expected_full_call,
+               accuracy=accuracy, performance=performance, errors=errors)
 (root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 lines.extend(f"ERROR {error}" for error in errors)
 lines.append(f"{'PASS' if passed else 'FAIL'}: accuracy {len(accuracy)}/{expected_accuracy}, performance {len(performance)}/{expected_performance}")

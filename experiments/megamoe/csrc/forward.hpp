@@ -23,7 +23,7 @@ class Plan {
 public:
     Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world, int64_t max_tokens,
          bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts, uint64_t symmetric_address,
-         int64_t symmetric_bytes);
+         int64_t symmetric_bytes, bool is_a4w8 = false);
 
     std::tuple<torch::Tensor, torch::Tensor> forward(
         torch::Tensor x, c10::optional<torch::Tensor> x_scales, torch::Tensor topk_ids, torch::Tensor topk_weights,

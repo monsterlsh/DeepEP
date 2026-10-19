@@ -82,19 +82,21 @@ def test_default_plan_preserves_a8w4_and_timer(configuration):
     assert plan["timer"] and plan["parse_timer"]
 
 
-@pytest.mark.parametrize("input_type", ["fp8", "bf16"])
-def test_a8w8_plan_passes_matching_format_to_benchmark_and_golden(configuration, tmp_path, input_type):
+@pytest.mark.parametrize(
+    "mma_type,input_type", [("fp8xfp8", "fp8"), ("fp8xfp8", "bf16"), ("fp4xfp8", "fp4"), ("fp4xfp8", "bf16")]
+)
+def test_fp8_weights_plan_passes_matching_format_to_benchmark_and_golden(configuration, tmp_path, input_type, mma_type):
     plan = launcher.make_plan(
         launcher.parse_args(
-            [*configuration, "--mma-type", "fp8xfp8", "--no-timer", "--input", input_type, "--mode", "accuracy"]
+            [*configuration, "--mma-type", mma_type, "--no-timer", "--input", input_type, "--mode", "accuracy"]
         )
     )
-    assert plan["mma_type"] == "fp8xfp8"
+    assert plan["mma_type"] == mma_type
     assert not plan["timer"] and not plan["parse_timer"]
     benchmark = node.benchmark_command(plan, tmp_path, 1, 96)
     golden = node.golden_command(plan, tmp_path, 1, 96)
     for command in (benchmark, golden):
-        assert command[command.index("--mma-type") + 1] == "fp8xfp8"
+        assert command[command.index("--mma-type") + 1] == mma_type
         assert command[command.index("--input") + 1] == input_type
         assert command[command.index("--golden-dir") + 1] == str(ROOT / "benchmark-golden")
     assert "--timer" not in benchmark
@@ -115,6 +117,26 @@ def test_a8w8_rejects_shared_experts_before_launch(configuration):
                 [*configuration, "--mma-type", "fp8xfp8", "--no-timer", "--config", "deepseek_v4_pro_shared1"]
             )
         )
+
+
+@pytest.mark.parametrize(
+    "options,match",
+    [
+        (["--input", "fp8"], "requires bf16 or fp4"),
+        (["--input", "fp4"], "--no-timer"),
+        (["--input", "fp4", "--no-timer", "--config", "deepseek_v4_pro_shared1"], "shared experts"),
+    ],
+)
+def test_a4w8_plan_rejects_mismatched_input_timer_and_shared(configuration, options, match):
+    with pytest.raises(ValueError, match=match):
+        launcher.make_plan(launcher.parse_args([*configuration, "--mma-type", "fp4xfp8", *options]))
+
+
+@pytest.mark.parametrize("mma_type,expected", [("fp8xfp4", "fp8"), ("fp8xfp8", "fp8"), ("fp4xfp8", "fp4")])
+def test_batch_default_input_follows_activation_mode(configuration, mma_type, expected):
+    args = launcher.parse_args([*configuration, "--mma-type", mma_type, "--no-timer"])
+    assert args.input == expected
+    assert launcher.make_plan(args)["input"] == expected
 
 
 def test_legacy_plan_uses_a8w4_for_benchmark_and_golden(configuration, tmp_path):

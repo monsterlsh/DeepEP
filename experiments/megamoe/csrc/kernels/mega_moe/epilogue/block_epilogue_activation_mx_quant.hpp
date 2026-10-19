@@ -33,6 +33,7 @@
 #include "quant/mx_quant_common.hpp"
 #include "quant/mx_quant_compute_scale.hpp"
 #include "quant/mxfp4_quant.hpp"
+#include "quant/mxfp4_expanded_quant.hpp"
 #include "quant/mxfp8_quant.hpp"
 
 namespace ActivationQuantMsg {
@@ -49,7 +50,7 @@ using namespace AscendC;
 using namespace ActivationQuantMsg;
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM = 256, uint32_t TileN = 256,
-          bool TopkWeightsPrefetch = false, bool IsInterleaved_ = false>
+          bool TopkWeightsPrefetch = false, bool IsInterleaved_ = false, bool QuantizeFp4Expanded = false>
 class BlockEpilogueActivationMxQuant {
 public:
     __aicore__ inline BlockEpilogueActivationMxQuant() {}
@@ -138,12 +139,13 @@ private:
 };
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
+          bool IsInterleaved_, bool QuantizeFp4Expanded>
 __aicore__ inline void
-BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                               IsInterleaved_>::StoreQuantOutput(AscendC::GlobalTensor<int8_t>& dst,
-                                                                 AscendC::LocalTensor<int8_t>& src, uint64_t blockCount,
-                                                                 uint64_t offset, uint64_t n, uint64_t singleN)
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               QuantizeFp4Expanded>::StoreQuantOutput(AscendC::GlobalTensor<int8_t>& dst,
+                                                                      AscendC::LocalTensor<int8_t>& src,
+                                                                      uint64_t blockCount, uint64_t offset, uint64_t n,
+                                                                      uint64_t singleN)
 {
     AscendC::DataCopyExtParams ub2GmParams{1, 0, 0, 0, 0};
     ub2GmParams.blockCount = blockCount;  // 128
@@ -163,13 +165,13 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
+          bool IsInterleaved_, bool QuantizeFp4Expanded>
 __aicore__ inline void
-BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                               IsInterleaved_>::StoreQuantScaleCompact(AscendC::GlobalTensor<int8_t>& dst,
-                                                                       AscendC::LocalTensor<int8_t>& src,
-                                                                       uint64_t blockCount, uint64_t offset,
-                                                                       uint64_t scaleN, uint64_t singleN)
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               QuantizeFp4Expanded>::StoreQuantScaleCompact(AscendC::GlobalTensor<int8_t>& dst,
+                                                                            AscendC::LocalTensor<int8_t>& src,
+                                                                            uint64_t blockCount, uint64_t offset,
+                                                                            uint64_t scaleN, uint64_t singleN)
 {
     AscendC::DataCopyExtParams ub2GmParams{0, 0, 0, 0, 0};
     auto blockScaleN = Ops::Base::CeilDiv(static_cast<uint64_t>(singleN), static_cast<uint64_t>(MXFP_DIVISOR_SIZE)) *
@@ -183,9 +185,9 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
+          bool IsInterleaved_, bool QuantizeFp4Expanded>
 __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                                                      IsInterleaved_>::Init(Params const& params)
+                                                      IsInterleaved_, QuantizeFp4Expanded>::Init(Params const& params)
 {
     if constexpr (g_coreType == AIC) {
         return;
@@ -218,9 +220,10 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
-__aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                                                      IsInterleaved_>::UpdateGlobalAddr(const BlockCoord& baseOffset)
+          bool IsInterleaved_, bool QuantizeFp4Expanded>
+__aicore__ inline void
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               QuantizeFp4Expanded>::UpdateGlobalAddr(const BlockCoord& baseOffset)
 {
     if constexpr (g_coreType == AIV) {
         quantOutputGlobal_.SetGlobalBuffer((__gm__ int8_t*)yGmAddr_ + Get<Y_IDX>(baseOffset));
@@ -229,10 +232,10 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
+          bool IsInterleaved_, bool QuantizeFp4Expanded>
 __aicore__ inline void
-BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                               IsInterleaved_>::UpdateNextProblem(const ProblemShape& problemShape)
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               QuantizeFp4Expanded>::UpdateNextProblem(const ProblemShape& problemShape)
 {
     intermediateHiddenSize_ = Get<N_VALUE>(problemShape);
     intermediateHiddenScaleElements_ =
@@ -241,15 +244,15 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
+          bool IsInterleaved_, bool QuantizeFp4Expanded>
 __aicore__ inline void
-BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                               IsInterleaved_>::RunGatedActivationTile(__ubuf__ DataTypeIn* firstSrc,
-                                                                       __ubuf__ DataTypeIn* secondSrc,
-                                                                       __ubuf__ bfloat16_t* gluResAddr,
-                                                                       uint16_t validRowCount,
-                                                                       uint16_t validColumnCount,
-                                                                       uint32_t outputRowStrideElements)
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               QuantizeFp4Expanded>::RunGatedActivationTile(__ubuf__ DataTypeIn* firstSrc,
+                                                                            __ubuf__ DataTypeIn* secondSrc,
+                                                                            __ubuf__ bfloat16_t* gluResAddr,
+                                                                            uint16_t validRowCount,
+                                                                            uint16_t validColumnCount,
+                                                                            uint32_t outputRowStrideElements)
 {
     uint32_t inputRowStrideElements;
     if constexpr (IsInterleaved_) {
@@ -345,11 +348,12 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
-__aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                                                      IsInterleaved_>::RunMxQuantTile(const UbPointers& ubPointers,
-                                                                                      uint16_t validRowCount,
-                                                                                      uint32_t outputRowStrideElements)
+          bool IsInterleaved_, bool QuantizeFp4Expanded>
+__aicore__ inline void
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               QuantizeFp4Expanded>::RunMxQuantTile(const UbPointers& ubPointers,
+                                                                    uint16_t validRowCount,
+                                                                    uint32_t outputRowStrideElements)
 {
     const uint32_t dataCount = validRowCount * outputRowStrideElements;
     const uint32_t scaleCount = dataCount / ONE_BLK_SIZE;
@@ -359,9 +363,14 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
                                                           MxQuant::SCALE_ELEMENT_COUNT_PER_VECTOR);
 
     MxQuant::ComputeGroupMaxExp(ubPointers.activationOutput, ubPointers.maxExp, dataCount, dataLoopCount);
-    MxQuant::ComputeMxScale<DataTypeOut>(ubPointers.maxExp, ubPointers.quantScale, ubPointers.reciprocalScale,
-                                         scaleCount, scaleLoopCount);
-    if constexpr (IsSameType<DataTypeOut, fp8_e4m3fn_t>::value || IsSameType<DataTypeOut, fp8_e5m2_t>::value) {
+    using ScaleQuantType = Std::conditional_t<QuantizeFp4Expanded, fp4x2_e2m1_t, DataTypeOut>;
+    MxQuant::ComputeMxScale<ScaleQuantType, QuantizeFp4Expanded>(
+        ubPointers.maxExp, ubPointers.quantScale, ubPointers.reciprocalScale, scaleCount, scaleLoopCount);
+    if constexpr (QuantizeFp4Expanded) {
+        static_assert(IsSameType<DataTypeOut, fp8_e4m3fn_t>::value, "Expanded FP4 must use E4M3 physical storage");
+        MxQuant::QuantizeMxFp4ExpandedData(ubPointers.activationOutput, ubPointers.reciprocalScale,
+                                           ubPointers.quantOutput, dataCount);
+    } else if constexpr (IsSameType<DataTypeOut, fp8_e4m3fn_t>::value || IsSameType<DataTypeOut, fp8_e5m2_t>::value) {
         MxQuant::QuantizeMxFp8Data<DataTypeOut>(ubPointers.activationOutput, ubPointers.reciprocalScale,
                                                 ubPointers.quantOutput, dataCount, dataLoopCount);
     }
@@ -372,19 +381,19 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
+          bool IsInterleaved_, bool QuantizeFp4Expanded>
 __aicore__ inline auto BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                                                      IsInterleaved_>::GetTopkWeightTensor()
+                                                      IsInterleaved_, QuantizeFp4Expanded>::GetTopkWeightTensor()
 {
     return weightUb_;
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
-__aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                                                      IsInterleaved_>::operator()(const BlockShape& blockShape,
-                                                                                  const BlockCoord& blockCoord,
-                                                                                  uint16_t pingpongIdx)
+          bool IsInterleaved_, bool QuantizeFp4Expanded>
+__aicore__ inline void
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               QuantizeFp4Expanded>::operator()(const BlockShape& blockShape,
+                                                                const BlockCoord& blockCoord, uint16_t pingpongIdx)
 {
     uint32_t tileRowCount = Get<M_VALUE>(blockShape);     // 128
     uint32_t tileColumnCount = Get<N_VALUE>(blockShape);  // 256

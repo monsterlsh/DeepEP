@@ -31,15 +31,15 @@ def token_indices(bs, check_tokens):
 def contract(config, world, bs, input_kind, routing, check_tokens, mma_type="fp8xfp4"):
     from . import reference
     from .benchmark import inputs
+    from .formats import validate_input_format
 
     if world <= 0 or config["model"]["num_experts"] % world:
         raise ValueError("Global experts must divide positive EP size")
-    if input_kind not in ("bf16", "fp8") or routing not in ("balanced", "random", "skewed"):
+    if input_kind not in ("bf16", "fp8", "fp4") or routing not in ("balanced", "random", "skewed"):
         raise ValueError("Invalid Golden input/routing")
-    if mma_type not in ("fp8xfp4", "fp8xfp8"):
-        raise ValueError(f"Unsupported MMA type: {mma_type}")
-    if mma_type == "fp8xfp8" and config["model"]["num_shared_experts"]:
-        raise ValueError("fp8xfp8 does not support shared experts")
+    validate_input_format(mma_type, input_kind)
+    if mma_type != "fp8xfp4" and config["model"]["num_shared_experts"]:
+        raise ValueError(f"{mma_type} does not support shared experts")
     token_indices(bs, check_tokens)
     # 权重/输入或参考算法变化自动失效；编译参数、性能轮数不影响 Golden。
     source = inspect.getsource(reference) + inspect.getsource(inputs) + Path(__file__).read_text(encoding="utf-8")
@@ -131,6 +131,7 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
     """Compute a node's source ranks together; bound dense weights by worker count."""
     import numpy as np
     from .benchmark import inputs
+    from .formats import activation_format
     from .reference import bf16, dequantize_input, expert_forward, make_weights, quantize_input, unpack_weight
 
     if workers < 1 or chunk_tokens < 1 or not ranks or len(set(ranks)) != len(ranks):
@@ -138,6 +139,7 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
     if any(not 0 <= rank < spec["world"] for rank in ranks):
         raise ValueError("Golden source rank exceeds EP size")
     model, bs, world = spec["model"], spec["bs"], spec["world"]
+    activation_kind = activation_format(spec["mma_type"])
     local = model["num_experts"] // world
     selected = token_indices(bs, spec["check_tokens"])
     counts = np.zeros(model["num_experts"], dtype=np.int64)
@@ -146,7 +148,11 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
         x, ids, weights = inputs(config, source, bs, spec["routing"], world=world)
         counts += np.bincount(ids.ravel(), minlength=len(counts))
         if source in ranks:
-            sources[source] = (dequantize_input(*quantize_input(x[selected])), ids[selected], weights[selected])
+            sources[source] = (
+                dequantize_input(*quantize_input(x[selected], activation_kind), activation_kind),
+                ids[selected],
+                weights[selected],
+            )
         if source == 0 or (source + 1) % 8 == 0:
             print(f"[GOLDEN] BS={bs} input/counts source={source + 1}/{world}", flush=True)
     x = np.concatenate([sources[rank][0] for rank in ranks])
@@ -180,7 +186,7 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
         result = np.empty((len(token), model["hidden"]), dtype=np.float32)
         for start in range(0, len(token), chunk_tokens):
             stop = start + chunk_tokens
-            result[start:stop] = expert_forward(x[token[start:stop]], w1, w2)
+            result[start:stop] = expert_forward(x[token[start:stop]], w1, w2, spec["mma_type"])
         if route_weight is not None:
             result *= route_weight[:, None]
         return token, result
@@ -282,8 +288,8 @@ def main():
     parser.add_argument("--ep-size", type=int, required=True)
     parser.add_argument("--ranks", required=True, help="Source ranks on this host, e.g. 0-7")
     parser.add_argument("--golden-dir", type=Path, default=Path("benchmark-golden"))
-    parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
-    parser.add_argument("--mma-type", choices=("fp8xfp4", "fp8xfp8"), default="fp8xfp4")
+    parser.add_argument("--input", choices=("bf16", "fp8", "fp4"), default="bf16")
+    parser.add_argument("--mma-type", choices=("fp8xfp4", "fp8xfp8", "fp4xfp8"), default="fp8xfp4")
     parser.add_argument("--routing", choices=("balanced", "random", "skewed"), default="balanced")
     parser.add_argument("--check-tokens", type=int, default=0)
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)

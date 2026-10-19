@@ -174,10 +174,12 @@ private:
         (TopkWeightsPrefetch || !GMM1_INTERLEAVED) ? A8W8_GMM1_UB_TILE_M : L1_TILE_M_256;
     static_assert(L1_TILE_N == A8W8_GMM1_UB_TILE_N, "A8W8 UB policy must match the GMM1 tile width");
 
-    using BlockEpilogue = BlockEpilogueActivationMxQuant<ActivationType, bfloat16_t, EPILOGUE_TILE_M, L1_TILE_N,
-                                                         TopkWeightsPrefetch, GMM1_INTERLEAVED>;
+    using BlockEpilogue =
+        BlockEpilogueActivationMxQuant<ActivationType, bfloat16_t, EPILOGUE_TILE_M, L1_TILE_N, TopkWeightsPrefetch,
+                                       GMM1_INTERLEAVED, QuantMode == E2M1_EXPANDED_QUANT>;
     using SharedBlockEpilogue =
-        BlockEpilogueActivationMxQuant<ActivationType, bfloat16_t, L1_TILE_M_256, L1_TILE_N, false, GMM1_INTERLEAVED>;
+        BlockEpilogueActivationMxQuant<ActivationType, bfloat16_t, L1_TILE_M_256, L1_TILE_N, false, GMM1_INTERLEAVED,
+                                       QuantMode == E2M1_EXPANDED_QUANT>;
     BlockEpilogue epilogueOp_;
     SharedBlockEpilogue sharedEpilogueOp_;
     MegaMoeImpl::ExceptionDumpEngine exceptionDump_;
@@ -387,7 +389,8 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::SendAnd
     uint32_t mxTempTensorSize = 2 * 1024;
     // 单个 xOutTensor 槽位与 dispatch 的 token-scale-weight 通信记录使用相同布局。
     uint32_t xOutTensorSize = quantProcessConfig_.quantTokenScaleAlignBytes;
-    uint32_t xInAlignSize = Ops::Base::CeilAlign(k_, static_cast<uint32_t>(ALIGN_128)) * sizeof(bfloat16_t);
+    constexpr uint32_t inputAlignment = QuantMode == E2M1_EXPANDED_QUANT ? ALIGN_256 : ALIGN_128;
+    uint32_t xInAlignSize = Ops::Base::CeilAlign(k_, inputAlignment) * sizeof(bfloat16_t);
     uint32_t expertPerCoreMax = Ops::Base::CeilDiv(worldSize_ * moeExpertPerRank_, blockAivNum_);
     uint32_t sendCntAccSize =
         Ops::Base::CeilAlign(static_cast<int64_t>(expertPerCoreMax * sizeof(int32_t)), static_cast<int64_t>(ALIGN_32));

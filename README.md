@@ -299,7 +299,7 @@ Tensor 布局、事件同步及 Buffer 生命周期见 [API 文档](docs/api.md)
 
 MegaMoE 将 dispatch、专家计算、激活/量化及 combine 融合为 W4A8 推理流程，覆盖 Prefill 与 Decode。配置和使用方法见 [experiments/megamoe/](experiments/megamoe/README.md)。
 
-实验测试入口也提供 W8A8（`--mma-type fp8xfp8`），支持 FP8/BF16 输入及独立 Golden 校验；当前不支持共享专家和设备 timer。单机 EP8 的构建、精度与性能验收见 [测试方案](experiments/megamoe/tests/README.md)，设备结果需在目标 Ascend950 环境验证。
+实验测试入口提供 A8W4、A8W8 和 A4W8（`--mma-type fp8xfp4|fp8xfp8|fp4xfp8`），支持 BF16 及对应预量化输入和独立 Golden 校验。A4W8 在输入及 SwiGLU 后均使用 FP4 精度，再无损展开为 FP8 存储、通信和计算，不代表原生 FP4×FP8 MMAD 或 FP4 通信带宽节省。A8W8/A4W8 不支持共享专家和设备 timer。CPU 与单机 EP2/EP8 验收见 [统一测试方案](validation/a8w8/README.md)，设备结果需在目标 Ascend950 环境验证。
 
 ## 致谢
 

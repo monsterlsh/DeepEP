@@ -5,7 +5,8 @@ Modified by Joyce_An 2026
 
 # MegaMoE Prefill Beta
 
-公开入口：`deep_ep_experimental.megamoe`。W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度。
+公开入口：`deep_ep_experimental.megamoe`，支持 A8W4、A8W8 和 A4W8 的 MX 浮点量化语义。
+W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度。
 构建和多机测试入口位于本目录的 `scripts/`；机器地址及环境配置由使用者提供。
 
 ## 1. 输入、输出与公开接口
@@ -28,8 +29,8 @@ def fp8_fp4_mega_moe(
 | 参数/输入 | 类型、形状与用途 |
 | --- | --- |
 | `y` | 调用方预分配的 BF16 `[B,H]` 输出，不能与输入重叠 |
-| `sym_buffer.x / x_sf` | 默认输入：FP8 E4M3 `[B,H]` + E8M0 `[B,H/32]`，调用前填入 buffer 的前 B 行 |
-| `x` | 可选 BF16 `[B,H]`，覆盖 buffer 中的 FP8 输入；内部量化为 FP8，**不是 BF16 GEMM** |
+| `sym_buffer.x / x_sf` | A8 模式为 FP8 E4M3 `[B,H]`，A4W8 为 packed FP4 E2M1 uint8 `[B,H/2]`；均配 E8M0 `[B,H/32]`，调用前填入前 B 行 |
+| `x` | 可选 BF16 `[B,H]`，覆盖 buffer 中的预量化输入；内部按模式量化为 FP8 或 FP4，**不是 BF16 GEMM** |
 | `sym_buffer.topk_idx` | int32 `[B,K]`，全局专家 ID，同 token 不重复且不能为 -1 |
 | `sym_buffer.topk_weights` | FP32 `[B,K]` 路由权重；BF16/FP8 输入均从 buffer 读取路由 |
 | `l1_weights / l2_weights` | 两对 `(weight, scale)`，使用 FP4 E2M1 或 FP8 E4M3 权重 + E8M0 scale，与 buffer 的 `mma_type` 一致 |
@@ -38,7 +39,7 @@ def fp8_fp4_mega_moe(
 | `timer` | 可选 `buffer.allocate_timer()`；仅在单独诊断调用中传入 |
 
 `recipe/activation/activation_clamp/fast_math` 当前仅支持签名中的默认值。所有张量在 buffer 所在 NPU 上。
-FP8 输入仍需打包到通信区，因此流水中的 `AIV_QUANT` 此时表示打包，不是重新量化。
+预量化输入仍需打包到通信区。A4W8 的 packed 输入先无损展开为 FP8 码，保持 E8M0 scale 不变。
 
 权重在测试/推理前转换一次，转换过程不计入性能测量：
 
@@ -79,17 +80,37 @@ W8A8 使用 `mma_type="fp8xfp8"` 和公开入口 `fp8_fp8_mega_moe`，调用签�
 `fp8_fp4_mega_moe` 相同。W8 权重为 FP8 E4M3 ND `[L,2I,H]` / `[L,H,I]`，
 scale 仍为 E8M0 `[L,2I,H/64,2]` / `[L,H,I/64,2]`；GMM1 保持 `[gate | up]`，
 `transform_weights_for_mega_moe` 只保证连续 ND，不做 FP4 的 NZ 或 gate/up 重排。
-输入可选 FP8 或 BF16（内部量化），输出均为 BF16。两个专用入口各自要求对应的 buffer 模式。
+输入可选 FP8 或 BF16（内部量化），输出均为 BF16。各专用入口要求对应的 buffer 模式。
 W8A8 当前要求 S=0，不支持设备 timer；支持 profiler 性能采样。
 A8W8 GMM1 保留 M256 调度和 Dispatch/GMM2 就绪粒度，gate/up 计算及 SwiGLU 按 M128
 子块传递，避免两份 M256×N256 BF16 中间结果超出可用 UB。只有一个逻辑 tile 的全部
 子块写回后才发布一次 GMM2 就绪通知。发送路由的 batch 大小按实际 UB 预算选择。
 原生入口也检查物理格式：W8 权重只允许 ND2，其余线性输入、scale、路由和输出支持 ND2/NCHW0。
-benchmark 和 Golden 均通过 `--mma-type fp8xfp4|fp8xfp8` 选择权重，默认保持 W4A8。
+benchmark 和 Golden 均通过 `--mma-type fp8xfp4|fp8xfp8|fp4xfp8` 选择激活/权重量化模式，默认保持 W4A8。
 单机 EP8 的构建、精度、边界和性能验收命令见 [测试方案](tests/README.md)。
-统一入口为 `bash experiments/megamoe/scripts/run_ep8.sh --build`，默认执行 W8 首轮验收；
-增加 `--suite full` 执行 W4 回归、全部路由和原生形状边界。脚本自动生成 Golden、
+三模式统一验证入口为 `bash validation/a8w8/run_npu.sh --build`；
+增加 `--suite full` 执行全部路由和原生形状边界。脚本自动生成 Golden、
 保存逐项日志并输出 `summary.json` / `summary.txt`；`--dry-run` 可先查看计划。
+
+### A4W8 的数值与执行合同
+
+使用 `SymmBuffer(..., mma_type="fp4xfp8")` 和 `fp4_fp8_mega_moe`，调用签名与 A8W8 专用入口相同。
+权重保持 FP8 E4M3 ND，输入及 SwiGLU 后的中间激活均按每 32 个值一组量化成 FP4 E2M1，
+配 E8M0 scale。FP4 采用最近偶数舍入、饱和到正负 6，并保留符号零。
+预量化输入使用 uint8 `[B,H/2]`，偶数元素在低 nibble、奇数元素在高 nibble；也可传 BF16 `[B,H]`。
+不能将任意 FP8 输入作为 A4W8 输入绕过 FP4 量化。共享专家和设备 timer 暂不支持。
+
+当前设备路径将 FP4 量化值无损展开为 FP8 后执行 FP8 Cube 计算；输入和中间激活的通信、
+工作区存储也使用展开形式。这保留 A4W8 的数值精度合同，**不代表原生 FP4×FP8 MMAD，
+也不提供 FP4 通信带宽节省**。预量化输入的展开属于调用开销，融合 kernel 的 profiler
+Duration 不包括 Python 侧展开算子。A4W8 另输出 `full_call_profiling.json`，并在性能报告中提供 `full_call_device`：用 NPU events 覆盖完整设备调用，packed 输入时包含展开算子（`includes_fp4_expansion=true`）。该指标仍不包含 Python 主机端提交耗时。
+
+```bash
+# 分别构建并验证三种模式；预量化输入和 BF16 输入均覆盖。
+bash validation/a8w8/run_npu.sh --build --suite quick
+# 只验证 A4W8。
+bash validation/a8w8/run_npu.sh --mma-type fp4xfp8 --suite quick
+```
 
 兼容入口 `mega_moe(x, ids, weights, w1, w2, buffer, ...)` 返回 `(y, per_call_counts)`。
 接口签名参照 DeepGEMM `78b6900`。本实现使用 int32 路由 ID、E8M0 输入 scale，
@@ -186,8 +207,8 @@ python experiments/megamoe/scripts/batch_launch.py --hosts-file "$HOSTS_FILE" --
 | 参数 | 默认 / 作用 |
 | --- | --- |
 | `--mode perf\|accuracy` | 默认 perf 执行性能测试；accuracy 检查全量输出和专家计数 |
-| `--input fp8\|bf16` | 默认 fp8；只改变输入类型，权重由 `--mma-type` 选择 |
-| `--mma-type fp8xfp4\|fp8xfp8` | 默认 fp8xfp4（W4A8）；fp8xfp8（W8A8）要求 S=0 和 `--no-timer` |
+| `--input fp8\|fp4\|bf16` | A8 模式接受 fp8/bf16，A4W8 接受 fp4/bf16；省略时选择与模式匹配的默认输入 |
+| `--mma-type fp8xfp4\|fp8xfp8\|fp4xfp8` | 默认 fp8xfp4（A8W4）；A8W8/A4W8 要求 S=0 和 `--no-timer` |
 | `--config NAME或路径` | 默认 `deepseek_v4_pro`；可传模型 JSON 路径 |
 | `--bs-values 96,4096` | 覆盖 JSON 中 BS 列表；每个 BS 单独启动 |
 | `--routing balanced\|random\|skewed` | 默认 balanced；random/skewed 用于精度压力测试 |

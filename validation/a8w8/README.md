@@ -1,9 +1,22 @@
-# MegaMoE A8W8：CPU 与 NPU 验证
+# MegaMoE A8W4 / A8W8 / A4W8：CPU 与 NPU 验证
 
 本目录在 `fix-megamoe-a8w8` 和 `megamoe-a8w8-ep8` 两个分支中提供相同的测试入口。
-脚本自动适配前者的 `--weights fp8` 和后者的 `--mma-type fp8xfp8`。
-这里的 A8W8 是 MXFP8 E4M3 激活与权重，配 E8M0 scale，支持 BF16/FP8 输入、BF16 输出；
-不支持 A8W8 共享专家和设备 timer。CPU 回归不能替代 NPU 编译、精度、跨卡同步和性能验证。
+两个分支均提供 `--mma-type`，旧的 `validation/a8w8/` 路径保留以兼容已有命令。
+默认同时测试以下三种模式，所有模式使用 block32 E8M0 scale、BF16 输出：
+
+| 模式 | `--mma-type` | 两层激活 / 权重精度 | 输入路径 |
+| --- | --- | --- | --- |
+| A8W4 | `fp8xfp4` | MXFP8 E4M3 / MXFP4 E2M1 | BF16 或预量化 FP8 |
+| A8W8 | `fp8xfp8` | MXFP8 E4M3 / MXFP8 E4M3 | BF16 或预量化 FP8 |
+| A4W8 | `fp4xfp8` | MXFP4 E2M1 / MXFP8 E4M3 | BF16 或预量化 packed FP4 |
+
+A4W8 的输入和 SwiGLU 中间激活均先按 MXFP4 精度量化，再无损展开为 FP8 存储、通信和 MMAD；
+它不减少当前 FP8 通信格式的字节数。BF16 输入由 native 路径量化；packed FP4 输入由 Python
+运行时在设备上展开。该展开属于调用端到端路径，不计入融合 kernel 的 profiler 数字；
+A4W8 另外记录包含该展开的 `full_call_device` 设备事件时长。
+A8W8/A4W8 不支持共享专家和设备 timer；A8W4 保留其已有支持，本目录设备矩阵统一 S=0、timer=OFF。
+CPU 回归不能替代 NPU 编译、精度、跨卡同步和性能验证。新增模式的真实 NPU 编译、精度和性能
+需在服务器执行以下命令验收，文档中的用例数量是计划数量，不表示设备测试已经通过。
 
 | 文件 | 用途 |
 | --- | --- |
@@ -52,7 +65,7 @@ NPU 预检同时校验完整版本字符串和源码指纹；同一分支再次�
 
 ### 版本统一对功能和安装的影响
 
-统一版本基线不回退源码，不改变 A8W8 算法、Python API、内核协议或构建开关。
+统一版本基线本身不回退源码，不改变算法、Python API、内核协议或构建开关。
 两个分支原有的实现差异仍然保留；相同 `dev5` 不表示它们的功能完全相同。
 `VERSION` 参与构建元数据和源码指纹计算，因此修改它后必须重新生成并安装 wheel，
 旧 wheel 会被版本或源码指纹校验拒绝。
@@ -107,8 +120,8 @@ bash validation/a8w8/run_npu.sh --suite quick --python "$(python -I -c 'import s
 
 ## 2. CPU 测试
 
-推荐 Linux、Python 3.11 或 3.12、Bash、Git；`megamoe-a8w8-ep8` 还需要 C++17 编译器
-（如 `g++`），用于实际编译内核策略头。可设置 `CXX=/path/to/g++`。
+推荐 Linux、Python 3.11 或 3.12、Bash、Git；两个分支均需要 C++17 编译器
+（如 `g++`），用于实际编译原生 FP4 量化策略头。可设置 `CXX=/path/to/g++`。
 依赖固定为 NumPy 1.26.4；不要用 Python 3.13/3.14 安装这份固定依赖。
 
 ```bash
@@ -125,9 +138,10 @@ bash validation/a8w8/run_cpu.sh \
   --output-dir /data/megamoe-results/ep8-cpu-02
 ```
 
-`full` 运行 `experiments/megamoe/tests` 和本目录脚本回归，覆盖 Python API、FP8 位模式、
-scale、Golden 缓存、路由/计数、生命周期、构建和启动计划。
-新分支还包含发送 UB 预算、GMM1 子块和 L2 策略的 C++ 测试。
+`full` 运行 `experiments/megamoe/tests` 和本目录脚本回归，覆盖三种精度模式的 Python API、FP4/FP8
+位模式、block32 scale、两层量化参考结果、Golden 缓存隔离、路由/计数、生命周期、构建和启动计划。
+FP4 测试检查低/高 nibble 顺序、舍入边界、无损展开及 BF16/预量化输入路径。
+两个分支均检查 FP4 量化、发送 UB 预算和 GMM1 子块策略；EP8 分支另有 L2 策略的 C++ 测试。
 全套测试不初始化 NPU。若环境中没有 CPU PyTorch，依赖它的少量主机协议测试会 skip，
 跳过数及原因保存在报告中；需要这些测试时使用已经装有 CPU PyTorch 的环境再跑。
 
@@ -182,7 +196,7 @@ SHMEM SDK 必须包含匹配的 `deepep-sdk.json`、头文件和库；CATLASS �
 # 只预览：不构建、不导入 Torch、不生成报告、不启动设备。
 bash validation/a8w8/run_npu.sh --build --suite quick --dry-run
 
-# 首轮：A8W8 精度通过后执行性能测试。
+# 首轮：三模式精度和融合 kernel 性能；A4W8 另测完整调用的设备时长。
 bash validation/a8w8/run_npu.sh --build --suite quick \
   --output-dir /data/megamoe-results/ep8-npu-quick-01
 
@@ -193,6 +207,10 @@ bash validation/a8w8/run_npu.sh --suite full \
 # 只看精度，可跳过 profiler 性能阶段。
 bash validation/a8w8/run_npu.sh --suite full --skip-perf \
   --output-dir /data/megamoe-results/ep8-npu-accuracy-01
+
+# 单独回归 A4W8；A8W4/A8W8 分别换成 fp8xfp4/fp8xfp8。
+bash validation/a8w8/run_npu.sh --suite quick --mma-type fp4xfp8 \
+  --output-dir /data/megamoe-results/ep8-a4w8-quick-01
 ```
 
 在 `DeepEP-fix` 中执行相同命令，将结果路径中的 `ep8` 换为 `fix`，并重新加 `--build`。
@@ -213,14 +231,21 @@ EP8 每卡一个专家，EP2 每卡四个专家。EP2 不能代替 EP8 验证。
 
 | 套件 | 精度覆盖 | 性能覆盖 |
 | --- | --- | --- |
-| `quick` | A8W8，FP8/BF16，balanced，BS=96/120/121/128/129/257，全部 token | A8W8，BS=96/4096，各独立重复 3 次 |
-| `full` | A8W4/A8W8，FP8/BF16，balanced/random/skewed，14 个 BS；另有 tail、wide、topk32、route_ub 边界 | A8W4/A8W8，BS=96/4096，各独立重复 3 次 |
+| `quick` | 三种模式，BF16/各自预量化输入，balanced，BS=96/120/121/128/129/257，全部 token | 三种模式，BS=96/4096，各独立重复 3 次 |
+| `full` | 三种模式，BF16/各自预量化输入，balanced/random/skewed，14 个 BS；每模式均有 tail、wide、topk32、route_ub 边界 | 三种模式，BS=96/4096，各独立重复 3 次 |
 
-quick 应生成 12 份精度报告、6 份性能报告；full 为 184 和 12。
+默认 `--mma-type all`：quick 应生成 36 份精度报告、18 份性能报告；full 为 300 和 18。
+单独选择一个模式：quick 为 12 和 6；full 为 100 和 6。
+包含 A4W8 且未跳过性能时，6 个 A4W8 性能用例各自还有 `full_call_device` 统计和逐 rank 的
+`full_call_profiling.json`。这是同一性能用例的另一种计时口径，不增加上述性能用例数量。
 `--skip-perf` 时性能报告应为 0。完整矩阵中的 wide 和 route_ub 占用更多内存、CPU Golden 耗时更长。
-这些边界用例可能暴露同事分支尚未包含的 UB 修复问题，测试失败应保留日志分析。
+两个分支都覆盖这些 UB 和原生形状边界，仍需分别在目标设备验收；测试失败应保留日志分析。
 每个测试先生成本分支匹配的 Golden，再检查所有 rank 的输出、专家计数和累计计数。
+汇总同时检查每种精度、每条输入路径的报告数量和 manifest；缺少 A4W8 或误跑成 FP8 输入不会算通过。
+同时检查 A4W8 完整调用设备时长的文件、rank 数、有效数值和展开标识；缺失或与输入类型不符也会失败。
 报告仅代表所列公开调用路径，不能替代所有原生格式负例的设备测试。
+旧版本仅有 `--weights` CLI 时，脚本只允许显式选择 `fp8xfp4`/`fp8xfp8`；
+选择 `all` 或 `fp4xfp8` 会在构建前提示升级，不会把 A4W8 映射成 A8W8。
 
 可通过 `--python /path/to/python` 指定解释器。使用 `--help` 查看完整参数。
 `ASCEND_RT_VISIBLE_DEVICES` 的卡数必须等于 EP；默认 SHMEM 地址为
@@ -272,7 +297,16 @@ tar -czf /data/megamoe-results/ep8-npu-quick-01.tar.gz \
 比较性能时使用相同硬件、EP、模型形状、输入类型、路由、框架/CANN、预热和计时口径。
 `mean_us` 是逐轮最快 rank 耗时的均值，`rank_max_mean_us` 是逐轮最慢 rank 耗时的均值。
 默认 profiler 前置对齐张量约占每卡 12 GB，不计入融合 kernel Duration。
-所有报告中的设备 timer 均关闭。
+这些数值仅统计融合 MegaMoE kernel Duration，不是完整 API 端到端时延；尤其不包括 A4W8 的
+packed FP4 输入在 Python 运行时展开的设备操作。所有报告中的设备 timer 均关闭。
+不同精度会改变数值误差与设备工作量，不能据融合 kernel 数字断言完整 A4W8 调用一定更快。
+
+A4W8 的 `profiling.json.full_call_device` 和同目录 `full_call_profiling.json` 使用调用方流的 NPU
+事件计时，覆盖一次公开调用的设备执行，包括 packed FP4 输入的展开和融合 kernel。
+`includes_fp4_expansion=true` 对应 `--input fp4`，BF16 输入则为 false（BF16 量化在 native 内执行）。
+该字段不是 Python 主机墙钟时长，不能代表包含数据准备、权重转换、编译安装等阶段的业务端到端耗时。
+汇总分别显示 `PERF fused-kernel` 和 `PERF full-call-device`，前者保留原来的比较口径，后者让
+A4W8 的输入展开开销可见。`summary.json` 中的 `expected_full_call` 为 6 或 0。
 
 **两分支的 FP8 随机权重生成方法不同，相同 seed 不代表相同权重。**
 本套件分别验证各分支与其自身 Golden 的一致性，不能据此宣称两套 NPU 输出逐元素相同。

@@ -14,6 +14,7 @@ from deep_ep._runtime import Runtime, integer, warn_unclosed
 from deep_ep._native import npu_api, require_native
 from deep_ep._store import StoreGroup
 from .validation import check_routing, collective_check
+from .formats import MMA_TYPES
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -72,6 +73,27 @@ def _check_fp8_weight_format(weight, name):
         )
 
 
+def _expand_fp4_input(packed, output):
+    """Losslessly expand E2M1 nibbles into E4M3 bytes on the caller's device/stream.
+
+    Packed inputs save storage at the API boundary. The communication record and
+    Cube path intentionally retain FP8 storage; no FP4 bandwidth claim is made.
+    """
+    import torch
+
+    # E2M1 positive values [0,.5,1,1.5,2,3,4,6] are exactly representable in E4M3.
+    # Integer indexing preserves -0, unlike numeric conversion through a float.
+    table = torch.tensor(
+        [0x00, 0x30, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC],
+        dtype=torch.uint8,
+        device=packed.device,
+    )
+    target = output.view(torch.uint8)
+    target[:, ::2].copy_(table[(packed & 15).to(torch.int64)])
+    target[:, 1::2].copy_(table[(packed >> 4).to(torch.int64)])
+    return output
+
+
 class SymmBuffer:
     """Collective resource owner. All ranks construct/call/destroy in the same order.
 
@@ -113,8 +135,8 @@ class SymmBuffer:
             integer("timeout", timeout, 1, 300)
             if hidden % 64 or intermediate_hidden % 128:
                 raise ValueError("hidden must be divisible by 64; intermediate_hidden by 128")
-            if activation != "swiglu" or mma_type not in {"fp8xfp4", "fp8xfp8"}:
-                raise ValueError("Only SwiGLU with FP8xFP4/FP8xFP8 is implemented; no BF16xBF16")
+            if activation != "swiglu" or mma_type not in MMA_TYPES:
+                raise ValueError("Only SwiGLU with FP8xFP4/FP8xFP8/FP4xFP8 is implemented; no BF16xBF16")
             if mma_type != "fp8xfp4" and num_shared_experts:
                 raise ValueError("Shared experts currently require FP8xFP4 weights")
             if num_experts % size or num_experts // size > 128:
@@ -138,6 +160,8 @@ class SymmBuffer:
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
+        if mma_type == "fp4xfp8" and not getattr(ext, "a4w8_supported", False):
+            raise RuntimeError("A4W8 requires rebuilding and reinstalling a wheel with a4w8_supported=True")
         capacity = int(ext.buffer_size(size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden))
         self._lock = threading.Lock()
         self._device = torch.device(f"npu:{npu_api().current_device()}")
@@ -147,7 +171,7 @@ class SymmBuffer:
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
         self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
         self.ranks_per_node = ranks_per_node
-        self.x = self.x_sf = self.topk_idx = self.topk_weights = None
+        self.x = self.x_sf = self.topk_idx = self.topk_weights = self._expanded_x = None
         error = None
         try:
             self.allocate_inputs()
@@ -165,8 +189,16 @@ class SymmBuffer:
             self._runtime.ensure_alive()
         if self.x is not None:
             return self
+        packed = self.mma_type == "fp4xfp8"
         self.x = torch.empty(
-            (self.num_max_tokens_per_rank, self.hidden), dtype=torch.float8_e4m3fn, device=self._device
+            (self.num_max_tokens_per_rank, self.hidden // 2 if packed else self.hidden),
+            dtype=torch.uint8 if packed else torch.float8_e4m3fn,
+            device=self._device,
+        )
+        self._expanded_x = (
+            torch.empty((self.num_max_tokens_per_rank, self.hidden), dtype=torch.float8_e4m3fn, device=self._device)
+            if packed
+            else self.x
         )
         self.x_sf = torch.empty(
             (self.num_max_tokens_per_rank, self.hidden // 32), dtype=torch.float8_e8m0fnu, device=self._device
@@ -187,7 +219,7 @@ class SymmBuffer:
         address = require_native("MegaMoE").megamoe_workspace_address(runtime.native)
         ext = _extension()
         self._plan = ext.Plan(
-            self.x[:bs],
+            (self._expanded_x if self.mma_type == "fp4xfp8" else self.x)[:bs],
             self.intermediate_hidden,
             self.num_topk,
             self.num_experts // self.group.size(),
@@ -199,6 +231,7 @@ class SymmBuffer:
             ext.ffts_config(),
             address,
             runtime.native.capacity,
+            *((True,) if self.mma_type == "fp4xfp8" else ()),
         )
         self._plan_bs = bs
 
@@ -260,7 +293,12 @@ class SymmBuffer:
                     raise ValueError(f"{name} must retain its buffer dtype/device/shape")
             if x is None:
                 for name, tensor, dtype, shape in (
-                    ("x", self.x, torch.float8_e4m3fn, (self.num_max_tokens_per_rank, self.hidden)),
+                    (
+                        "x",
+                        self.x,
+                        torch.uint8 if self.mma_type == "fp4xfp8" else torch.float8_e4m3fn,
+                        (self.num_max_tokens_per_rank, self.hidden // 2 if self.mma_type == "fp4xfp8" else self.hidden),
+                    ),
                     ("x_sf", self.x_sf, torch.float8_e8m0fnu, (self.num_max_tokens_per_rank, self.hidden // 32)),
                 ):
                     if (
@@ -288,7 +326,7 @@ class SymmBuffer:
         with self._lock:
             self._runtime.close()
             self._plan = self._plan_bs = None
-            self.x = self.x_sf = self.topk_idx = self.topk_weights = None
+            self.x = self.x_sf = self.topk_idx = self.topk_weights = self._expanded_x = None
 
     def __del__(self):
         warn_unclosed(self)
@@ -411,8 +449,10 @@ def mega_moe(
 ):
     """Explicit-input API; buffered callers may use fp8_fp4/fp8_fp8_mega_moe.
 
-    x: BF16 [B,H], or (FP8 E4M3 [B,H], E8M0 [B,H/32]).
-    FP8 is copied into the original communication record, never dequantized/requantized.
+    x: BF16 [B,H], or (FP8 E4M3 [B,H], E8M0 [B,H/32]) for A8 modes.
+    A4W8 accepts BF16 or (packed uint8 E2M1 [B,H/2], E8M0 [B,H/32]);
+    even K elements use the low nibble. Packed FP4 is expanded exactly to FP8
+    physical storage. Prequantized values/scales are never requantized.
     Routed work uses the prefill scheduler; W4 shared strategy switches at B=256.
     No backward or graph guarantee yet.
     """
@@ -459,8 +499,24 @@ def _run(
         sw2, ss2 = _pair(shared_l2_weights, "shared_l2_weights")
         shared = (sw1, sw2, ss1, ss2)
     b = sym_buffer
-    if data.ndim != 2 or not 0 < data.shape[0] <= b.num_max_tokens_per_rank or data.shape[1] != b.hidden:
-        raise ValueError("x must be nonempty [BS,H] within the buffer capacity")
+    packed = b.mma_type == "fp4xfp8" and scales is not None
+    width = b.hidden // 2 if packed else b.hidden
+    if data.ndim != 2 or not 0 < data.shape[0] <= b.num_max_tokens_per_rank or data.shape[1] != width:
+        raise ValueError("x must be nonempty [BS,H] (packed FP4: [BS,H/2]) within the buffer capacity")
+    if b.mma_type == "fp4xfp8":
+        if data.dtype != (torch.uint8 if packed else torch.bfloat16):
+            raise TypeError("A4W8 inputs must be BF16 or (packed uint8 FP4, E8M0 scales)")
+        if not data.is_contiguous():
+            raise ValueError("A4W8 inputs must be contiguous")
+        if packed and (
+            scales.dtype != torch.float8_e8m0fnu
+            or scales.device != b._device
+            or tuple(scales.shape) != (data.shape[0], b.hidden // 32)
+            or not scales.is_contiguous()
+        ):
+            raise ValueError("A4W8 scales must be contiguous E8M0 [BS,H/32] on the buffer device")
+        if timer is not None:
+            raise NotImplementedError("A4W8 device timer traces are not supported; use the profiler")
     if data.device != b._device:
         raise ValueError("x must be on the buffer's creating device")
     expected = (b.num_experts // b.group.size(), b.intermediate_hidden * 2)
@@ -527,7 +583,12 @@ def _run(
         # 同一 owner 的调用串行进入专属流，禁止不同流覆盖仍在使用的对称空间。
         with npu_api().stream(runtime.stream):
             b._prepare(data.shape[0])
-            result = b._plan.forward(data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, out)
+            launch_data = _expand_fp4_input(data, b._expanded_x[: data.shape[0]]) if packed else data
+            if packed:
+                # Native sees only expanded storage. Keep explicit packed inputs
+                # alive on this stream even if allocated on a different stream.
+                data.record_stream(runtime.stream)
+            result = b._plan.forward(launch_data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, out)
             if cumulative_stats is not None:
                 cumulative_stats.add_(result[1])
                 cumulative_stats.record_stream(runtime.stream)
@@ -619,6 +680,46 @@ def fp8_fp8_mega_moe(
     )
 
 
+def fp4_fp8_mega_moe(
+    y: Tensor,
+    l1_weights: WeightPair,
+    l2_weights: WeightPair,
+    sym_buffer: SymmBuffer,
+    shared_l1_weights: WeightPair | None = None,
+    shared_l2_weights: WeightPair | None = None,
+    cumulative_local_expert_recv_stats: Tensor | None = None,
+    recipe: tuple[int, int, int] = (1, 1, 32),
+    activation: str = "swiglu",
+    activation_clamp: float | None = None,
+    fast_math: bool = True,
+    *,
+    x: Tensor | None = None,
+    timer: Tensor | None = None,
+) -> None:
+    """A4W8: MXFP4 E2M1 input and SwiGLU activation, FP8 E4M3 weights.
+
+    Omit x for packed uint8 buffer.x [BS,H/2] with E8M0 buffer.x_sf
+    [BS,H/32], or supply BF16 [BS,H]. FP4 values are represented exactly
+    in FP8 communication/Cube storage; this path does not halve communication.
+    """
+    _buffered_mega_moe(
+        y,
+        l1_weights,
+        l2_weights,
+        sym_buffer,
+        shared_l1_weights,
+        shared_l2_weights,
+        cumulative_local_expert_recv_stats,
+        recipe,
+        activation,
+        activation_clamp,
+        fast_math,
+        x=x,
+        timer=timer,
+        mma_type="fp4xfp8",
+    )
+
+
 def _buffered_mega_moe(
     y,
     l1_weights,
@@ -642,11 +743,12 @@ def _buffered_mega_moe(
         raise TypeError("sym_buffer must be this installation's MegaMoE SymmBuffer")
     if sym_buffer.mma_type != mma_type:
         raise ValueError(f"This entry point requires SymmBuffer(mma_type={mma_type!r})")
-    if mma_type == "fp8xfp8":
+    if mma_type != "fp8xfp4":
+        mode = "A4W8" if mma_type == "fp4xfp8" else "A8W8"
         if shared_l1_weights is not None or shared_l2_weights is not None:
-            raise NotImplementedError("A8W8 shared experts are not supported")
+            raise NotImplementedError(f"{mode} shared experts are not supported")
         if timer is not None:
-            raise NotImplementedError("A8W8 device timer traces are not supported; use the profiler")
+            raise NotImplementedError(f"{mode} device timer traces are not supported; use the profiler")
     import torch
 
     sym_buffer._runtime.ensure_alive()
@@ -654,7 +756,7 @@ def _buffered_mega_moe(
         raise ValueError("y must be BF16 [BS,H]")
     bs = y.shape[0]
     if x is not None and (x.dtype != torch.bfloat16 or tuple(x.shape) != (bs, sym_buffer.hidden)):
-        raise ValueError("x override must be BF16 [BS,H]; omit x for buffered FP8 input")
+        raise ValueError("x override must be BF16 [BS,H]; omit x for buffered quantized input")
     _run(
         (sym_buffer.x[:bs], sym_buffer.x_sf[:bs]) if x is None else x,
         sym_buffer.topk_idx[:bs],

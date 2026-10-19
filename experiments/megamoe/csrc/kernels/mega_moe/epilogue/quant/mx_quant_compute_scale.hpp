@@ -46,7 +46,7 @@ __aicore__ inline void ComputeGroupMaxExp(__ubuf__ bfloat16_t* input, __ubuf__ u
     }
 }
 
-template <typename OutputType>
+template <typename OutputType, bool PreserveSubnormal = false>
 __aicore__ inline void ComputeMxScale(__ubuf__ uint16_t* maxExp, __ubuf__ uint16_t* outputScale,
                                       __ubuf__ uint16_t* reciprocalScale, uint32_t scaleCount, uint16_t scaleLoopCount)
 {
@@ -88,7 +88,11 @@ __aicore__ inline void ComputeMxScale(__ubuf__ uint16_t* maxExp, __ubuf__ uint16
                                                                   exponentBiasReg, scaleMask);
             AscendC::Reg::Sub(reciprocalScaleReg, exponentBiasReg, sharedExponentReg, scaleMask);
             AscendC::Reg::Select<uint16_t>(reciprocalScaleReg, reciprocalScaleReg, bf16NanReg, validExponentMask);
-            AscendC::Reg::Select<uint16_t>(reciprocalScaleReg, reciprocalScaleReg, zeroReg, nonzeroMask);
+            if constexpr (!PreserveSubnormal) {
+                AscendC::Reg::Select<uint16_t>(reciprocalScaleReg, reciprocalScaleReg, zeroReg, nonzeroMask);
+            }
+            // Expanded FP4 uses the minimum E8M0 scale even for exponent-zero
+            // groups, which may contain nonzero BF16 subnormals.
             AscendC::Reg::Select<uint16_t>(reciprocalScaleReg, specialExponentReg, reciprocalScaleReg,
                                            specialExponentMask);
             AscendC::Reg::DataCopy<uint16_t, AscendC::Reg::PostLiteral::POST_MODE_UPDATE>(
