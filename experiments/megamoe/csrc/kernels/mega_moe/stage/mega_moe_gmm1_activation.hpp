@@ -871,10 +871,10 @@ __aicore__ inline void Gmm1ExecA8W4(Scheduler& scheduler, const Params& params, 
 template <typename ElementA, typename EpilogueElementA, typename ElementB, typename ElementC, typename ElementMxScaleA,
           typename ElementMxScaleB, bool IsWeightNZ = false, uint32_t Gmm1TileM = L1_TILE_M_256,
           uint32_t EpilogueTileM = Gmm1TileM, bool TopkWeightsPrefetch = false, bool IsShared = false,
-          bool IsGmm1Interleaved = false, bool IsWaveFlagGrained = false>
+          bool IsGmm1Interleaved = false, bool IsWaveFlagGrained = false, bool QuantizeFp4Expanded = false>
 __aicore__ inline void RunGmm1Generic(
     BlockEpilogueActivationMxQuant<EpilogueElementA, ElementC, EpilogueTileM, L1_TILE_N, TopkWeightsPrefetch,
-                                   IsGmm1Interleaved>& epilogueOp,
+                                   IsGmm1Interleaved, QuantizeFp4Expanded>& epilogueOp,
     const Params& params, const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape,
     const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, int32_t& vecSetSyncCom, const BlockJobContext& blockJob,
     uint32_t expertBeforeCnt, uint32_t expertIdx, uint16_t& pingpongIdx, void* blockMmadContext = nullptr,
@@ -923,10 +923,10 @@ __aicore__ inline void RunGmm1Generic(
 template <typename ElementA, typename EpilogueElementA, typename ElementB, typename ElementC, typename ElementMxScaleA,
           typename ElementMxScaleB, bool IsWeightNZ = false, uint32_t Gmm1TileM = L1_TILE_M_256,
           uint32_t EpilogueTileM = Gmm1TileM, bool TopkWeightsPrefetch = false, bool IsShared = false,
-          bool IsGmm1Interleaved = false, bool IsWaveFlagGrained = false>
+          bool IsGmm1Interleaved = false, bool IsWaveFlagGrained = false, bool QuantizeFp4Expanded = false>
 __aicore__ inline void RunGmm1Generic(
     BlockEpilogueActivationMxQuant<EpilogueElementA, ElementC, EpilogueTileM, L1_TILE_N, TopkWeightsPrefetch,
-                                   IsGmm1Interleaved>& epilogueOp,
+                                   IsGmm1Interleaved, QuantizeFp4Expanded>& epilogueOp,
     const Params& params, const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape,
     const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, int32_t& vecSetSyncCom, uint32_t expertBeforeCnt,
     uint32_t expertIdx, uint16_t& pingpongIdx, void* blockMmadContext = nullptr, bool allowWeightL2Bypass = false)
@@ -934,9 +934,10 @@ __aicore__ inline void RunGmm1Generic(
     BlockJobContext blockJob{static_cast<uint32_t>(GetBlockIdx() / GetTaskRation()),
                              static_cast<uint32_t>(GetBlockNum())};
     RunGmm1Generic<ElementA, EpilogueElementA, ElementB, ElementC, ElementMxScaleA, ElementMxScaleB, IsWeightNZ,
-                   Gmm1TileM, EpilogueTileM, TopkWeightsPrefetch, IsShared, IsGmm1Interleaved, IsWaveFlagGrained>(
-        epilogueOp, params, problemShape, gmmAddrInfo, startBlockIdx, vecSetSyncCom, blockJob, expertBeforeCnt,
-        expertIdx, pingpongIdx, blockMmadContext, allowWeightL2Bypass);
+                   Gmm1TileM, EpilogueTileM, TopkWeightsPrefetch, IsShared, IsGmm1Interleaved, IsWaveFlagGrained,
+                   QuantizeFp4Expanded>(epilogueOp, params, problemShape, gmmAddrInfo, startBlockIdx, vecSetSyncCom,
+                                        blockJob, expertBeforeCnt, expertIdx, pingpongIdx, blockMmadContext,
+                                        allowWeightL2Bypass);
 }
 
 // 调度器已确认 ready，只执行一个 SwiGLU tile；函数不依赖物理 AIV 子核编号。

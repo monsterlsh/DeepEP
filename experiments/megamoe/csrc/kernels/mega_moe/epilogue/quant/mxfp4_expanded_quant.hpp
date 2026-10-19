@@ -8,8 +8,8 @@
 #if defined(__DAV_C310__)
 namespace MegaMoeImpl::MxQuant {
 
-// A5 MX MMAD has no mixed FP4 x FP8 operand pair. Quantize to the E2M1
-// lattice and write its exact E4M3 representation. Both GEMMs therefore use
+// Use E4M3 physical operands for MXFP4 activation precision: quantize to the
+// E2M1 lattice and write its exact E4M3 representation. Both GEMMs therefore use
 // MXFP4 activation precision with FP8 physical storage/communication/MMAD.
 // No additional scale adjustment or E4M3 rounding is performed.
 __aicore__ inline void QuantizeMxFp4ExpandedData(__ubuf__ bfloat16_t* input, __ubuf__ uint16_t* reciprocalScale,
