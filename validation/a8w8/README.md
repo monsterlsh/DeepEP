@@ -26,6 +26,28 @@ git clone --branch megamoe-a8w8-ep8 --single-branch \
 下面的命令适用于两个目录。每次运行使用新的结果目录；结果放在源码目录之外，
 避免切分支时混用报告或从源码误导入包。两个分支的设备测试依次执行。
 
+### 安装版本与分支对应关系
+
+两个分支使用不同的、带分支标识的 Python 包版本。`setup.py` 从根目录 `VERSION` 读取版本，
+因此 wheel 文件名、`pip show` 和测试预检显示的版本保持一致：
+
+| 分支 | `pip show ascend-deepep` 的 Version |
+| --- | --- |
+| `fix-megamoe-a8w8` | `0.1.0.dev5+fix.megamoe.a8w8` |
+| `megamoe-a8w8-ep8` | `0.1.0.dev7+megamoe.a8w8.ep8` |
+
+`+` 后是 Python 包规范支持的本地版本标识。发行包名为 `ascend-deepep`，Python 导入名为 `deep_ep`。
+安装后使用同一个解释器查询，避免查到其他虚拟环境：
+
+```bash
+python -m pip show ascend-deepep
+python -c 'from importlib.metadata import version; print(version("ascend-deepep"))'
+```
+
+每次切换分支后运行 `bash validation/a8w8/run_npu.sh --build`。构建脚本使用
+`pip install --force-reinstall --no-deps` 安装本次生成的 wheel，允许从 dev7 切回 dev5。
+NPU 预检同时校验完整版本字符串和源码指纹；同一分支再次修改源码后也会检查 wheel 是否需要重建。
+
 ## 2. CPU 测试
 
 推荐 Linux、Python 3.11 或 3.12、Bash、Git；`megamoe-a8w8-ep8` 还需要 C++17 编译器
