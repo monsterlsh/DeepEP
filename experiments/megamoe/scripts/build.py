@@ -85,18 +85,46 @@ def build(root=ROOT, *, rebuild_shmem=False):
     from build_support import build_configuration
 
     build_configuration(env)
+    expected_version = (root / "VERSION").read_text(encoding="utf-8").strip()
+    print(f"[BUILD] Python: {sys.executable}; expected version: {expected_version}", flush=True)
     (root / "dist").mkdir(exist_ok=True)
     wheel_dir = Path(tempfile.mkdtemp(prefix="build-", dir=root / "dist"))
     run([sys.executable, "-m", "pip", "wheel", ".", "--no-build-isolation", "--no-deps", "-w", str(wheel_dir)])
     wheels = list(wheel_dir.glob("ascend_deepep-*.whl"))
     if len(wheels) != 1:
         raise RuntimeError(f"Expected exactly one ascend-deepep wheel in {wheel_dir}, found {len(wheels)}")
-    run([sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", str(wheels[0])])
-    probe = "from deep_ep._native import require_native; require_native('build smoke')"
+    # Match the isolated test interpreter. Source egg-info on PYTHONPATH can hide
+    # the installed distribution from pip and leave its old dist-info behind.
+    run(
+        [sys.executable, "-I", "-m", "pip", "install", "--no-user", "--force-reinstall", "--no-deps", str(wheels[0])],
+        cwd=wheel_dir,
+    )
+    probe = """
+from importlib.metadata import distribution, distributions
+from pathlib import Path
+import sys
+
+expected = sys.argv[1]
+installed = distribution("ascend-deepep")
+candidates = list(distributions(name="ascend-deepep"))
+print("[BUILD] Installed metadata:", [
+    (item.version, str(getattr(item, "_path", item.locate_file("")))) for item in candidates
+], flush=True)
+location = Path(installed.locate_file("")).resolve()
+same_location = [item for item in candidates if Path(item.locate_file("")).resolve() == location]
+if installed.version != expected or len(same_location) != 1:
+    raise SystemExit(
+        f"Installed version {installed.version}, expected {expected}; "
+        f"found {len(same_location)} ascend-deepep metadata records in {location}. "
+        "Check stale installations and pip user/target/prefix settings in this Python environment."
+    )
+from deep_ep._native import require_native
+require_native("build smoke")
+"""
     if beta == "ON":
-        probe += "; import torch, torch_npu; import deep_ep_experimental.megamoe._C"
+        probe += "\nimport torch, torch_npu\nimport deep_ep_experimental.megamoe._C\n"
     # -I 不从源码目录/PYTHONPATH 导入；这里只加载扩展，不分配 NPU 或启动通信。
-    run([sys.executable, "-I", "-c", probe], cwd=wheel_dir)
+    run([sys.executable, "-I", "-c", probe, expected_version], cwd=wheel_dir)
     print(f"[BUILD] Installed: {wheels[0]}", flush=True)
     print("[BUILD] Before running tests in your shell (bash cannot export to its parent):")
     print(f'export LD_LIBRARY_PATH={shlex.quote(str(Path(env["SHMEM_ROOT"]) / "lib"))}:"${{LD_LIBRARY_PATH:-}}"')

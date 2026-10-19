@@ -136,7 +136,7 @@ run_logged preflight env -u PYTHONPATH "$PYTHON_BIN" -I - "$EXPECTED_VERSION" "$
     "$CLI_MODE" "$EP_SIZE" "$SUITE" "$SKIP_PERF" "$TIMEOUT_SECONDS" "$BUILD" <<'PY'
 from datetime import datetime, timezone
 import importlib.util
-from importlib.metadata import version
+from importlib.metadata import distributions, version
 from importlib.resources import files
 import json
 import os
@@ -157,9 +157,16 @@ import deep_ep_experimental.megamoe._C as native
 
 actual = version("ascend-deepep")
 print("version:", actual, "package:", deep_ep.__file__, flush=True)
+print("expected version:", expected, "Python:", sys.executable, "source:", root, flush=True)
 print("framework:", torch.__version__, torch_npu.__version__, flush=True)
 if actual != expected:
-    raise SystemExit(f"Installed wheel {actual} differs from checkout {expected}; rerun with --build")
+    print("installed metadata:", [
+        (item.version, str(getattr(item, "_path", item.locate_file(""))))
+        for item in distributions(name="ascend-deepep")
+    ], flush=True)
+    hint = ("--build was already requested; inspect logs/build.log for the installed wheel and stale metadata"
+            if built == "1" else "rerun with --build")
+    raise SystemExit(f"Installed wheel {actual} differs from checkout {expected}; {hint}")
 if any(root in Path(package.__file__).resolve().parents for package in (deep_ep, megamoe)):
     raise SystemExit("Source checkout shadows the installed wheel")
 info = json.loads(files("deep_ep").joinpath("_build_info.json").read_text())

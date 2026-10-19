@@ -40,13 +40,56 @@ git clone --branch megamoe-a8w8-ep8 --single-branch \
 安装后使用同一个解释器查询，避免查到其他虚拟环境：
 
 ```bash
-python -m pip show ascend-deepep
-python -c 'from importlib.metadata import version; print(version("ascend-deepep"))'
+python -I -m pip show ascend-deepep
+python -I -c 'from importlib.metadata import version; print(version("ascend-deepep"))'
 ```
 
 每次切换分支后运行 `bash validation/a8w8/run_npu.sh --build`。构建脚本使用
-`pip install --force-reinstall --no-deps` 安装本次生成的 wheel，允许从 dev7 切回 dev5。
+`python -I -m pip install --no-user --force-reinstall --no-deps` 安装本次生成的 wheel，允许从 dev7 切回 dev5。
 NPU 预检同时校验完整版本字符串和源码指纹；同一分支再次修改源码后也会检查 wheel 是否需要重建。
+
+### 已加 `--build` 仍报版本不匹配
+
+CPU 测试运行源码，不检查 NPU wheel 是否已安装，因此 CPU 通过与安装版本不匹配可以同时发生。
+若源码是 dev7、安装显示 dev5，先在服务器本地检查，不需要导出日志：
+
+```bash
+git branch --show-current
+cat VERSION
+python -I -m pip --version
+python -I -m pip show ascend-deepep
+python -I - <<'PY'
+from importlib.metadata import distributions
+import sys
+print("Python:", sys.executable)
+for item in distributions(name="ascend-deepep"):
+    print(item.version, getattr(item, "_path", item.locate_file("")))
+PY
+```
+
+旧构建脚本的 pip 安装没有隔离 `PYTHONPATH`。当它包含源码目录时，源码 `.egg-info`
+可能遮蔽环境中已安装的版本，导致 pip 没有卸载旧 `.dist-info`。此时可以出现新代码与旧版本
+元数据并存，日志含 `Not uninstalling ... outside environment` 或 `No files were found to uninstall`。
+新版安装步骤使用 `-I` 隔离源码路径、`--no-user` 禁止装入预检不可见的用户目录，
+并在安装结束时检查版本以及同一安装目录的重复元数据。离线源配置仍生效。
+
+如果本次构建已经生成了版本正确的 wheel，且源码仍与构建时一致，可以直接重新安装它，
+不必再次编译。若已更新源码（包括拉取本次构建脚本修复），应使用新版脚本加 `--build`
+重新构建，否则源码指纹校验会拒绝旧 wheel：
+
+```bash
+# 使用本次 logs/build.log 中的完整 wheel 路径，不要用 dist/**/*.whl 通配混装两个分支。
+WHEEL=/absolute/path/to/DeepEP/dist/build-XXXX/ascend_deepep-0.1.0.dev7+megamoe.a8w8.ep8-cp311-cp311-linux_aarch64.whl
+python -I -m pip install --no-user --force-reinstall --no-deps "$WHEEL"
+python -I -m pip show ascend-deepep
+
+# 已确认安装版本正确后，不加 --build，避免旧版构建脚本再次污染安装。
+bash validation/a8w8/run_npu.sh --suite quick --python "$(python -I -c 'import sys; print(sys.executable)')"
+```
+
+上面的 wheel 名称只是示例，Python ABI、平台和路径以本次构建实际输出为准。
+若仍不匹配，检查当前环境的 pip `user`、`target`、`prefix` 配置及重复元数据；
+不要改小 `VERSION` 或跳过版本校验。两分支应依次安装、依次测试。
 
 ## 2. CPU 测试
 
