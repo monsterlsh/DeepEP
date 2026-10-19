@@ -170,7 +170,7 @@ __aicore__ inline void ComputeMaxExpClip(__ubuf__ T* srcAddr, __ubuf__ uint16_t*
     }
 }
 
-template <typename T>
+template <typename T, bool PreserveSubnormal = false>
 __aicore__ inline void ComputeScale(__ubuf__ uint16_t* maxExpAddr, __ubuf__ uint16_t* mxScaleLocalAddr,
                                     __ubuf__ uint16_t* recipScaleLocalAddr, uint32_t scaleNum)
 {
@@ -234,7 +234,12 @@ __aicore__ inline void ComputeScale(__ubuf__ uint16_t* maxExpAddr, __ubuf__ uint
             Reg::Compare<uint16_t, CMPMODE::EQ>(specialDataMask, sharedExp, scaleBias, preMaskScale);
             Reg::Sub(recipScale, scaleBias, sharedExp, preMaskScale);
             Reg::Select<uint16_t>(recipScale, recipScale, nanU16, cmpResult);
-            Reg::Select<uint16_t>(recipScale, recipScale, zeroU16, zeroMask);
+            if constexpr (!PreserveSubnormal) {
+                Reg::Select<uint16_t>(recipScale, recipScale, zeroU16, zeroMask);
+            }
+            // Expanded FP4 retains 2^127 when the group exponent is zero:
+            // exponent-only reduction cannot distinguish zero from BF16
+            // subnormals. Multiplying actual zeros by this finite value is safe.
             Reg::Select<uint16_t>(recipScale, specialExpU16, recipScale, specialDataMask);
 
             Reg::StoreAlign<uint16_t, Reg::PostLiteral::POST_MODE_UPDATE>(recipScaleLocalAddr, recipScale, vlB16,

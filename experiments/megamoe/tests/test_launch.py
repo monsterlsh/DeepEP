@@ -18,6 +18,9 @@ SCRIPTS = ROOT / "experiments/megamoe/scripts"
 spec = importlib.util.spec_from_file_location("megamoe_batch_launch", SCRIPTS / "batch_launch.py")
 launcher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launcher)
+spec = importlib.util.spec_from_file_location("megamoe_batch_node", SCRIPTS / "batch_node.py")
+node = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(node)
 
 
 @pytest.fixture
@@ -25,9 +28,9 @@ def configuration(tmp_path, monkeypatch):
     for key in ("SHARED_CODE", "BS_VALUES", "MASTER_PORT", "SHMEM_PORT", "SSH_PORT", "SSH_AUTH", "REMOTE_USER"):
         monkeypatch.delenv(key, raising=False)
     for key, value in {
-        "CONDA_BASE": "/opt/conda",
+        "CONDA_BASE": str(tmp_path / "conda"),
         "CONDA_ENV": "test env",
-        "ASCEND_ENV": "/opt/cann/set_env.sh",
+        "ASCEND_ENV": str(tmp_path / "cann/set_env.sh"),
     }.items():
         monkeypatch.setenv(key, value)
     hosts = [f"192.0.2.{i}" for i in range(1, 5)]
@@ -71,6 +74,77 @@ def test_master_override_and_default(configuration):
     assert plan["hosts"][0] == hosts[-1]
     with pytest.raises(ValueError, match="Master"):
         launcher.select_hosts({"hosts": hosts}, 32, "192.0.2.99")
+
+
+def test_default_plan_preserves_a8w4_and_timer(configuration):
+    plan = launcher.make_plan(launcher.parse_args(configuration))
+    assert plan["mma_type"] == "fp8xfp4"
+    assert plan["timer"] and plan["parse_timer"]
+
+
+@pytest.mark.parametrize(
+    "mma_type,input_type", [("fp8xfp8", "fp8"), ("fp8xfp8", "bf16"), ("fp4xfp8", "fp4"), ("fp4xfp8", "bf16")]
+)
+def test_fp8_weights_plan_passes_matching_format_to_benchmark_and_golden(configuration, tmp_path, input_type, mma_type):
+    plan = launcher.make_plan(
+        launcher.parse_args(
+            [*configuration, "--mma-type", mma_type, "--no-timer", "--input", input_type, "--mode", "accuracy"]
+        )
+    )
+    assert plan["mma_type"] == mma_type
+    assert not plan["timer"] and not plan["parse_timer"]
+    benchmark = node.benchmark_command(plan, tmp_path, 1, 96)
+    golden = node.golden_command(plan, tmp_path, 1, 96)
+    for command in (benchmark, golden):
+        assert command[command.index("--mma-type") + 1] == mma_type
+        assert command[command.index("--input") + 1] == input_type
+        assert command[command.index("--golden-dir") + 1] == str(ROOT / "benchmark-golden")
+    assert "--timer" not in benchmark
+    assert benchmark[benchmark.index("--node-rank") + 1] == "1"
+    assert golden[golden.index("--ep-size") + 1] == "32"
+    assert golden[golden.index("--ranks") + 1] == "8-15"
+
+
+def test_a8w8_requires_explicitly_disabled_timer(configuration):
+    with pytest.raises(ValueError, match="fp8xfp8.*--no-timer"):
+        launcher.make_plan(launcher.parse_args([*configuration, "--mma-type", "fp8xfp8"]))
+
+
+def test_a8w8_rejects_shared_experts_before_launch(configuration):
+    with pytest.raises(ValueError, match="fp8xfp8.*shared experts"):
+        launcher.make_plan(
+            launcher.parse_args(
+                [*configuration, "--mma-type", "fp8xfp8", "--no-timer", "--config", "deepseek_v4_pro_shared1"]
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "options,match",
+    [
+        (["--input", "fp8"], "requires bf16 or fp4"),
+        (["--input", "fp4"], "--no-timer"),
+        (["--input", "fp4", "--no-timer", "--config", "deepseek_v4_pro_shared1"], "shared experts"),
+    ],
+)
+def test_a4w8_plan_rejects_mismatched_input_timer_and_shared(configuration, options, match):
+    with pytest.raises(ValueError, match=match):
+        launcher.make_plan(launcher.parse_args([*configuration, "--mma-type", "fp4xfp8", *options]))
+
+
+@pytest.mark.parametrize("mma_type,expected", [("fp8xfp4", "fp8"), ("fp8xfp8", "fp8"), ("fp4xfp8", "fp4")])
+def test_batch_default_input_follows_activation_mode(configuration, mma_type, expected):
+    args = launcher.parse_args([*configuration, "--mma-type", mma_type, "--no-timer"])
+    assert args.input == expected
+    assert launcher.make_plan(args)["input"] == expected
+
+
+def test_legacy_plan_uses_a8w4_for_benchmark_and_golden(configuration, tmp_path):
+    plan = launcher.make_plan(launcher.parse_args(configuration))
+    del plan["mma_type"]
+    for factory in (node.benchmark_command, node.golden_command):
+        command = factory(plan, tmp_path, 0, 96)
+        assert command[command.index("--mma-type") + 1] == "fp8xfp4"
 
 
 @pytest.mark.parametrize("entry", ["build.py", "batch_node.py", "batch_launch.py"])

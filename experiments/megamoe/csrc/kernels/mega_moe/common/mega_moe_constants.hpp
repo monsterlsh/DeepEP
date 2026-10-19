@@ -73,6 +73,8 @@ constexpr uint32_t SYNC_EVENT_ID5 = 5;
 constexpr int64_t GM_FLAG_POLL_BACKOFF_CYCLES = 200;
 constexpr int64_t E5M2_QUANT = 3U;
 constexpr int64_t E2M1_QUANT = 5U;
+// E2M1 numerical precision, losslessly expanded to E4M3 physical storage.
+constexpr int64_t E2M1_EXPANDED_QUANT = 6U;
 constexpr int64_t OVERFLOW_MODE_CTRL = 60U;
 constexpr uint8_t COMBINE_NO_QUANT = 0;
 constexpr uint8_t MXFP8_E4M3_COMM_QUANT = 4;
@@ -83,6 +85,7 @@ constexpr uint8_t GROUPED_MATMUL_MODE_A8W8_NZ = 2U;
 // a4w4 混合场景：GMM1 走 generic a4w4，GMM2 走 A8W4。
 constexpr uint8_t GROUPED_MATMUL_MODE_A4W4 = 3U;
 constexpr uint8_t GROUPED_MATMUL_MODE_A4W4_NZ = 4U;
+constexpr uint8_t GROUPED_MATMUL_MODE_A4W8 = 5U;
 
 constexpr uint32_t L1_TILE_M_256 = 256U;
 constexpr uint32_t L1_TILE_M_128 = 128U;

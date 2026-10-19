@@ -93,6 +93,30 @@ def test_default_fp4_generator_preserves_original_rng_sequence():
             np.testing.assert_array_equal(actual, original)
 
 
+def test_fp8_generator_preserves_fix_branch_normal_rng_and_scale_sequence():
+    rng = np.random.default_rng(13)
+    expected = []
+    for n, k in ((128, 128), (128, 64)):
+        codes = fp8_encode(rng.normal(0, 1, (2, n, k)).astype(np.float32))
+        exponent = int(np.floor(-0.5 * np.log2(k)))
+        scales = rng.integers(127 + exponent - 1, 127 + exponent + 2, (2, n, k // 64, 2), dtype=np.uint8)
+        expected.append((codes, scales))
+    for mode in ("fp8", "fp8xfp8", "fp4xfp8"):
+        for actual_pair, expected_pair in zip(make_weights(2, 128, 64, 13, mode), expected):
+            for actual, original in zip(actual_pair, expected_pair):
+                np.testing.assert_array_equal(actual, original)
+
+
+def test_legacy_weight_kind_and_explicit_mma_arguments_agree_or_reject_conflicts():
+    for weight_kind, mma_type in (("fp4", "fp8xfp4"), ("fp8", "fp8xfp8")):
+        legacy = make_weights(1, 64, 64, 13, weight_kind=weight_kind)
+        modern = make_weights(1, 64, 64, 13, mma_type=mma_type)
+        for a, b in zip(legacy, modern):
+            np.testing.assert_array_equal(unpack_weight(a, weight_kind=weight_kind), unpack_weight(b, mma_type))
+    with pytest.raises(ValueError, match="Conflicting"):
+        make_weights(1, 64, 64, 13, mma_type="fp4xfp8", weight_kind="fp4")
+
+
 def test_unsupported_weight_modes_fail_early():
     from deep_ep_experimental.megamoe.benchmark import validate_weight_mode
 

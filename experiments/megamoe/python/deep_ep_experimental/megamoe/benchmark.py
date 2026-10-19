@@ -11,7 +11,8 @@ import os
 from pathlib import Path
 
 from .timer.__main__ import parse_ranks
-from .performance import alignment_config, collect_profile, enqueue_batch, summarize_rounds
+from .performance import alignment_config, collect_device_call_samples, collect_profile, enqueue_batch, summarize_rounds
+from .formats import MMA_TYPES, resolve_mma_type, validate_input_format
 
 
 def load_config(name, bs_values=None):
@@ -41,9 +42,8 @@ def load_config(name, bs_values=None):
 
 
 def validate_weight_mode(config, weight_kind, *, timer=False):
-    """Reject unsupported A8W8 combinations before importing Torch or allocating devices."""
-    if weight_kind not in ("fp4", "fp8"):
-        raise ValueError("Weights must be fp4 or fp8")
+    """Compatibility helper for the original fix-branch --weights contract."""
+    resolve_mma_type(weight_kind=weight_kind)
     if weight_kind == "fp8" and config["model"]["num_shared_experts"]:
         raise ValueError("A8W8 (--weights fp8) does not support shared experts; set num_shared_experts=0")
     if weight_kind == "fp8" and timer:
@@ -95,13 +95,15 @@ def accuracy(
     group,
     golden_dir,
     input_kind,
-    weight_kind="fp4",
+    mma_type=None,
+    weight_kind=None,
 ):
     import numpy as np
     from .golden import cache_path, compare, contract, load
     from .reference import error_metrics
 
-    spec = contract(config, world, bs, input_kind, routing, check_tokens, weight_kind=weight_kind)
+    mma_type = resolve_mma_type(mma_type, weight_kind)
+    spec = contract(config, world, bs, input_kind, routing, check_tokens, mma_type=mma_type)
     expected, expected_local, selected = load(golden_dir, spec, rank)
     actual = output.float().cpu().numpy()[selected]
     report = compare(actual, expected)
@@ -115,6 +117,8 @@ def accuracy(
         counts_equal=bool(np.array_equal(counts.cpu().numpy(), expected_local)),
         policy="cpu_mixed_error",
         reference="cached_numpy_quantization_aware_not_bitwise",
+        mma_type=mma_type,
+        weights=mma_type.rsplit("x", 1)[-1],
     )
     report["passed"] &= report["counts_equal"]
     if cumulative_stats is not None:
@@ -124,13 +128,27 @@ def accuracy(
     return group.all_gather(report, f"accuracy reports BS={bs}")
 
 
-def main():
+def device_weight_pair(pair, mma_type):
+    """Upload raw codes once; FP8 codes must be reinterpreted, never numerically cast."""
+    import torch
+
+    data, scale = pair
+    weight = torch.from_numpy(data).npu()
+    if mma_type in ("fp8xfp8", "fp4xfp8"):
+        weight = weight.view(torch.float8_e4m3fn)
+    elif mma_type != "fp8xfp4":
+        raise ValueError(f"Unknown mma_type: {mma_type}")
+    return weight, torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu)
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="smoke", help="Packaged name or JSON path")
     parser.add_argument("--bs-values", help="Only model config override, e.g. 96,4096")
     parser.add_argument("--mode", choices=("accuracy", "perf"), default="accuracy")
-    parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
-    parser.add_argument("--weights", choices=("fp4", "fp8"), default="fp4", help="FP4 W4A8 or FP8 W8A8 weights")
+    parser.add_argument("--input", choices=("bf16", "fp8", "fp4"), default="bf16")
+    parser.add_argument("--mma-type", choices=MMA_TYPES, help="A8W4, A8W8 or A4W8 compute format")
+    parser.add_argument("--weights", choices=("fp4", "fp8"), help="Legacy weight selector; default fp4")
     parser.add_argument(
         "--routing",
         choices=("balanced", "random", "skewed"),
@@ -145,14 +163,27 @@ def main():
         "--golden-dir", type=Path, default=Path("benchmark-golden"), help="Precomputed CPU Golden cache"
     )
     parser.add_argument("--relative-rmse", type=float, default=0.02, help="Timer on/off output tolerance only")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     config = load_config(args.config, args.bs_values)
     if args.check_tokens < 0 or not 0 < args.relative_rmse < 1:
         parser.error("Invalid accuracy sample count or tolerance")
     try:
-        validate_weight_mode(config, args.weights, timer=args.timer)
+        args.mma_type = resolve_mma_type(args.mma_type, args.weights)
+        args.weights = args.mma_type.rsplit("x", 1)[-1]
+        validate_input_format(args.mma_type, args.input)
     except ValueError as error:
         parser.error(str(error))
+    if args.mma_type != "fp8xfp4":
+        mode = "A4W8" if args.mma_type == "fp4xfp8" else "W8A8"
+        if config["model"]["num_shared_experts"]:
+            parser.error(f"{mode} requires num_shared_experts=0")
+        if args.timer:
+            parser.error(f"{mode} does not support --timer; profiler performance measurement remains available")
+    return args, config
+
+
+def main():
+    args, config = parse_args()
     import torch
     import torch_npu  # noqa: F401 - Registers NPU dtype/device/stream support.
     from .api import StoreGroup
@@ -170,9 +201,8 @@ def main():
 
 
 def run(args, config, group):
-    validate_weight_mode(config, args.weights, timer=args.timer)
     import torch
-    from .api import SymmBuffer, fp8_fp4_mega_moe, transform_weights_for_mega_moe
+    from .api import SymmBuffer, fp4_fp8_mega_moe, fp8_fp4_mega_moe, fp8_fp8_mega_moe, transform_weights_for_mega_moe
     from .reference import make_weights, quantize_input
     from .validation import collective_check
 
@@ -185,7 +215,7 @@ def run(args, config, group):
             config,
             args.mode,
             args.input,
-            args.weights,
+            args.mma_type,
             args.routing,
             args.timer,
             args.timer_ranks,
@@ -206,7 +236,7 @@ def run(args, config, group):
             for bs in config["bs_values"]:
                 load(
                     args.golden_dir,
-                    contract(config, world, bs, args.input, args.routing, args.check_tokens, weight_kind=args.weights),
+                    contract(config, world, bs, args.input, args.routing, args.check_tokens, mma_type=args.mma_type),
                     rank,
                 )
         except Exception as failure:
@@ -225,6 +255,7 @@ def run(args, config, group):
     manifest = dict(
         config=config,
         input=args.input,
+        mma_type=args.mma_type,
         weights=args.weights,
         mode=args.mode,
         routing=args.routing,
@@ -234,7 +265,10 @@ def run(args, config, group):
         timer_ranks=timer_ranks,
         host_coordination="tcpstore",
         device_communication="shmem_mte",
-        api="fp8_fp4_mega_moe",
+        api=args.mma_type.replace("x", "_") + "_mega_moe",
+        activation_storage="fp4_expanded_to_fp8" if args.mma_type == "fp4xfp8" else "fp8",
+        execution_path="fp4_precision_expanded_fp8" if args.mma_type == "fp4xfp8" else args.mma_type,
+        timing_scope="fused_kernel",
         numerical_contract="ascend_post_gmm2_route_weight_v1",
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
@@ -245,16 +279,9 @@ def run(args, config, group):
         group,
         num_max_tokens_per_rank=max(config["bs_values"]),
         ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
-        mma_type="fp8xfp4" if args.weights == "fp4" else "fp8xfp8",
+        mma_type=args.mma_type,
         **model,
     )
-
-    def device_pair(pair):
-        data, scale = pair
-        weight = torch.from_numpy(data).npu()
-        if args.weights == "fp8":
-            weight = weight.view(torch.float8_e4m3fn)
-        return weight, torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu)
 
     if args.timer and not buffer.timer_enabled:
         raise RuntimeError("Timer requires a W4A8 wheel built with DEEPEP_MEGAMOE_TIMER=ON")
@@ -263,16 +290,21 @@ def run(args, config, group):
         model["hidden"],
         model["intermediate_hidden"],
         config["seed"] + rank,
-        weight_kind=args.weights,
+        mma_type=args.mma_type,
     )
-    prepared = transform_weights_for_mega_moe(*map(device_pair, raw))
-    shared_raw, shared_kwargs = None, {}
+    prepared = transform_weights_for_mega_moe(*(device_weight_pair(pair, args.mma_type) for pair in raw))
+    del raw
+    shared_kwargs = {}
     if model["num_shared_experts"]:
         shared_raw = make_weights(
             model["num_shared_experts"], model["hidden"], model["intermediate_hidden"], config["seed"] + 100000
         )
-        shared = transform_weights_for_mega_moe(*map(device_pair, shared_raw), shared=True)
+        shared = transform_weights_for_mega_moe(
+            *(device_weight_pair(pair, args.mma_type) for pair in shared_raw), shared=True
+        )
+        del shared_raw
         shared_kwargs = dict(shared_l1_weights=shared[0], shared_l2_weights=shared[1])
+    forward = {"fp8xfp4": fp8_fp4_mega_moe, "fp8xfp8": fp8_fp8_mega_moe, "fp4xfp8": fp4_fp8_mega_moe}[args.mma_type]
     for bs in config["bs_values"]:
         case = rank_dir / f"bs_{bs}"
         case.mkdir()
@@ -280,8 +312,9 @@ def run(args, config, group):
         if args.input == "bf16":
             activation = torch.from_numpy(x).to(device="npu", dtype=torch.bfloat16)
         else:
-            data, scale = quantize_input(x)
-            buffer.x[:bs].copy_(torch.from_numpy(data).npu().view(torch.float8_e4m3fn))
+            data, scale = quantize_input(x, args.input)
+            uploaded = torch.from_numpy(data).npu()
+            buffer.x[:bs].copy_(uploaded if args.input == "fp4" else uploaded.view(torch.float8_e4m3fn))
             buffer.x_sf[:bs].copy_(torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
             activation = None
         buffer.topk_idx[:bs].copy_(torch.from_numpy(ids))
@@ -303,7 +336,7 @@ def run(args, config, group):
         result = torch.empty((bs, model["hidden"]), device="npu", dtype=torch.bfloat16)
 
         def call(timer=None, stats=None):
-            fp8_fp4_mega_moe(
+            forward(
                 result,
                 *prepared,
                 buffer,
@@ -353,14 +386,15 @@ def run(args, config, group):
                 group=group,
                 golden_dir=args.golden_dir,
                 input_kind=args.input,
-                weight_kind=args.weights,
+                mma_type=args.mma_type,
             )
             (case / "accuracy.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
             if not all(item["passed"] for item in reports):
                 raise AssertionError(f"BS={bs}: accuracy FAILED; see {case / 'accuracy.json'}")
             if rank == 0:
                 print(
-                    f"[ACCURACY] BS={bs} all {world} ranks passed ({args.input}, sampled={args.check_tokens})",
+                    f"[ACCURACY] BS={bs} all {world} ranks passed "
+                    f"({args.mma_type}, {args.input}, sampled={args.check_tokens})",
                     flush=True,
                 )
         else:
@@ -370,15 +404,33 @@ def run(args, config, group):
             per_rank = group.all_gather(timings, f"profiling BS={bs}")
             report = summarize_rounds(per_rank, int(os.environ["LOCAL_WORLD_SIZE"]))
             report["alignment"] = config["alignment"]
+            report.update(mma_type=args.mma_type, input=args.input, ep_size=world, bs=bs)
+            report.update(timing_scope="fused_kernel", execution_path=manifest["execution_path"])
+            if args.mma_type == "fp4xfp8":
+                call_samples = collect_device_call_samples(call, group, torch, config, prefix, bs)
+                per_rank_calls = group.all_gather(call_samples, f"full call device timing BS={bs}")
+                call_report = summarize_rounds(per_rank_calls, int(os.environ["LOCAL_WORLD_SIZE"]))
+                call_report.update(
+                    metric="megamoe_full_call_device_duration_us",
+                    includes_fp4_expansion=args.input == "fp4",
+                    measurement="caller_stream_npu_events",
+                    mma_type=args.mma_type,
+                    input=args.input,
+                )
+                (case / "full_call_profiling.json").write_text(json.dumps(call_report, indent=2), encoding="utf-8")
+                report["full_call_device"] = call_report
             (case / "profiling.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
             if rank == 0:
                 print(
-                    f"[PERF] BS={bs} MegaMoe E2E={report['mean_us']:.3f}us "
+                    f"[PERF] BS={bs} MMA={args.mma_type} MegaMoE kernel={report['mean_us']:.3f}us "
                     f"rank-max-mean={report['rank_max_mean_us']:.3f}us "
                     f"rounds={report['rounds']}/{report['recorded_rounds']} "
                     f"(last ceil(iters/2); kernel Duration; rank-min mean; timer off)",
                     flush=True,
                 )
+                if args.mma_type == "fp4xfp8":
+                    scope = "including packed input expansion" if args.input == "fp4" else "BF16 input"
+                    print(f"[PERF] A4W8 full call ({scope})={call_report['mean_us']:.3f}us", flush=True)
         if args.timer:
             uninstrumented = result.float().cpu().numpy() if args.mode == "accuracy" else None
             timer, error = None, None

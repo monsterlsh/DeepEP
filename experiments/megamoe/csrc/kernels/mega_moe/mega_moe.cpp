@@ -19,7 +19,7 @@ using namespace AscendC;
 // Explicit types replace asc_opc dtype/format/tiling-key specialisation.
 // A8W4's existing matmul prologue continues to interpret weights as NZ/C0_32.
 // Batch scheduling preserves the old ACL schemMode=1 cross-core contract.
-template <bool IsA8W4, bool FuseGateUp = false>
+template <bool IsA8W4, bool FuseGateUp = false, bool IsA4W8 = false>
 __schedmode__(1) __global__
     __mix__(1, 2) void mega_moe_kernel(GM_ADDR context, GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_ids,
                                        GM_ADDR topk_weights, GM_ADDR weight1, GM_ADDR weight2, GM_ADDR weight_scales1,
@@ -31,7 +31,7 @@ __schedmode__(1) __global__
 #if defined(__NPU_DEVICE__)
     InitSocState();
     util_set_ffts_config(ffts_addr);
-    constexpr int32_t kDispatchE4M3 = 4;
+    constexpr int32_t kDispatchE4M3 = IsA4W8 ? MegaMoeImpl::E2M1_EXPANDED_QUANT : 4;
     if constexpr (IsA8W4) {
         MegaMoeImpl::MegaMoeA8W4Wave<bfloat16_t, bfloat16_t, float, fp4x2_e2m1_t, kDispatchE4M3,
                                      MegaMoeImpl::COMBINE_NO_QUANT, false, FuseGateUp>
@@ -69,6 +69,11 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
             workspace, timer, tiling, ffts_addr);
     } else if (is_a8w4) {
         mega_moe_kernel<true, false><<<block_dim, ub_bytes, stream>>>(
+            context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
+            shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
+            workspace, timer, tiling, ffts_addr);
+    } else if (tiling.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A4W8) {
+        mega_moe_kernel<false, false, true><<<block_dim, ub_bytes, stream>>>(
             context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
             shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
             workspace, timer, tiling, ffts_addr);

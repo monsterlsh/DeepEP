@@ -9,6 +9,8 @@ are modeled; this is not a bitwise emulator of Cube accumulation or exp.
 
 import numpy as np
 
+from .formats import resolve_mma_type
+
 FP4 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=np.float32)
 _code = np.arange(127)
 FP8_POSITIVE = np.where(_code < 8, _code * 2.0**-9, (1 + (_code % 8) / 8) * np.exp2(_code // 8 - 7)).astype(np.float32)
@@ -41,43 +43,79 @@ def fp8_encode(x):
     return code | (np.signbit(x).astype(np.uint8) << 7)
 
 
-def quantize_input(x):
-    """ComputeMaxExp/ComputeScale: floor(log2(block_amax))-8, block size 32."""
+def fp4_encode(x):
+    """Finite E2M1 codes, round-to-nearest-even, saturating to +/-6."""
+    x = np.asarray(x, dtype=np.float32)
+    if not np.isfinite(x).all():
+        raise ValueError("FP4 conversion requires finite values")
+    value = np.minimum(np.abs(x), 6)
+    upper = np.searchsorted(FP4[:8], value).clip(0, 7)
+    lower = np.maximum(upper - 1, 0)
+    dl, du = value - FP4[lower], FP4[upper] - value
+    code = np.where((dl < du) | ((dl == du) & ((lower % 2) == 0)), lower, upper).astype(np.uint8)
+    return code | (np.signbit(x).astype(np.uint8) << 3)
+
+
+def fp4_pack(codes):
+    """Pack even K indices into low nibbles; preserve signed zero."""
+    codes = np.asarray(codes, dtype=np.uint8)
+    if codes.shape[-1] % 2 or np.any(codes > 15):
+        raise ValueError("FP4 codes must be in [0,15] with an even last dimension")
+    return codes[..., ::2] | (codes[..., 1::2] << 4)
+
+
+def fp4_unpack(packed):
+    packed = np.asarray(packed, dtype=np.uint8)
+    codes = np.empty((*packed.shape[:-1], packed.shape[-1] * 2), dtype=np.uint8)
+    codes[..., ::2], codes[..., 1::2] = packed & 15, packed >> 4
+    return codes
+
+
+def quantize_input(x, input_kind="fp8"):
+    """MX block32: floor(log2(amax))-8 for E4M3, -2 for E2M1."""
+    if input_kind not in ("fp8", "fp4"):
+        raise ValueError("Activation format must be fp8 or fp4")
     x = bf16(x)
     if x.shape[-1] % 32 or not np.isfinite(x).all():
         raise ValueError("Finite inputs and K divisible by 32 are required")
     blocks = x.reshape(*x.shape[:-1], x.shape[-1] // 32, 32)
     maximum = np.abs(blocks).max(axis=-1)
-    exponent = np.maximum(np.floor(np.log2(np.maximum(maximum, 2.0**-119))) - 8, -127)
+    shift = 2 if input_kind == "fp4" else 8
+    exponent = np.maximum(np.floor(np.log2(np.maximum(maximum, 2.0 ** (-127 + shift)))) - shift, -127)
     scale = np.exp2(exponent).astype(np.float32)
-    codes = fp8_encode((blocks / scale[..., None]).reshape(x.shape))
+    normalized = (blocks / scale[..., None]).reshape(x.shape)
+    codes = fp4_pack(fp4_encode(normalized)) if input_kind == "fp4" else fp8_encode(normalized)
     return codes, (exponent + 127).astype(np.uint8)
 
 
-def dequantize_input(codes, scales):
+def dequantize_input(codes, scales, input_kind="fp8"):
+    if input_kind not in ("fp8", "fp4"):
+        raise ValueError("Activation format must be fp8 or fp4")
     scale = np.exp2(np.asarray(scales, dtype=np.int16) - 127).astype(np.float32)
-    return fp8_decode(codes) * np.repeat(scale, 32, axis=-1)
+    values = FP4[fp4_unpack(codes)] if input_kind == "fp4" else fp8_decode(codes)
+    return values * np.repeat(scale, 32, axis=-1)
 
 
-def unpack_weight(pair, weight_kind="fp4"):
+def unpack_weight(pair, mma_type=None, *, weight_kind=None):
+    mma_type = resolve_mma_type(mma_type, weight_kind)
     packed, scales = pair
     packed = np.asarray(packed, dtype=np.uint8)
-    if weight_kind == "fp4":
+    if mma_type == "fp8xfp4":
         values = np.empty((*packed.shape[:-1], packed.shape[-1] * 2), dtype=np.float32)
         values[..., ::2], values[..., 1::2] = FP4[packed & 15], FP4[packed >> 4]
-    elif weight_kind == "fp8":
+    elif mma_type in ("fp8xfp8", "fp4xfp8"):
         values = fp8_decode(packed)
     else:
-        raise ValueError("Weights must be fp4 or fp8")
+        raise ValueError(f"Unsupported MMA type: {mma_type}")
     shape = (*values.shape[:-1], values.shape[-1] // 32)
     scale = np.exp2(np.asarray(scales, dtype=np.int16).reshape(shape) - 127).astype(np.float32)
     return values * np.repeat(scale, 32, axis=-1)
 
 
-def make_weights(experts, hidden, intermediate, seed, weight_kind="fp4"):
+def make_weights(experts, hidden, intermediate, seed, mma_type=None, *, weight_kind=None):
     """Generate FP4/FP8 codes and non-uniform E8M0 scales before the hot path."""
-    if weight_kind not in ("fp4", "fp8"):
-        raise ValueError("Weights must be fp4 or fp8")
+    mma_type = resolve_mma_type(mma_type, weight_kind)
+    weight_kind = mma_type.rsplit("x", 1)[-1]
     rng = np.random.default_rng(seed)
     result = []
     for n, k in ((2 * intermediate, hidden), (hidden, intermediate)):
@@ -92,21 +130,22 @@ def make_weights(experts, hidden, intermediate, seed, weight_kind="fp4"):
     return tuple(result)
 
 
-def expert_forward(x, w1, w2):
+def expert_forward(x, w1, w2, mma_type="fp8xfp4"):
     first = bf16(x @ w1.T)
     gate, up = np.split(first, 2, axis=-1)
     activated = bf16(gate / (1 + np.exp(np.clip(-gate, -80, 80))) * up)
-    quantized = dequantize_input(*quantize_input(activated))
+    input_kind = "fp4" if mma_type == "fp4xfp8" else "fp8"
+    quantized = dequantize_input(*quantize_input(activated, input_kind), input_kind)
     return bf16(quantized @ w2.T)
 
 
-def local_reference(x, indices, weights, l1, l2, first_expert):
+def local_reference(x, indices, weights, l1, l2, first_expert, mma_type="fp8xfp4"):
     """One rank's contribution to one source rank. l1/l2 contain local experts only."""
     result = np.zeros_like(x, dtype=np.float32)
     for local in range(len(l1)):
         token, slot = np.where(indices == first_expert + local)
         if token.size:
-            contribution = expert_forward(x[token], l1[local], l2[local])
+            contribution = expert_forward(x[token], l1[local], l2[local], mma_type)
             np.add.at(result, token, contribution * weights[token, slot, None])
     return result
 

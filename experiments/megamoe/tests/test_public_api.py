@@ -155,6 +155,9 @@ def backend(monkeypatch):
     class Plan:
         def __init__(self, example, *args):
             self.bs, self.workspace_bytes = example.shape[0], 4096
+            self.is_a8w4 = args[5]
+            self.is_a4w8 = len(args) == 12 and args[-1] is True
+            self.example = example
             events.append(("prepare", self.bs))
 
         def forward(self, *args):
@@ -170,6 +173,7 @@ def backend(monkeypatch):
         timer_enabled=True,
         timer_numel=64,
         small_batch_max_tokens=256,
+        a4w8_supported=True,
     )
     monkeypatch.setattr(api, "_extension", lambda: ext)
     buffer = api.SymmBuffer(Group(), 4, 17, 2, 1024, 256)
@@ -187,6 +191,167 @@ def weights():
     for weight, _ in prepared:
         weight.npu_format = 50
     return prepared
+
+
+@pytest.fixture
+def w8_backend(backend):
+    buffer = api.SymmBuffer(backend.buffer.group, 4, 257, 2, 1024, 256, mma_type="fp8xfp8")
+    buffer.topk_idx.data[:] = [0, 1]
+    buffer.topk_weights.data[:] = [0.4, 0.6]
+    buffer.x.data[:] = np.arange(1024, dtype=np.uint16) % 127
+    buffer.x_sf.data[:] = 127
+    yield SimpleNamespace(buffer=buffer, events=backend.events)
+    buffer.destroy()
+
+
+def fp8_weights():
+    return (
+        (Tensor(np.zeros((2, 512, 1024)), "float8_e4m3fn"), Tensor(np.full((2, 512, 16, 2), 127), "float8_e8m0fnu")),
+        (Tensor(np.zeros((2, 1024, 256)), "float8_e4m3fn"), Tensor(np.full((2, 1024, 4, 2), 127), "float8_e8m0fnu")),
+    )
+
+
+@pytest.fixture
+def a4_backend(backend, monkeypatch):
+    from deep_ep_experimental.megamoe.reference import FP4, fp4_unpack, fp8_encode
+
+    def expand(data, output):
+        backend.events.append("expand_fp4")
+        backend.events.append(("packed_input", data))
+        output.data[:] = fp8_encode(FP4[fp4_unpack(data.data)])
+        return output
+
+    monkeypatch.setattr(api, "_expand_fp4_input", expand)
+    buffer = api.SymmBuffer(backend.buffer.group, 4, 257, 2, 1024, 256, mma_type="fp4xfp8")
+    buffer.topk_idx.data[:] = [0, 1]
+    buffer.topk_weights.data[:] = [0.4, 0.6]
+    buffer.x.data[:] = np.arange(512, dtype=np.uint16) % 256
+    buffer.x_sf.data[:] = 127
+    yield SimpleNamespace(buffer=buffer, events=backend.events)
+    buffer.destroy()
+
+
+@pytest.mark.parametrize("bf16_input", [False, True])
+def test_a4w8_public_workflow_packed_or_bf16_and_native_plan(a4_backend, bf16_input):
+    b = a4_backend.buffer
+    assert b.x.dtype == "uint8" and b.x.shape == (257, 512)
+    stats = Tensor([7, 11], "int32")
+    original = b.x.data.copy()
+    for iteration, bs in enumerate((17, 257, 17), start=1):
+        x = Tensor(np.ones((bs, 1024)), "bfloat16") if bf16_input else None
+        y = Tensor(np.zeros((bs, 1024)), "bfloat16")
+        b.validate_inputs(bs, x=x)
+        b.prepare(bs)
+        assert b._plan.is_a4w8 and not b._plan.is_a8w4
+        assert b._plan.example.shape == (bs, 1024) and b._plan.example.dtype == "float8_e4m3fn"
+        assert api.fp4_fp8_mega_moe(y, *fp8_weights(), b, cumulative_local_expert_recv_stats=stats, x=x) is None
+        launch = [e[1] for e in a4_backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
+        if bf16_input:
+            assert launch[0] is x and launch[1] is None
+        else:
+            assert launch[0].dtype == "float8_e4m3fn" and launch[0].shape == (bs, 1024)
+            np.testing.assert_array_equal(launch[1].data, b.x_sf.data[:bs])
+        np.testing.assert_array_equal(stats.data, [7 + 2 * iteration, 11 + 3 * iteration])
+    np.testing.assert_array_equal(b.x.data, original)
+    assert a4_backend.events.count("expand_fp4") == (0 if bf16_input else 3)
+    for event in a4_backend.events:
+        if isinstance(event, tuple) and event[0] == "packed_input":
+            assert event[1].streams == [b._runtime.stream]
+    assert not b.timer_enabled
+
+
+def test_a4w8_requires_native_capability_before_allocating_runtime(backend):
+    backend.ext.a4w8_supported = False
+    with pytest.raises(RuntimeError, match="a4w8_supported"):
+        api.SymmBuffer(backend.buffer.group, 4, 17, 2, 1024, 256, mma_type="fp4xfp8")
+
+
+@pytest.mark.parametrize("unsupported", ["shared_l1_weights", "shared_l2_weights", "timer"])
+def test_a4w8_rejects_unsupported_features_before_launch(a4_backend, unsupported):
+    kwargs = {unsupported: Tensor([0], "int64") if unsupported == "timer" else fp8_weights()[0]}
+    with pytest.raises(NotImplementedError, match="A4W8.*not supported"):
+        api.fp4_fp8_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), *fp8_weights(), a4_backend.buffer, **kwargs)
+    assert not any(isinstance(e, tuple) and e[0] == "launch" for e in a4_backend.events)
+
+
+def test_a4w8_explicit_api_rejects_fp8_and_invalid_scales(a4_backend):
+    b = a4_backend.buffer
+    with pytest.raises(TypeError, match="A4W8 inputs"):
+        api.mega_moe(
+            Tensor(np.zeros((17, 1024)), "float8_e4m3fn"), b.topk_idx[:17], b.topk_weights[:17], *fp8_weights(), b
+        )
+    with pytest.raises(ValueError, match="A4W8 scales"):
+        api.mega_moe(
+            (b.x[:17], Tensor(np.zeros((17, 16)), "float8_e8m0fnu")),
+            b.topk_idx[:17],
+            b.topk_weights[:17],
+            *fp8_weights(),
+            b,
+        )
+
+
+def test_legacy_buffered_entry_rejects_a4_mode_before_launch(a4_backend):
+    with pytest.raises(ValueError, match="use fp4_fp8_mega_moe"):
+        api.fp8_fp4_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), *fp8_weights(), a4_backend.buffer)
+    assert not any(isinstance(event, tuple) and event[0] == "launch" for event in a4_backend.events)
+
+
+@pytest.mark.parametrize("bf16", [False, True])
+def test_fp8_public_workflow_preserves_inputs_weights_stats_and_plan_mode(w8_backend, bf16):
+    from deep_ep_experimental.megamoe import fp8_fp8_mega_moe
+
+    b = w8_backend.buffer
+    w1, w2 = api.transform_weights_for_mega_moe(*fp8_weights())
+    stats = Tensor([7, 11], "int32")
+    for iteration, bs in enumerate((17, 257, 17), start=1):
+        x = Tensor(np.ones((bs, 1024)), "bfloat16") if bf16 else None
+        y = Tensor(np.zeros((bs, 1024)), "bfloat16")
+        b.validate_inputs(bs, x=x)
+        b.prepare(bs)
+        plan = b._plan
+        b.prepare(bs)
+        assert b._plan is plan and not plan.is_a8w4
+        assert fp8_fp8_mega_moe(y, w1, w2, b, cumulative_local_expert_recv_stats=stats, x=x) is None
+        assert b._plan is plan
+        np.testing.assert_array_equal(y.data, 3)
+        np.testing.assert_array_equal(stats.data, [7 + 2 * iteration, 11 + 3 * iteration])
+        launch = [event[1] for event in w8_backend.events if isinstance(event, tuple) and event[0] == "launch"][-1]
+        assert launch[4] is w1[0] and launch[5] is w2[0]
+        assert launch[6] is w1[1] and launch[7] is w2[1]
+        assert launch[-1] is y and launch[8] is None
+        if bf16:
+            assert launch[0] is x and launch[1] is None
+        else:
+            np.testing.assert_array_equal(launch[0].data, b.x.data[:bs])
+            np.testing.assert_array_equal(launch[1].data, b.x_sf.data[:bs])
+            assert launch[0].untyped_storage().data_ptr() == b.x.untyped_storage().data_ptr()
+    assert not b.timer_enabled
+    assert not any(isinstance(event, tuple) and event[0] == "format_cast" for event in w8_backend.events)
+
+
+def test_named_fp8_entry_rejects_fp4_but_legacy_entry_preserves_a8w8(backend, w8_backend):
+    y = Tensor(np.zeros((17, 1024)), "bfloat16")
+    with pytest.raises(ValueError, match="mma_type='fp8xfp8'"):
+        api.fp8_fp8_mega_moe(y, *weights(), backend.buffer)
+    assert not any(isinstance(event, tuple) and event[0] in {"prepare", "launch"} for event in backend.events)
+    api.fp8_fp4_mega_moe(y, *fp8_weights(), w8_backend.buffer)
+    assert any(isinstance(event, tuple) and event[0] == "launch" for event in backend.events)
+
+
+@pytest.mark.parametrize("unsupported", ["shared_l1_weights", "shared_l2_weights", "timer"])
+def test_fp8_rejects_unsupported_features_before_preparation(w8_backend, unsupported):
+    kwargs = {unsupported: Tensor([0], "int64") if unsupported == "timer" else fp8_weights()[0]}
+    with pytest.raises(NotImplementedError, match="A8W8.*not supported"):
+        api.fp8_fp8_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), *fp8_weights(), w8_backend.buffer, **kwargs)
+    assert not any(isinstance(event, tuple) and event[0] in {"prepare", "launch"} for event in w8_backend.events)
+
+
+def test_fp8_rejects_mixed_weight_dtypes_before_preparation(w8_backend):
+    w1, _ = fp8_weights()
+    _, w2 = weights()
+    with pytest.raises(TypeError, match="Weight dtype differs"):
+        api.fp8_fp8_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), w1, w2, w8_backend.buffer)
+    assert not any(isinstance(event, tuple) and event[0] in {"prepare", "launch"} for event in w8_backend.events)
 
 
 @pytest.mark.parametrize("bf16", [False, True])

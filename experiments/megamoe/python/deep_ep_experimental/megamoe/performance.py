@@ -144,3 +144,25 @@ def collect_profile(call, group, torch, config, prefix, directory, bs):
         print(f"[PROFILE] BS={bs} batch complete; exporting {directory}", flush=True)
         prof.step()
     return read_kernel_samples(directory, config["iters"])
+
+
+def collect_device_call_samples(call, group, torch, config, prefix, bs):
+    """Device event duration covers packed FP4 expansion plus the MegaMoE call.
+
+    Events are on the caller stream. The public API orders its private stream
+    before returning, so the end event also waits for expansion and the kernel.
+    """
+    pairs = [(torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)) for _ in range(config["iters"])]
+    torch.npu.synchronize()
+    group.barrier(f"device call timing ready BS={bs}")
+    for _ in range(config["alignment"]["repeats"]):
+        torch.exp(prefix, out=prefix)
+    for start, end in pairs:
+        start.record()
+        call()
+        end.record()
+    torch.npu.synchronize()
+    samples = [float(start.elapsed_time(end)) * 1000 for start, end in pairs]
+    if any(not math.isfinite(value) or value <= 0 for value in samples):
+        raise ValueError("Nonfinite/nonpositive A4W8 full-call device timing")
+    return samples

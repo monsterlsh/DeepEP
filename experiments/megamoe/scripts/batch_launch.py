@@ -44,7 +44,13 @@ def parse_args(argv=None):
     parser.add_argument("--shared-code", type=Path, default=Path(os.environ.get("SHARED_CODE", ROOT)))
     parser.add_argument("--config", default="deepseek_v4_pro")
     parser.add_argument("--bs-values", default=os.environ.get("BS_VALUES"))
-    parser.add_argument("--input", choices=("fp8", "bf16"), default="fp8")
+    parser.add_argument("--input", choices=("fp8", "bf16", "fp4"), help="Default: matching quantized activation format")
+    parser.add_argument(
+        "--mma-type",
+        choices=("fp8xfp4", "fp8xfp8", "fp4xfp8"),
+        help="Activation/weight compute format",
+    )
+    parser.add_argument("--weights", choices=("fp4", "fp8"), help="Legacy weight selector; default fp4")
     parser.add_argument("--routing", choices=("balanced", "random", "skewed"), default="balanced")
     parser.add_argument("--mode", choices=("perf", "accuracy"), default="perf")
     parser.add_argument("--no-timer", action="store_true", help="Disable timer collection and parsing")
@@ -71,7 +77,13 @@ def parse_args(argv=None):
     parser.add_argument("--timeout", type=int, default=7200, help="Seconds per stage/BS; failure cancels this launch")
     parser.add_argument("--master-port", type=int, default=int(os.environ.get("MASTER_PORT", "29654")))
     parser.add_argument("--shmem-port", type=int, default=int(os.environ.get("SHMEM_PORT", "26733")))
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.mma_type is not None and args.weights is not None and args.mma_type.rsplit("x", 1)[-1] != args.weights:
+        parser.error(f"Conflicting --mma-type {args.mma_type} and --weights {args.weights}")
+    args.mma_type = args.mma_type or ("fp8x" + (args.weights or "fp4"))
+    if args.input is None:
+        args.input = "fp4" if args.mma_type == "fp4xfp8" else "fp8"
+    return args
 
 
 def make_plan(args):
@@ -91,6 +103,14 @@ def make_plan(args):
         raise ValueError("BS values must be distinct integers in [1,65536]")
     if config["model"]["num_experts"] % args.ep_size:
         raise ValueError("Global experts must divide EP size")
+    quantized = "fp4" if args.mma_type == "fp4xfp8" else "fp8"
+    if args.input not in ("bf16", quantized):
+        raise ValueError(f"{args.mma_type} requires bf16 or {quantized} input")
+    if args.mma_type != "fp8xfp4":
+        if config["model"].get("num_shared_experts", 0):
+            raise ValueError(f"{args.mma_type} does not support shared experts; use num_shared_experts=0")
+        if not args.no_timer:
+            raise ValueError(f"{args.mma_type} does not support device timers; pass --no-timer")
     if (
         not all(1024 <= port <= 65535 for port in (args.master_port, args.shmem_port))
         or args.master_port == args.shmem_port
@@ -118,6 +138,8 @@ def make_plan(args):
         hosts=hosts,
         config=config,
         input=args.input,
+        mma_type=args.mma_type,
+        weights=args.mma_type.rsplit("x", 1)[-1],
         routing=args.routing,
         mode=args.mode,
         timer=not args.no_timer,

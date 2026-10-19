@@ -6,6 +6,7 @@
 
 #include "../common/mega_moe_mxfp8_utils.hpp"
 #include "../common/mega_moe_utils.hpp"
+#include "../epilogue/quant/mxfp4_expanded_quant.hpp"
 
 namespace MegaMoeImpl {
 
@@ -170,7 +171,14 @@ __aicore__ inline void QuantizeLocalTokens(const AivJobContext& job, const MoeSt
         __ubuf__ int8_t* outDataAddr = (__ubuf__ int8_t*)xOutTensor.GetPhyAddr();
         __ubuf__ uint16_t* mxScaleAddr = (__ubuf__ uint16_t*)xOutTensor[config.quantTokenAlignBytes].GetPhyAddr();
 
-        if constexpr (QuantMode == E2M1_QUANT) {
+        if constexpr (QuantMode == E2M1_EXPANDED_QUANT) {
+            // Physical output remains FP8; the rounding lattice and scales are
+            // MXFP4 E2M1. GMM1 and the SwiGLU epilogue use the same policy.
+            Quant::ComputeMaxExp(srcAddr, maxExpAddr, hiddenDim);
+            Quant::ComputeScale<fp4x2_e2m1_t, true>(maxExpAddr, mxScaleAddr, halfScaleAddr,
+                                                    config.quantScaleNumAlignPerToken);
+            MxQuant::QuantizeMxFp4ExpandedData(srcAddr, halfScaleAddr, outDataAddr, hiddenDim);
+        } else if constexpr (QuantMode == E2M1_QUANT) {
             Quant::ComputeMaxExp(srcAddr, maxExpAddr, hiddenDim);
             Quant::ComputeScale<QuantOutType>(maxExpAddr, mxScaleAddr, halfScaleAddr,
                                               config.quantScaleNumAlignPerToken);

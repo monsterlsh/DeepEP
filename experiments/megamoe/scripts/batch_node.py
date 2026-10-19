@@ -84,6 +84,8 @@ def benchmark_command(plan, run_dir, rank, bs):
         plan["mode"],
         "--input",
         plan["input"],
+        "--mma-type",
+        plan.get("mma_type", "fp8xfp4"),
         "--routing",
         plan["routing"],
         "--output-dir",
@@ -112,6 +114,8 @@ def golden_command(plan, run_dir, rank, bs):
         f"{rank * 8}-{rank * 8 + 7}",
         "--input",
         plan["input"],
+        "--mma-type",
+        plan.get("mma_type", "fp8xfp4"),
         "--routing",
         plan["routing"],
         "--golden-dir",
@@ -152,13 +156,15 @@ def main(argv=None):
 from importlib.resources import files
 from deep_ep._native import require_native
 require_native("cluster preflight")
-import deep_ep_experimental.megamoe._C
+import deep_ep_experimental.megamoe._C as megamoe_native
+if sys.argv[2] == "fp4xfp8" and not getattr(megamoe_native, "a4w8_supported", False):
+    raise RuntimeError("Selected wheel lacks A4W8 support; rebuild and reinstall")
 info = json.loads(files("deep_ep").joinpath("_build_info.json").read_text())
 with open(sys.argv[1], "w") as f:
     json.dump(dict(build=info, torch=torch.__version__, torch_npu=torch_npu.__version__,
                    python=list(sys.version_info[:2])), f)
 """
-        run([sys.executable, "-I", "-c", code, str(target)])
+        run([sys.executable, "-I", "-c", code, str(target), plan.get("mma_type", "fp8xfp4")])
         return read_json(target)
 
     interfaces = json.loads(run(["ip", "-j", "-4", "addr", "show", "up"], capture=True))

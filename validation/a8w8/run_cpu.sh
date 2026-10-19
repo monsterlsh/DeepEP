@@ -25,7 +25,7 @@ Recommended: a Python 3.11/3.12 virtual environment; Torch/CANN/NPU are not need
   -h, --help             Show help.
 
 Full is intended for Linux. Portable is a reduced suite, including on Linux.
-Both require a C++17 compiler when test_native_policies.py exists (set CXX if needed).
+Both require a C++17 compiler for native quantization/policy tests (set CXX if needed).
 Tests needing real CPU PyTorch are skipped if Torch is absent; reports list skips.
 Exit status is nonzero on a failed preflight, install, test, or report write.
 HELP
@@ -90,7 +90,8 @@ if ((DRY_RUN)); then
     printf 'Run tests from the source checkout; all reports use the new output directory.\n'
     if ((INSTALL)); then install_command; print_command install "${INSTALL_COMMAND[@]}"; fi
     printf '[preflight] CPU dependencies, Bash (Python 3.11/3.12 recommended)'
-    if [[ -f $REPO_DIR/experiments/megamoe/tests/test_native_policies.py ]]; then
+    if [[ -f $REPO_DIR/experiments/megamoe/tests/test_native_policies.py ||
+          -f $REPO_DIR/experiments/megamoe/tests/test_a4w8_native_policy.py ]]; then
         printf ', C++17 compiler (CXX/c++/g++/clang++)'
     fi
     printf '\n'
@@ -227,7 +228,8 @@ metadata = {
     "python": sys.executable, "python_version": platform.python_version(), "platform": platform.platform(),
     "suite": sys.argv[3], "scope": ["experiments/megamoe/tests", "validation/a8w8/test_runners.py"],
     "deselected_prefixes": sys.argv[4:], "torch_available": importlib.util.find_spec("torch") is not None,
-    "native_policy_tests_present": (root / "experiments/megamoe/tests/test_native_policies.py").is_file(),
+    "native_policy_tests_present": any((root / "experiments/megamoe/tests" / name).is_file() for name in (
+        "test_native_policies.py", "test_a4w8_native_policy.py")),
 }
 (output / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 if sys.version_info[:2] not in {(3, 11), (3, 12)}:
@@ -267,7 +269,8 @@ for line in (root / "validation/a8w8/requirements-cpu.txt").read_text().splitlin
 if not shutil.which("bash"):
     problems.append("Bash is required by launcher/runner tests")
 compiler = None
-if (root / "experiments/megamoe/tests/test_native_policies.py").is_file():
+if any((root / "experiments/megamoe/tests" / name).is_file() for name in (
+        "test_native_policies.py", "test_a4w8_native_policy.py")):
     compiler = os.environ.get("CXX") or shutil.which("c++") or shutil.which("g++") or shutil.which("clang++")
     if not compiler:
         problems.append("C++17 policy tests must run: install g++/clang++ or set CXX to its executable path")

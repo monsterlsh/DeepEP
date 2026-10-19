@@ -21,30 +21,39 @@ def token_indices(bs, check_tokens):
 
     if bs <= 0 or check_tokens < 0:
         raise ValueError("BS must be positive and check_tokens nonnegative")
-    return np.arange(bs) if check_tokens == 0 else np.unique(np.linspace(0, bs - 1, min(bs, check_tokens)).astype(int))
+    return (
+        np.arange(bs, dtype=np.int64)
+        if check_tokens == 0
+        else np.unique(np.linspace(0, bs - 1, min(bs, check_tokens)).astype(np.int64))
+    )
 
 
-def contract(config, world, bs, input_kind, routing, check_tokens, *, weight_kind="fp4"):
+def contract(config, world, bs, input_kind, routing, check_tokens, mma_type=None, *, weight_kind=None):
     from . import reference
-    from .benchmark import inputs, validate_weight_mode
+    from .benchmark import inputs
+    from .formats import resolve_mma_type, validate_input_format
 
-    validate_weight_mode(config, weight_kind)
     if world <= 0 or config["model"]["num_experts"] % world:
         raise ValueError("Global experts must divide positive EP size")
-    if input_kind not in ("bf16", "fp8") or routing not in ("balanced", "random", "skewed"):
+    if input_kind not in ("bf16", "fp8", "fp4") or routing not in ("balanced", "random", "skewed"):
         raise ValueError("Invalid Golden input/routing")
+    mma_type = resolve_mma_type(mma_type, weight_kind)
+    validate_input_format(mma_type, input_kind)
+    if mma_type != "fp8xfp4" and config["model"]["num_shared_experts"]:
+        raise ValueError(f"{mma_type} does not support shared experts")
     token_indices(bs, check_tokens)
     # 权重/输入或参考算法变化自动失效；编译参数、性能轮数不影响 Golden。
     source = inspect.getsource(reference) + inspect.getsource(inputs) + Path(__file__).read_text(encoding="utf-8")
     return dict(
-        version=2,
+        version=1,
         reference_sha256=hashlib.sha256(source.encode()).hexdigest(),
         model=config["model"],
         seed=config["seed"],
         world=world,
         bs=bs,
         input=input_kind,
-        weights=weight_kind,
+        mma_type=mma_type,
+        weights=mma_type.rsplit("x", 1)[-1],
         routing=routing,
         check_tokens=check_tokens,
         numerical_contract="ascend_post_gmm2_route_weight_v1",
@@ -124,6 +133,7 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
     """Compute a node's source ranks together; bound dense weights by worker count."""
     import numpy as np
     from .benchmark import inputs
+    from .formats import activation_format
     from .reference import bf16, dequantize_input, expert_forward, make_weights, quantize_input, unpack_weight
 
     if workers < 1 or chunk_tokens < 1 or not ranks or len(set(ranks)) != len(ranks):
@@ -131,6 +141,7 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
     if any(not 0 <= rank < spec["world"] for rank in ranks):
         raise ValueError("Golden source rank exceeds EP size")
     model, bs, world = spec["model"], spec["bs"], spec["world"]
+    activation_kind = activation_format(spec["mma_type"])
     local = model["num_experts"] // world
     selected = token_indices(bs, spec["check_tokens"])
     counts = np.zeros(model["num_experts"], dtype=np.int64)
@@ -139,7 +150,11 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
         x, ids, weights = inputs(config, source, bs, spec["routing"], world=world)
         counts += np.bincount(ids.ravel(), minlength=len(counts))
         if source in ranks:
-            sources[source] = (dequantize_input(*quantize_input(x[selected])), ids[selected], weights[selected])
+            sources[source] = (
+                dequantize_input(*quantize_input(x[selected], activation_kind), activation_kind),
+                ids[selected],
+                weights[selected],
+            )
         if source == 0 or (source + 1) % 8 == 0:
             print(f"[GOLDEN] BS={bs} input/counts source={source + 1}/{world}", flush=True)
     x = np.concatenate([sources[rank][0] for rank in ranks])
@@ -155,11 +170,7 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
                 continue
             # 必须保留原始 RNG 的整组生成顺序；单专家重新播种会改变待测权重。
             raw = make_weights(
-                local,
-                model["hidden"],
-                model["intermediate_hidden"],
-                config["seed"] + owner,
-                weight_kind=spec["weights"],
+                local, model["hidden"], model["intermediate_hidden"], config["seed"] + owner, spec["mma_type"]
             )
             for expert in needed:
                 token, slot = np.where(ids == owner * local + expert)
@@ -173,11 +184,11 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
 
     def forward(job):
         token, route_weight, pair = job
-        w1, w2 = (unpack_weight(value, weight_kind=spec["weights"]) for value in pair)
+        w1, w2 = (unpack_weight(item, spec["mma_type"]) for item in pair)
         result = np.empty((len(token), model["hidden"]), dtype=np.float32)
         for start in range(0, len(token), chunk_tokens):
             stop = start + chunk_tokens
-            result[start:stop] = expert_forward(x[token[start:stop]], w1, w2)
+            result[start:stop] = expert_forward(x[token[start:stop]], w1, w2, spec["mma_type"])
         if route_weight is not None:
             result *= route_weight[:, None]
         return token, result
@@ -217,13 +228,14 @@ def prepare(
     directory,
     *,
     input_kind="bf16",
-    weight_kind="fp4",
     routing="balanced",
     check_tokens=0,
+    mma_type=None,
+    weight_kind=None,
     workers=DEFAULT_WORKERS,
     chunk_tokens=256,
 ):
-    spec = contract(config, world, bs, input_kind, routing, check_tokens, weight_kind=weight_kind)
+    spec = contract(config, world, bs, input_kind, routing, check_tokens, mma_type, weight_kind=weight_kind)
     missing = []
     for rank in ranks:
         if cache_path(directory, spec, rank).exists():
@@ -279,13 +291,21 @@ def main():
     parser.add_argument("--ep-size", type=int, required=True)
     parser.add_argument("--ranks", required=True, help="Source ranks on this host, e.g. 0-7")
     parser.add_argument("--golden-dir", type=Path, default=Path("benchmark-golden"))
-    parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
-    parser.add_argument("--weights", choices=("fp4", "fp8"), default="fp4", help="Must match the benchmark weight type")
+    parser.add_argument("--input", choices=("bf16", "fp8", "fp4"), default="bf16")
+    parser.add_argument("--mma-type", choices=("fp8xfp4", "fp8xfp8", "fp4xfp8"))
+    parser.add_argument("--weights", choices=("fp4", "fp8"), help="Legacy weight selector; default fp4")
     parser.add_argument("--routing", choices=("balanced", "random", "skewed"), default="balanced")
     parser.add_argument("--check-tokens", type=int, default=0)
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--chunk-tokens", type=int, default=256)
     args = parser.parse_args()
+    from .formats import resolve_mma_type, validate_input_format
+
+    try:
+        args.mma_type = resolve_mma_type(args.mma_type, args.weights)
+        validate_input_format(args.mma_type, args.input)
+    except ValueError as error:
+        parser.error(str(error))
     if args.workers < 1 or args.chunk_tokens < 1:
         parser.error("workers and chunk-tokens must be positive")
     # 在 NumPy/BLAS 导入前设置，每台机器仅一个生成进程，防止八个 rank 争用 CPU。
@@ -308,9 +328,9 @@ def main():
             ranks,
             args.golden_dir,
             input_kind=args.input,
-            weight_kind=args.weights,
             routing=args.routing,
             check_tokens=args.check_tokens,
+            mma_type=args.mma_type,
             workers=args.workers,
             chunk_tokens=args.chunk_tokens,
         )

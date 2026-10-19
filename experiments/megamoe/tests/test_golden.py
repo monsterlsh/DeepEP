@@ -133,6 +133,16 @@ def test_weight_type_has_distinct_golden_cache_and_rejects_shared_fp8(config, tm
     assert not np.array_equal(golden.load(tmp_path, fp4, 0)[0], golden.load(tmp_path, fp8, 0)[0])
 
 
+def test_weight_kind_and_mma_aliases_share_golden_contract_but_a4_does_not(config):
+    config["model"]["num_shared_experts"] = 0
+    legacy = golden.contract(config, 2, 7, "bf16", "balanced", 0, weight_kind="fp8")
+    modern = golden.contract(config, 2, 7, "bf16", "balanced", 0, mma_type="fp8xfp8")
+    a4 = golden.contract(config, 2, 7, "bf16", "balanced", 0, mma_type="fp4xfp8", weight_kind="fp8")
+    assert legacy == modern
+    assert a4["weights"] == modern["weights"] == "fp8"
+    assert a4["mma_type"] == "fp4xfp8" and a4 != modern
+
+
 def test_routing_source_change_invalidates_cached_golden(config, tmp_path, monkeypatch):
     spec = golden.prepare(config, 2, 7, [0], tmp_path)
     original = golden.inspect.getsource

@@ -3,6 +3,7 @@
 
 #include "forward.hpp"
 #include "kernel_launch.hpp"
+#include "send_route_policy.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -87,14 +88,7 @@ MegaMoeSendMaskBufferConfig SendMaskConfig(const MegaMoeTilingData& t, uint32_t 
     const uint64_t aligned = AlignUp(total, uint64_t{256});
     c.routeItemsPerBatch = static_cast<int32_t>(std::min<uint64_t>(aligned, BASE_SEND_ROUTE_ITEMS_PER_BATCH));
     c.routeBatchCount = static_cast<int32_t>(CeilDiv(total, static_cast<uint64_t>(c.routeItemsPerBatch)));
-    auto route_slot_bytes = [&](uint32_t route_items) {
-        // A batch can begin in the middle of a token's top-k segment.  Reserve
-        // one matched index per covered token, including both boundary tokens.
-        const uint64_t matched = CeilDiv<uint64_t>(static_cast<uint64_t>(route_items) + t.topK - 1U, t.topK);
-        const uint64_t valid_index_bytes = AlignUp<uint64_t>(matched * sizeof(int32_t), 32U);
-        return static_cast<uint32_t>(route_items / 8U + valid_index_bytes);
-    };
-    c.bufferBytes = route_slot_bytes(static_cast<uint32_t>(c.routeItemsPerBatch));
+    c.bufferBytes = static_cast<uint32_t>(SendRouteSlotBytes(static_cast<uint32_t>(c.routeItemsPerBatch), t.topK));
     const uint32_t route_bytes = static_cast<uint32_t>(c.routeItemsPerBatch) * 4U;
     const uint32_t without_masks = fixed + 2U * route_bytes;
     const uint32_t budget = ub > without_masks ? ub - without_masks : 0U;
@@ -104,22 +98,13 @@ MegaMoeSendMaskBufferConfig SendMaskConfig(const MegaMoeTilingData& t, uint32_t 
         c.bufferCount = static_cast<int32_t>(pushes);
     }
     c.bufferCount = std::max(c.bufferCount, MIN_SEND_MASK_BUFFER_COUNT);
-    if (static_cast<uint64_t>(c.routeItemsPerBatch) < total) {
-        const uint64_t fixed_with_padding =
-            static_cast<uint64_t>(fixed) + static_cast<uint64_t>(c.bufferCount) * (32U + 2U * sizeof(int32_t));
-        const uint64_t route_budget = ub > fixed_with_padding ? ub - fixed_with_padding : 0U;
-        const uint64_t ring_bits =
-            static_cast<uint64_t>(c.bufferCount) +
-            CeilDiv<uint64_t>(static_cast<uint64_t>(c.bufferCount) * sizeof(int32_t) * 8U, t.topK);
-        uint64_t expanded = route_budget * 8U / (2U * sizeof(int32_t) * 8U + ring_bits);
-        expanded = expanded / 256U * 256U;
-        expanded = std::min<uint64_t>(expanded, aligned);
-        if (expanded > static_cast<uint64_t>(c.routeItemsPerBatch)) {
-            c.routeItemsPerBatch = static_cast<int32_t>(expanded);
-            c.routeBatchCount = static_cast<int32_t>(CeilDiv(total, static_cast<uint64_t>(expanded)));
-            c.bufferBytes = route_slot_bytes(static_cast<uint32_t>(expanded));
-        }
-    }
+    const uint32_t fitted =
+        FitSendRouteBatch(static_cast<uint32_t>(aligned), t.topK, fixed, static_cast<uint32_t>(c.bufferCount), ub);
+    TORCH_CHECK(fitted != 0U, "MegaMoE send-route buffers do not fit UB: need at least ",
+                SendRouteUbBytes(256U, t.topK, fixed, static_cast<uint32_t>(c.bufferCount)), " bytes, got ", ub);
+    c.routeItemsPerBatch = static_cast<int32_t>(fitted);
+    c.routeBatchCount = static_cast<int32_t>(CeilDiv(total, static_cast<uint64_t>(fitted)));
+    c.bufferBytes = static_cast<uint32_t>(SendRouteSlotBytes(fitted, t.topK));
     return c;
 }
 
@@ -161,7 +146,8 @@ void SetSendMaskConfigs(MegaMoeTilingData& t, uint32_t ub)
     const uint32_t reset_count = std::min(reset_per_core, static_cast<uint32_t>(DISPATCH_RESET_BATCH));
     const uint32_t reset_bytes = AlignUp(reset_count, uint32_t{MegaMoeImpl::INT32_PER_256B}) * 4U;
     const uint32_t quant_out = AlignUp(t.h, 256U) + AlignUp(CeilDiv(t.h, 32U), 32U);
-    const uint32_t quant_in = AlignUp(t.h, 128U) * 2U;
+    const uint32_t input_alignment = t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A4W8 ? 256U : 128U;
+    const uint32_t quant_in = AlignUp(t.h, input_alignment) * 2U;
     const auto sharedPolicy = MegaMoeImpl::SelectSharedExpertPolicy(
         t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4, t.sharedExpertNum, t.bs);
     const uint32_t route_cores = sharedPolicy.routeAiv1Only ? t.aicNum : t.blockAivNum;
@@ -238,7 +224,7 @@ PlatformInfo GetPlatformInfo()
 
 MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t topk, int64_t local_experts,
                              int64_t world, int64_t max_tokens, int64_t max_recv, bool is_a8w4, int64_t shared_experts,
-                             const PlatformInfo& p)
+                             const PlatformInfo& p, bool is_a4w8)
 {
     MegaMoeTilingData t{};
     t.moeExpertPerRank = static_cast<uint32_t>(local_experts);
@@ -255,7 +241,9 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     t.blockAivNum = p.aiv;
     t.combineQuantMode = MegaMoeImpl::COMBINE_NO_QUANT;
     t.clampLimit = std::numeric_limits<float>::max();
-    t.groupedMatmulMode = is_a8w4 ? MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 : MegaMoeImpl::GROUPED_MATMUL_MODE_GENERAL;
+    t.groupedMatmulMode =
+        is_a8w4 ? MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4
+                : (is_a4w8 ? MegaMoeImpl::GROUPED_MATMUL_MODE_A4W8 : MegaMoeImpl::GROUPED_MATMUL_MODE_GENERAL);
     t.topoType = MegaMoeImpl::TOPO_TYPE_MTE;
     t.sharedExpertNum = static_cast<uint32_t>(shared_experts);
     t.combineSyncSlotCountPerExpert = 0;
@@ -296,10 +284,11 @@ void CheckTensor(const torch::Tensor& t, int64_t dims, const char* name)
 
 Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world,
            int64_t max_tokens, bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts,
-           uint64_t symmetric_address, int64_t symmetric_bytes)
+           uint64_t symmetric_address, int64_t symmetric_bytes, bool is_a4w8)
     : ffts_(ffts)
 {
     CheckTensor(example, 2, "plan input");
+    TORCH_CHECK(!is_a4w8 || !is_a8w4, "A4W8 requires FP8 weights; A4W4 is not supported");
     TORCH_CHECK(example.size(0) > 0 && example.size(0) <= max_tokens && max_tokens <= 65536,
                 "Plan BS must be in [1, max_tokens], max_tokens <= 65536");
     TORCH_CHECK(intermediate >= 256 && intermediate <= 4096 && intermediate % 128 == 0,
@@ -313,7 +302,7 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
                 " bytes, got ", symmetric_bytes);
     platform_ = GetPlatformInfo();
     tiling_ = MakeTiling(example.size(0), example.size(1), intermediate * 2, topk, experts, world, max_tokens, 0,
-                         is_a8w4, shared_experts, platform_);
+                         is_a8w4, shared_experts, platform_, is_a4w8);
     tiling_.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
     static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
     const MegaMoeImpl::WorkspaceInfo info(nullptr, &tiling_);
