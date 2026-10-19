@@ -6,7 +6,7 @@ Modified by SimpleBright_Man 2026
 # MegaMoE 单机 EP8：W4A8 / W8A8 验收与性能基线
 
 Linux 服务器上的设备验收统一使用 [`run_ep8.sh`](../scripts/run_ep8.sh)，无需逐条生成
-Golden、启动 8 个 rank 或汇总结果。本方案对应 `0.1.0.dev7`，需要 8 张空闲 Ascend950、
+Golden、启动 8 个 rank 或汇总结果。本方案对应 `0.1.0.dev7+megamoe.a8w8.ep8`，需要 8 张空闲 Ascend950、
 CANN 9.2.0 和匹配的 Torch/torch_npu。CPU 测试不能替代设备编译、精度、通信同步和性能验收。
 
 W8A8 支持 S=0、FP8/BF16 输入、BF16 输出，不支持共享专家和设备 timer。
