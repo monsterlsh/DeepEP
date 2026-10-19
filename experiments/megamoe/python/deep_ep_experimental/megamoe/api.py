@@ -75,6 +75,11 @@ def _check_fp8_nd_format(tensor, name):
         )
 
 
+# E2M1 values, including signed zero, represented exactly as E4M3 bytes.
+_FP4_TO_FP8_BYTES = (0x00, 0x30, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC)
+_PACKED_FP4_TO_FP8_BYTES = tuple((_FP4_TO_FP8_BYTES[byte & 15], _FP4_TO_FP8_BYTES[byte >> 4]) for byte in range(256))
+
+
 def _expand_fp4_input(packed, output):
     """Losslessly expand E2M1 nibbles into E4M3 bytes on the caller's device/stream.
 
@@ -83,16 +88,12 @@ def _expand_fp4_input(packed, output):
     """
     import torch
 
-    # E2M1 positive values [0,.5,1,1.5,2,3,4,6] are exactly representable in E4M3.
-    # Integer indexing preserves -0, unlike numeric conversion through a float.
-    table = torch.tensor(
-        [0x00, 0x30, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC],
-        dtype=torch.uint8,
-        device=packed.device,
-    )
-    target = output.view(torch.uint8)
-    target[:, ::2].copy_(table[(packed & 15).to(torch.int64)])
-    target[:, 1::2].copy_(table[(packed >> 4).to(torch.int64)])
+    # Decode both nibbles in one gather into the existing contiguous buffer.
+    # Advanced indexing and strided copies can enter torch_npu's legacy internal
+    # format allocation path, which warns even for ND with internal formats off.
+    table = torch.tensor(_PACKED_FP4_TO_FP8_BYTES, dtype=torch.uint8, device=packed.device)
+    indices = packed.reshape(-1).to(torch.int64)
+    torch.index_select(table, 0, indices, out=output.view(torch.uint8).view(-1, 2))
     return output
 
 

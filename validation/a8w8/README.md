@@ -23,6 +23,7 @@ CPU 回归不能替代 NPU 编译、精度、跨卡同步和性能验证。新�
 | `run_cpu.sh` | 从当前源码运行 CPU 回归，保存日志、JUnit、元数据和汇总 |
 | `requirements-cpu.txt` | CPU 最小依赖，不安装 Torch、torch_npu 或 CANN |
 | `run_npu.sh` | 构建安装、环境预检、CPU Golden、NPU 精度及性能测试 |
+| `check_fp4_expand.py` | 单卡或 CPU 检查 FP4 全部字节展开；可将内部格式告警视为失败 |
 | `test_runners.py` | 不使用 NPU 的脚本回归，检查两种分支接口和报告完整性 |
 
 ## 1. 拉取两个分支
@@ -282,6 +283,35 @@ bash validation/a8w8/run_npu.sh --build \
 若子模块已准备完整，构建不需要重新下载它们；如果未准备，需先通过内网镜像或手动迁移补齐。
 
 ## 6. 收集结果与比较两个分支
+
+### A4W8 展开时的 internal-format 告警
+
+`Cannot create tensor with internal format while allow_internal_format=False, tensor will be created with base format`
+表示 torch_npu 的兼容分配路径使用基础存储格式；这条告警本身不说明 FP4 精度或计算结果错误。
+部分版本即使请求 ND 也会进入该告警分支，见
+[torch_npu 分配实现](https://github.com/Ascend/pytorch/blob/master/torch_npu/csrc/aten/common/TensorFactories.cpp)。
+是否通过仍按下文的退出码、`passed=true` 和完整报告判断。
+
+packed FP4 展开现使用 256×2 字节查表及 `index_select(out=...)` 写入连续缓冲区，
+避免原先的高级索引、设备侧拆 nibble 和跨步写入，保留所有 FP4 编码（包括负零）。
+不修改业务进程的 `allow_internal_format`，也不屏蔽告警。具体框架/CANN 组合是否还触发兼容路径，
+须在目标 NPU 验证；本地 CPU 的逐字节测试不能证明目标 NPU 无告警。
+
+更新并重新构建安装后，可单独运行以下检查，无需启动 EP8 或准备模型数据。
+脚本只在自己的进程内设置 `allow_internal_format=False`，用非默认 NPU stream 测试全部
+256 种打包字节、输出缓冲区别名、容量切片、负零和相邻行保护。
+
+```bash
+# -I 确保使用已安装的 wheel；--strict-warning 将这一条告警视为失败，其他告警照常显示。
+ASCEND_RT_VISIBLE_DEVICES=0 python -I validation/a8w8/check_fp4_expand.py --device npu --strict-warning
+# 已安装 wheel 的 CPU 版本检查（需要 CPU 可导入的 torch 和包环境）。
+python -I validation/a8w8/check_fp4_expand.py --device cpu
+
+# 完整算子回归：同一分支源码变化也需要 --build，以通过源码指纹校验。
+bash validation/a8w8/run_npu.sh --build --mma-type fp4xfp8 --suite full
+```
+
+### 结果与性能口径
 
 每次执行结束后保留完整结果目录。CPU 查看 `summary.json`、JUnit 和 pytest 日志；
 NPU 查看 `summary.txt`、`summary.json`、元数据、`logs/`、`accuracy_*/`、`perf_*/` 和 `golden/`。

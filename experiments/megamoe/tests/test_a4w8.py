@@ -63,14 +63,26 @@ def test_fp4_block32_scaling_packing_zero_and_bf16_rounding():
         quantize_input(np.zeros((1, 17), np.float32), "fp4")
 
 
-def test_fp4_is_losslessly_representable_in_fp8_on_torch_device():
+@pytest.mark.parametrize("shape", [(1, 256), (16, 16), (256, 1)])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_fp4_is_losslessly_representable_in_fp8_on_torch_device(shape, offset):
     torch = pytest.importorskip("torch")
-    packed = np.arange(256, dtype=np.uint8).reshape(16, 16)
-    output = torch.empty((16, 32), dtype=torch.float8_e4m3fn)
-    returned = api._expand_fp4_input(torch.from_numpy(packed), output)
+    packed = np.arange(256, dtype=np.uint8).reshape(shape)
+    source = torch.from_numpy(packed.copy())
+    # Runtime passes a BS-sized view of a larger reusable buffer. Check that
+    # index_select(out=...) writes through the view without resizing its storage.
+    storage = torch.full((shape[0] + 2, shape[1] * 2), 0xA5, dtype=torch.uint8)
+    output = storage[offset : offset + shape[0]].view(torch.float8_e4m3fn)
+    pointer = output.data_ptr()
+    returned = api._expand_fp4_input(source, output)
     assert returned is output
+    assert output.data_ptr() == pointer
     expected = fp8_encode(FP4[fp4_unpack(packed)])
     np.testing.assert_array_equal(output.view(torch.uint8).numpy(), expected)
+    np.testing.assert_array_equal(storage[offset : offset + shape[0]].numpy(), expected)
+    assert torch.all(storage[:offset] == 0xA5)
+    assert torch.all(storage[offset + shape[0] :] == 0xA5)
+    np.testing.assert_array_equal(source.numpy(), packed)
 
 
 @pytest.mark.parametrize(
