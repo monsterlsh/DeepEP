@@ -79,7 +79,8 @@ def test_syntax_and_help_without_python(bash, name):
         ("run_cpu.sh", ["--suite", "unknown"]),
         ("run_cpu.sh", ["--wheelhouse", "/tmp/wheels"]),
         ("run_cpu.sh", ["--python"]),
-        ("run_npu.sh", ["--ep-size", "4"]),
+        ("run_npu.sh", ["--ep-size", "3"]),
+        ("run_npu.sh", ["--ep-size", "16"]),
         ("run_npu.sh", ["--timeout", "0"]),
         ("run_npu.sh", ["--suite", "unknown"]),
         ("run_npu.sh", ["--mma-type", "fp4xfp4"]),
@@ -131,7 +132,7 @@ def test_cpu_plan_keeps_scope_and_offline_install_explicit(bash, tmp_path, suite
         ("weights", "fp8xfp8", ("fp8xfp8",)),
     ],
 )
-@pytest.mark.parametrize("ep", [2, 8])
+@pytest.mark.parametrize("ep", [2, 4, 8])
 @pytest.mark.parametrize("suite", ["quick", "full"])
 def test_npu_plan_matches_branch_world_and_golden(bash, tmp_path, cli, selection, modes, ep, suite):
     script = checkout(tmp_path, cli)
@@ -153,9 +154,11 @@ def test_npu_plan_matches_branch_world_and_golden(bash, tmp_path, cli, selection
         "--output-dir",
         shell_path(output),
         "--dry-run",
+        env={key: value for key, value in os.environ.items() if key != "ASCEND_RT_VISIBLE_DEVICES"},
     )
     assert result.returncode == 0, result.stderr
     assert not output.exists()
+    assert f"devices={','.join(map(str, range(ep)))} " in result.stdout
     plan = commands(result.stdout)
     assert "DEEPEP_MEGAMOE_TIMER=OFF" in plan["build"]
     accuracy = {name: cmd for name, cmd in plan.items() if name.startswith("accuracy_")}
@@ -185,6 +188,22 @@ def test_npu_plan_matches_branch_world_and_golden(bash, tmp_path, cli, selection
     skipped = execute(bash, script, "--mma-type", selection, "--skip-perf", "--dry-run")
     assert skipped.returncode == 0, skipped.stderr
     assert not any(name.startswith("perf_") for name in commands(skipped.stdout))
+
+
+def test_ep4_preserves_explicit_device_selection(bash):
+    result = execute(
+        bash,
+        DIRECTORY / "run_npu.sh",
+        "--ep-size",
+        "4",
+        "--mma-type",
+        "fp4xfp8",
+        "--dry-run",
+        env={**os.environ, "ASCEND_RT_VISIBLE_DEVICES": "4,5,6,7"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "devices=4,5,6,7 " in result.stdout
+    assert "--nproc-per-node=4" in commands(result.stdout)["accuracy_fp4xfp8_fp4_balanced"]
 
 
 @pytest.mark.parametrize("selection", ["all", "fp4xfp8"])
@@ -273,7 +292,11 @@ def make_reports(root, cli, ep, modes, *, skip_perf=False):
 
 @pytest.mark.parametrize(
     "cli,ep,modes",
-    [("weights", 2, ("fp8xfp8",)), ("mma-type", 8, ("fp8xfp4", "fp8xfp8", "fp4xfp8"))],
+    [
+        ("weights", 2, ("fp8xfp8",)),
+        ("mma-type", 4, ("fp8xfp4", "fp8xfp8", "fp4xfp8")),
+        ("mma-type", 8, ("fp8xfp4", "fp8xfp8", "fp4xfp8")),
+    ],
 )
 @pytest.mark.parametrize("fault", [None, "missing_rank", "failed_counts", "nan_time", "wrong_manifest", "wrong_input"])
 def test_npu_summary_accepts_both_formats_and_rejects_incomplete_runs(tmp_path, cli, ep, modes, fault):
