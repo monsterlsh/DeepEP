@@ -54,7 +54,8 @@ __aicore__ inline uint32_t FragmentGmm2Tiles(const Arguments& args, const Fragme
 __aicore__ inline UrmaMegaMoeImpl::GMMAddrInfo Gmm1Addresses(const Arguments& args, const Fragment& fragment)
 {
     const uint64_t h = args.config.hidden;
-    const uint64_t n = static_cast<uint64_t>(args.config.intermediate) * 2U;
+    const uint64_t n = static_cast<uint64_t>(args.config.intermediate) *
+                       UrmaMegaMoeImpl::ActivationFactor(static_cast<uint8_t>(args.config.activationMode));
     const uint64_t scaleH = h / 32U;
     const uint64_t expert = fragment.expert;
     UrmaMegaMoeImpl::GMMAddrInfo addr{};
@@ -129,7 +130,8 @@ __aicore__ inline RowIO FragmentRowIO(const Arguments& args, const Fragment& fra
 
 __aicore__ inline UrmaMegaMoeImpl::ProblemShape FragmentShape(const Arguments& args, const Fragment& fragment)
 {
-    return {fragment.rows, static_cast<int64_t>(args.config.intermediate) * 2, args.config.hidden, 0};
+    const int64_t factor = UrmaMegaMoeImpl::ActivationFactor(static_cast<uint8_t>(args.config.activationMode));
+    return {fragment.rows, static_cast<int64_t>(args.config.intermediate) * factor, args.config.hidden, factor};
 }
 
 __aicore__ inline TraceMeta FragmentTraceMeta(const Fragment& fragment, uint32_t index)
@@ -390,7 +392,7 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
     UrmaMegaMoeImpl::GmmKernel::BlockScheduler scheduler(
         {config.m, config.outputN, config.k},
         UrmaMegaMoeImpl::GmmKernel::BlockScheduler::Params{
-            Te::MakeCoord(static_cast<int64_t>(kComputeTileM), static_cast<int64_t>(kGmm1LogicalTileN))});
+            Te::MakeCoord(static_cast<int64_t>(kComputeTileM), static_cast<int64_t>(Gmm1LogicalTileN(args.config)))});
     epilogue.UpdateNextProblem({config.m, config.outputN, config.k, 0});
     const auto coord = scheduler.GetBlockCoord(tile);
     const auto tileShape = scheduler.GetBlockShape(coord);
@@ -436,7 +438,8 @@ __aicore__ inline void RunActivation(Arguments& args, uint32_t worker, Timer& ti
     // which clamps every up value to zero and makes the entire FFN zero.
     epilogue.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(args.activation),
                    .yScaleGmAddr = reinterpret_cast<GM_ADDR>(args.activationScale),
-                   .clampLimit = args.activationClamp});
+                   .clampLimit = args.activationClamp,
+                   .actMode = static_cast<uint8_t>(args.config.activationMode)});
     uint32_t nextGather = worker;
     uint32_t nextActivation = 0U;
     uint32_t activationTile = 0U;
@@ -534,34 +537,72 @@ __aicore__ inline void RunActivation(Arguments& args, uint32_t worker, Timer& ti
 namespace MegaMoeUrma {
 
 // FIX writes an ND M256 x [gate128, up128] BF16 matrix to the paired AIV1's
-// low128KiB mailbox. The interleaved epilogue compacts its BF16 result in place
-// to M256x128, then reuses dead input space for FP8 data and E8M0 scales.
+// low128KiB mailbox. SwiGLU uses the interleaved half-width layout; single-projection
+// GELU uses the full-width layout, whose quant/scratch area extends above the mailbox.
 // The caller must have consumed real FIX full and must NOT return UB empty
 // until Run() returns (its final activation/scale MTE3 stores are complete).
 class UbRoutedActivation {
     using Op = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 256U, 256U, false, true, true>;
     using WeightedOp = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 256U, 256U, true, true, true>;
+    using GeluOp = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 256U, 256U, false, false, true>;
+    using WeightedGeluOp = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 256U, 256U, true, false, true>;
+    static constexpr uint32_t kGeluWeightUbOffset = 208U * 1024U;
     static_assert(128U * 1024U + 256U * 32U <= kAiv1PersistentUbBase);
+    static_assert(kGeluWeightUbOffset + 256U * 32U <= kAiv1PersistentUbBase);
     static constexpr auto offsets =
         UrmaMegaMoeImpl::Detail::BuildActivationMxQuantUbOffsets<bfloat16_t, 256U, 256U, true>();
+    static constexpr auto geluOffsets =
+        UrmaMegaMoeImpl::Detail::BuildActivationMxQuantUbOffsets<bfloat16_t, 256U, 256U, false>();
     static_assert(offsets.firstInputElementCapacity * sizeof(bfloat16_t) == 128U * 1024U);
     static_assert(offsets.reciprocalScaleOffsetBytes + offsets.scaleElementCapacity * sizeof(uint16_t) <= 128U * 1024U);
+    static_assert(geluOffsets.firstInputElementCapacity * sizeof(bfloat16_t) == 128U * 1024U);
+    static_assert(geluOffsets.reciprocalScaleOffsetBytes + geluOffsets.scaleElementCapacity * sizeof(uint16_t) <=
+                  kGeluWeightUbOffset);
 
 public:
-    static constexpr uint32_t kColumns = 128U;
+    __aicore__ static inline uint32_t Columns(const Arguments& a)
+    {
+        return UrmaMegaMoeImpl::ActivationFactor(static_cast<uint8_t>(a.config.activationMode)) == 1U ? 256U : 128U;
+    }
     __aicore__ inline void Init(const Arguments& a)
     {
+        const bool singleProjection =
+            UrmaMegaMoeImpl::ActivationFactor(static_cast<uint8_t>(a.config.activationMode)) == 1U;
+        if (singleProjection) {
+            if (a.config.topkWeightsType) {
+                weightedGelu_.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a.activation),
+                                    .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a.activationScale),
+                                    .clampLimit = a.activationClamp,
+                                    .actMode = static_cast<uint8_t>(a.config.activationMode),
+                                    .ubOffsetBytes = 0U,
+                                    .topkWeightUbOffsetBytes = kGeluWeightUbOffset,
+                                    .topkWeightIndex = 0U});
+                weightedGelu_.UpdateNextProblem({0, a.config.intermediate, 0, 0});
+            } else {
+                gelu_.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a.activation),
+                            .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a.activationScale),
+                            .clampLimit = a.activationClamp,
+                            .actMode = static_cast<uint8_t>(a.config.activationMode),
+                            .ubOffsetBytes = 0U});
+                gelu_.UpdateNextProblem({0, a.config.intermediate, 0, 0});
+            }
+            return;
+        }
         if (a.config.topkWeightsType) {
             weighted_.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a.activation),
                             .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a.activationScale),
-                            .clampLimit = a.activationClamp, .ubOffsetBytes = 0U,
-                            .topkWeightUbOffsetBytes = 128U * 1024U, .topkWeightIndex = 0U});
+                            .clampLimit = a.activationClamp,
+                            .actMode = static_cast<uint8_t>(a.config.activationMode),
+                            .ubOffsetBytes = 0U,
+                            .topkWeightUbOffsetBytes = 128U * 1024U,
+                            .topkWeightIndex = 0U});
             weighted_.UpdateNextProblem({0, a.config.intermediate, 0, 0});
             return;
         }
         op_.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a.activation),
                   .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a.activationScale),
                   .clampLimit = a.activationClamp,
+                  .actMode = static_cast<uint8_t>(a.config.activationMode),
                   .ubOffsetBytes = 0U});
         op_.UpdateNextProblem({0, a.config.intermediate, 0, 0});
     }
@@ -569,6 +610,13 @@ public:
     template <class TimerT>
     __aicore__ inline void Run(const Arguments& a, const Fragment& f, uint32_t group, uint32_t tile, TimerT& timer)
     {
+        const bool singleProjection =
+            UrmaMegaMoeImpl::ActivationFactor(static_cast<uint8_t>(a.config.activationMode)) == 1U;
+        if (singleProjection) {
+            if (a.config.topkWeightsType) RunImpl<true>(a, f, group, tile, timer, weightedGelu_);
+            else RunImpl<false>(a, f, group, tile, timer, gelu_);
+            return;
+        }
         if (a.config.topkWeightsType) RunImpl<true>(a, f, group, tile, timer, weighted_);
         else RunImpl<false>(a, f, group, tile, timer, op_);
     }
@@ -578,12 +626,13 @@ private:
     __aicore__ inline void RunImpl(const Arguments& a, const Fragment& f, uint32_t group,
                                     uint32_t tile, TimerT& timer, ActivationOp& op)
     {
-        const uint32_t n = tile * kColumns;
-        // I is256-aligned, so fused N128 task columns have no partial tail.
+        const uint32_t columns = Columns(a);
+        const uint32_t n = tile * columns;
+        // I is256-aligned, so fused N128 or single-projection N256 tasks have no partial tail.
         // Only the M tail changes; each UB input row remains256 BF16 elements.
         op.UpdateGlobalAddr({static_cast<int64_t>(f.rowBegin * a.config.intermediate),
                               static_cast<int64_t>(f.rowBegin * (a.config.intermediate / 32U)), 0, 0, 0, 0});
-        auto meta = ComputeTileTraceMeta(FragmentTraceMeta(f, group), 0U, n, f.rows, kColumns);
+        auto meta = ComputeTileTraceMeta(FragmentTraceMeta(f, group), 0U, n, f.rows, columns);
         timer.Begin(Phase::Activation);
         const auto start = timer.TraceBegin();
         if constexpr (Early) {
@@ -595,7 +644,7 @@ private:
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         }
         AscendC::SetCtrlSpr<60, 60>(0);
-        op({f.rows, kColumns, 0, 0}, {n, n / 32U, 0, 0, 0, 0}, 0U);
+        op({f.rows, columns, 0, 0}, {n, n / 32U, 0, 0, 0, 0}, 0U);
         // operator() retains the existing SeparateSigmoid FP32 sequence,
         // BF16 rounding and MX groups. It drains both output DMA planes.
         AscendC::AtomicAdd(ComputeFlag(a.activationDone, group), 1);
@@ -606,5 +655,7 @@ private:
 private:
     Op op_;
     WeightedOp weighted_;
+    GeluOp gelu_;
+    WeightedGeluOp weightedGelu_;
 };
 }  // namespace MegaMoeUrma

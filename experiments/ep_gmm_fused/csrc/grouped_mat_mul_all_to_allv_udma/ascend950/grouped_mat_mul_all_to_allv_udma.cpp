@@ -116,7 +116,8 @@ TilingProfile ResolveTiling(const TilingProfile& defaultTiling, at::IntArrayRef 
     return result;
 }
 
-constexpr uint32_t kMaxLocalExperts = 32;
+// Capacity check only; 128 covers E/P up to 128 (for example 800 experts on EP8).
+constexpr uint32_t kMaxLocalExperts = 128;
 constexpr uint32_t kBf16UbAlignElements = 16;
 
 uint32_t TargetOrderLocalCopyColumns(uint32_t columns)

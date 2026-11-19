@@ -12,6 +12,7 @@
 #include <vector>
 #include "kernels/combine/tiling.hpp"
 #include "kernels/combine/launch.hpp"
+#include "kernels/ht_limits.h"
 #include "kernels/combine/profile.hpp"
 #include "kernels/combine/chunk_profile.hpp"
 #include "kernels/combine/peer_profile.hpp"
@@ -117,7 +118,8 @@ ascend_deepep::PutCombineTiling layout(int rank, int world, int tokens, int topk
                                        int hidden)
 {
     if (world < 2 || world > 512 || (world & (world - 1)) || rank < 0 || rank >= world || tokens < 1 ||
-        tokens > 16384 || topk < 1 || topk > 16 || chunk < 1 || chunk > 16384 || rows < 1 || gathered < 1 ||
+        tokens > ascend_deepep::kHtMaxTokensPerRank || topk < 1 || topk > ascend_deepep::kHtMaxTopk ||
+        chunk < 1 || chunk > 16384 || rows < 1 || gathered < 1 ||
         uint64_t(rows) > uint64_t(world) * tokens * topk || uint64_t(gathered) > uint64_t(world) * tokens * topk ||
         uint64_t(world) * tokens * topk >= (1ULL << 31) || hidden <= 0 || hidden > 7168 || hidden % 16) {
         throw std::invalid_argument("Invalid expanded Combine shape");

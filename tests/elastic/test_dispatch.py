@@ -24,6 +24,10 @@ import traceback
 import runpy
 import random
 
+# Mirrored from csrc/kernels/ht_limits.h; this script must stay importable
+# without the deep_ep wheel on sys.path.
+MAX_TOPK = 32
+
 
 _ROUTES = ("normal", "random", "duplicates", "invalid", "empty", "hotspot")
 _profile = runpy.run_path(str(Path(__file__).with_name("test_notify.py")))
@@ -117,7 +121,7 @@ def build_notify_golden(routes, experts, chunk_tokens, *, rank_dedup=None):
     topk = len(routes[0][0]) if tokens else 0
     if (
         chunk_tokens <= 0
-        or not 1 <= topk <= 16
+        or not 1 <= topk <= MAX_TOPK
         or any(len(rows) != tokens or any(len(row) != topk for row in rows) for rows in routes)
     ):
         raise ValueError("routes must have a common [tokens, topk] shape")

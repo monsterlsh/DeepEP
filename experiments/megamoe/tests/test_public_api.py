@@ -4,6 +4,9 @@
 """Execute public wrappers using CPU storage doubles; this does not simulate the NPU kernel."""
 
 import contextlib
+from pathlib import Path
+import shutil
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -11,7 +14,7 @@ import numpy as np
 import pytest
 
 from deep_ep_experimental.megamoe import api
-from deep_ep_experimental.megamoe.validation import collective_check
+from deep_ep_experimental.megamoe.validation import check_routing, collective_check
 
 
 class Device(str):
@@ -175,10 +178,17 @@ def backend(monkeypatch):
             capacity,
             backend="mte",
             topk_weights_type=0,
+            activation="swiglu",
+            mma_type="fp8xfp4",
+            windowed=False,
         ):
             self.bs, self.workspace_bytes = example.shape[0], 4096
+            self.max_tokens = max_tokens
+            self.windowed = windowed
             self.backend = backend
             self.topk_weights_type = topk_weights_type
+            self.activation = activation
+            self.mma_type = mma_type
             self.local_experts = experts
             events.append(("prepare", self.bs))
             events.append(("plan_backend", backend))
@@ -222,14 +232,25 @@ def backend(monkeypatch):
             events.append(("launch", args))
             events.append(("activation_clamp", activation_clamp))
             output = out if out is not None else Tensor(np.zeros(x.shape), "bfloat16")
-            output.data.fill(3)
+            if self.windowed:
+                assert 0 < x.shape[0] <= self.max_tokens and out is not None
+                output.data[:] = x.data[:, :1]
+                counts = np.bincount(ids.data.ravel(), minlength=self.local_experts)[: self.local_experts]
+            else:
+                output.data.fill(3)
+                counts = np.arange(self.local_experts) + 2
             if self.backend == "urma" and timer is not None:
                 timer.data[-1] = generation
-            return output, Tensor(np.arange(self.local_experts) + 2, "int32")
+            return output, Tensor(counts, "int32")
 
-    def buffer_size(*args, backend="mte", topk_weights_type=0):
-        events.append(("buffer_size", args, backend))
+    def buffer_size(*args, backend="mte", topk_weights_type=0, mma_type="fp8xfp4", windowed=False):
+        events.append(("buffer_size", args, backend, windowed))
         return 2 << 20
+
+    def validate_timer(timer, backend):
+        events.append(("validate_timer", timer, backend))
+        if timer.dtype != "int64" or timer.shape != (65536 if backend == "urma" else 64,):
+            raise ValueError("Invalid native timer shape or dtype")
 
     ext = SimpleNamespace(
         buffer_size=buffer_size,
@@ -238,7 +259,9 @@ def backend(monkeypatch):
         timer_enabled=True,
         timer_numel=64,
         allocate_timer=lambda example, backend="mte": Tensor(np.zeros(65536 if backend == "urma" else 64), "int64"),
+        validate_timer=validate_timer,
         small_batch_max_tokens=256,
+        urma_ep8_window_tokens=256,
     )
     monkeypatch.setattr(api, "_extension", lambda: ext)
     buffer = api.SymmBuffer(Group(), 4, 17, 2, 1024, 256)
@@ -368,13 +391,13 @@ def test_shared_fp4_preparation_retains_planar_weights_and_scales(backend):
 
 
 @pytest.mark.parametrize("bf16", [False, True])
-def test_routed_layout_switches_with_actual_bs_without_hot_path_cast(backend, bf16):
-    b = backend.buffer
-    b.num_max_tokens_per_rank = 4096
-    b.x = Tensor(np.zeros((4096, 1024)), "float8_e4m3fn")
-    b.x_sf = Tensor(np.zeros((4096, 32)), "float8_e8m0fnu")
-    b.topk_idx = Tensor(np.tile([0, 1], (4096, 1)), "int32")
-    b.topk_weights = Tensor(np.ones((4096, 2)), "float32")
+def test_routed_layout_switches_with_actual_bs_without_hot_path_cast(backend, bf16, request):
+    b = api.SymmBuffer(backend.group_type(), 4, 4096, 2, 1024, 256)
+    request.addfinalizer(b.destroy)
+    b.x.data.fill(0)
+    b.x_sf.data.fill(0)
+    b.topk_idx.data[:] = [0, 1]
+    b.topk_weights.data.fill(1)
     raw = weights()
     for weight, _ in raw:
         weight.npu_format = 2
@@ -667,3 +690,574 @@ def test_route_weight_mode_reaches_plan(backend, mode):
 def test_invalid_route_weight_mode(backend, mode):
     with pytest.raises((ValueError, TypeError), match="topk_weights_type"):
         api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, topk_weights_type=mode)
+
+
+def gelu_weights():
+    _, second = weights()
+    first = (
+        Tensor(np.zeros((2, 256, 512)), "uint8"),
+        Tensor(np.full((2, 256, 16, 2), 127), "float8_e8m0fnu"),
+    )
+    first[0].npu_format = 50
+    return first, second
+
+
+def test_gelu_single_projection_and_forced_prequant_mode_reach_native(backend):
+    b = api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, activation="gelu")
+    try:
+        assert b.topk_weights_type == 1
+        b.prepare(17)
+        assert b._plan.activation == "gelu" and b._plan.topk_weights_type == 1
+        y = Tensor(np.zeros((17, 1024)), "bfloat16")
+        api.fp8_fp4_mega_moe(y, *gelu_weights(), b, activation="gelu")
+        assert any(isinstance(event, tuple) and event[0] == "launch" for event in backend.events)
+        with pytest.raises(ValueError, match="must match"):
+            api.fp8_fp4_mega_moe(y, *gelu_weights(), b)
+        with pytest.raises(ValueError, match="activation_clamp"):
+            api.fp8_fp4_mega_moe(y, *gelu_weights(), b, activation="gelu", activation_clamp=0.2)
+    finally:
+        b.destroy()
+
+
+def test_gelu_weight_transform_keeps_one_planar_projection(backend):
+    raw = (
+        Tensor(np.zeros((1, 256, 64)), "uint8"),
+        Tensor(np.full((1, 256, 2, 2), 127), "float8_e8m0fnu"),
+    )
+    transformed = api.transform_weights_for_mega_moe(raw, raw, activation="gelu")
+    assert not isinstance(transformed[0], api._RoutedWeightPair)
+    assert sum(isinstance(event, tuple) and event[0] == "format_cast" for event in backend.events) == 2
+    for weight, _ in transformed:
+        assert weight.npu_format == 50
+
+
+@pytest.mark.parametrize("activation", ["swiglu", "gelu"])
+def test_a8w8_activation_modes_reach_native(backend, activation):
+    b = api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, activation=activation, mma_type="fp8xfp8")
+    try:
+        first_width = 512 if activation == "swiglu" else 256
+        first = (
+            Tensor(np.zeros((2, first_width, 1024)), "float8_e4m3fn"),
+            Tensor(np.full((2, first_width, 16, 2), 127), "float8_e8m0fnu"),
+        )
+        second = (
+            Tensor(np.zeros((2, 1024, 256)), "float8_e4m3fn"),
+            Tensor(np.full((2, 1024, 4, 2), 127), "float8_e8m0fnu"),
+        )
+        b.topk_idx.data[:] = [0, 1]
+        b.topk_weights.data[:] = [0.4, 0.6]
+        y = Tensor(np.zeros((17, 1024)), "bfloat16")
+        api.fp8_fp4_mega_moe(y, first, second, b, activation=activation)
+        assert b._plan.mma_type == "fp8xfp8" and b._plan.activation == activation
+        assert b._plan.topk_weights_type == (1 if activation == "gelu" else 0)
+        assert any(isinstance(event, tuple) and event[0] == "launch" for event in backend.events)
+    finally:
+        b.destroy()
+
+
+def test_a4w4_public_configuration_remains_closed(backend):
+    with pytest.raises(ValueError, match="A4W4.*not enabled"):
+        api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, mma_type="fp4xfp4")
+
+
+@pytest.mark.parametrize("world", [8, 16, 32])
+@pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8"])
+def test_mte_target_topology_topk25_reaches_plan_for_a8_modes(backend, world, mma_type):
+    b = api.SymmBuffer(
+        backend.group_type(world),
+        800,
+        39280,
+        25,
+        4096,
+        1536,
+        activation="gelu",
+        mma_type=mma_type,
+        ranks_per_node=min(world, 16),
+    )
+    try:
+        assert b.x.shape == (39280, 4096) and b.topk_idx.shape == (39280, 25)
+        b.prepare(39280)
+        assert b._plan.local_experts == 800 // world
+        assert b._plan.topk_weights_type == 1 and b._plan.mma_type == mma_type
+    finally:
+        b.destroy()
+
+
+def test_mte_topk32_boundary_and_invalid_activation_precision(backend):
+    b = api.SymmBuffer(backend.group_type(), 64, 17, 32, 1024, 256, activation="gelu")
+    assert b.topk_weights_type == 1
+    b.destroy()
+    with pytest.raises(ValueError, match="num_topk"):
+        api.SymmBuffer(backend.group_type(), 64, 17, 33, 1024, 256)
+    with pytest.raises(ValueError, match="activation"):
+        api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, activation="tanh")
+    with pytest.raises(ValueError, match="mma_type"):
+        api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, mma_type="bf16xbf16")
+
+
+def test_urma_gelu_uses_single_planar_projection_within_existing_limits(backend, monkeypatch):
+    from deep_ep_experimental.megamoe import backend as selector
+
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
+    b = api.SymmBuffer(backend.group_type(16), 32, 2048, 2, 256, 256, activation="gelu")
+    raw = (
+        (Tensor(np.zeros((2, 256, 128)), "uint8"), Tensor(np.full((2, 256, 4, 2), 127), "float8_e8m0fnu")),
+        (Tensor(np.zeros((2, 256, 128)), "uint8"), Tensor(np.full((2, 256, 4, 2), 127), "float8_e8m0fnu")),
+    )
+    prepared = api.transform_weights_for_mega_moe(*raw, activation="gelu")
+    try:
+        b.topk_idx.data[:] = [0, 1]
+        b.topk_weights.data[:] = [0.4, 0.6]
+        y = Tensor(np.zeros((17, 256)), "bfloat16")
+        api.fp8_fp4_mega_moe(y, *prepared, b, activation="gelu")
+        assert b._plan.backend == "urma" and b._plan.topk_weights_type == 1
+    finally:
+        b.destroy()
+
+
+def test_urma_unsafe_target_limits_remain_explicit(backend, monkeypatch):
+    from deep_ep_experimental.megamoe import backend as selector
+
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
+    for world, kwargs in (
+        (16, dict(num_experts=32, num_max_tokens_per_rank=17, num_topk=9)),
+        (16, dict(num_experts=32, num_max_tokens_per_rank=16385, num_topk=8)),
+        (32, dict(num_experts=64, num_max_tokens_per_rank=17, num_topk=8)),
+    ):
+        with pytest.raises(ValueError):
+            api.SymmBuffer(backend.group_type(world), hidden=256, intermediate_hidden=256, **kwargs)
+
+
+def windowed_urma_buffer(backend, monkeypatch, capacity, topk, *, group=None):
+    from deep_ep_experimental.megamoe import backend as selector
+
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
+    monkeypatch.setattr(api, "_host_boot_id", lambda: "ab" * 16)
+
+    def validate_routes(indices, weights, num_experts):
+        check_routing(indices.data.tolist(), weights.data.tolist(), num_experts, indices.shape[1])
+
+    monkeypatch.setattr(api, "check_window_routes", validate_routes)
+    if group is None:
+        group = backend.group_type(8)
+    b = api.SymmBuffer(group, 64, capacity, topk, 256, 256, activation="gelu")
+    rows = np.arange(capacity, dtype=np.int32)[:, None]
+    slots = np.arange(topk, dtype=np.int32)[None, :]
+    b.topk_idx.data[:] = (rows + 17 * slots) % b.num_experts
+    b.topk_weights.data[:] = (1 + rows + slots) / 1024
+    b.x.data[:] = rows % 251
+    b.x_sf.data[:] = (rows + 101) % 251
+    local = b.num_experts // group.size()
+    raw = (
+        (Tensor(np.zeros((local, 256, 128)), "uint8"), Tensor(np.full((local, 256, 4, 2), 127), "float8_e8m0fnu")),
+        (Tensor(np.zeros((local, 256, 128)), "uint8"), Tensor(np.full((local, 256, 4, 2), 126), "float8_e8m0fnu")),
+    )
+    return b, api.transform_weights_for_mega_moe(*raw, activation="gelu")
+
+
+def native_launches(backend):
+    return [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"]
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize(
+    "capacity,bs,topk,lengths",
+    [
+        (33, 1, 1, [1]),
+        (512, 255, 9, [255]),
+        (256, 256, 25, [256]),
+        (1024, 257, 32, [256, 1]),
+        (640, 529, 8, [256, 256, 17]),
+    ],
+)
+def test_windowed_urma_launches_preserve_routes_and_results(
+    backend, monkeypatch, explicit, capacity, bs, topk, lengths
+):
+    b, weights = windowed_urma_buffer(backend, monkeypatch, capacity, topk)
+    local = b.num_experts // b.group.size()
+    stats = Tensor(np.arange(local), "int32")
+    expected_ids = b.topk_idx.data[:bs].copy()
+    expected_weights = b.topk_weights.data[:bs].copy()
+    expected_counts = np.array([(expected_ids == e).sum() for e in range(local)])
+    timer = b.allocate_timer()
+    native_capacity = min(capacity, 256)
+
+    try:
+        assert ("buffer_size", (8, local, native_capacity, topk, 256), "urma", True) in backend.events
+        assert b.num_forward_windows(bs) == len(lengths)
+        b.prepare(bs)
+        plan = b._plan
+        assert plan.windowed and plan.bs == plan.max_tokens == native_capacity and plan.topk_weights_type == 1
+
+        if explicit:
+            x = b.x[:bs], b.x_sf[:bs].reshape((bs, b.hidden // 64, 2))
+            y, counts = api.mega_moe(x, b.topk_idx[:bs], b.topk_weights[:bs], *weights, b, timer=timer)
+            np.testing.assert_array_equal(counts.data, expected_counts)
+        else:
+            y = Tensor(np.full((bs, b.hidden), -1), "bfloat16")
+            assert api.fp8_fp4_mega_moe(
+                y, *weights, b, activation="gelu", timer=timer, cumulative_local_expert_recv_stats=stats
+            ) is None
+            np.testing.assert_array_equal(stats.data, np.arange(local) + expected_counts)
+            assert stats.streams == [b._runtime.stream]
+
+        launches = native_launches(backend)
+        assert [x[0].shape[0] for x in launches] == lengths
+        assert [x[-1] for x in launches] == list(range(1, len(lengths) + 1))
+        assert [x[8] for x in launches] == [timer, *([None] * (len(lengths) - 1))]
+        assert backend.events.count(("validate_timer", timer, "urma")) == 1
+        assert timer.data[-1] == 1
+        np.testing.assert_array_equal(np.concatenate([x[0].data for x in launches]), b.x.data[:bs])
+        np.testing.assert_array_equal(np.concatenate([x[1].data for x in launches]), b.x_sf.data[:bs])
+        np.testing.assert_array_equal(np.concatenate([x[2].data for x in launches]), expected_ids)
+        np.testing.assert_array_equal(np.concatenate([x[3].data for x in launches]), expected_weights)
+        np.testing.assert_array_equal(y.data, np.broadcast_to(b.x.data[:bs, :1], y.shape))
+        assert all(np.shares_memory(x[-2].data, y.data) for x in launches)
+
+        b.prepare(1)
+        b.prepare(capacity)
+        assert b._plan is plan
+        y1 = Tensor(np.full((1, b.hidden), -1), "bfloat16")
+        api.fp8_fp4_mega_moe(y1, *weights, b, activation="gelu")
+        assert native_launches(backend)[-1][-1] == len(lengths) + 1
+        assert backend.events.count(("prepare", native_capacity)) == 1
+    finally:
+        b.destroy()
+
+
+def test_windowed_urma_tail_validation_and_remote_error_allow_retry(backend, monkeypatch):
+    from deep_ep._store import StoreGroup
+
+    group = StoreGroup(None, 0, 8, prefix="window-inputs-test")
+    remote_error = None
+    mismatched_batch = False
+
+    def gather(value, stage):
+        peers = [value] * group.size()
+        if stage == "check:window inputs":
+            if remote_error is not None:
+                peers[3] = (remote_error, value[1])
+            if mismatched_batch:
+                rows, *remaining = value[1]
+                peers[3] = (None, (rows - 1, *remaining))
+        return peers
+
+    group.all_gather = gather
+    b, weights = windowed_urma_buffer(backend, monkeypatch, 257, 32, group=group)
+    y = Tensor(np.zeros((257, b.hidden)), "bfloat16")
+    try:
+        valid_id = b.topk_idx.data[-1, -1]
+        b.topk_idx.data[-1, -1] = b.topk_idx.data[-1, 0]
+        with pytest.raises(ValueError, match="window inputs.*rank=0.*token=256.*duplicate"):
+            api.fp8_fp4_mega_moe(y, *weights, b, activation="gelu")
+        b.topk_idx.data[-1, -1] = valid_id
+
+        remote_error = "bad input shape on peer"
+        with pytest.raises(ValueError, match="window inputs.*rank=3: bad input shape on peer"):
+            api.fp8_fp4_mega_moe(y, *weights, b, activation="gelu")
+        remote_error = None
+        mismatched_batch = True
+        with pytest.raises(ValueError, match="window inputs.*ranks disagree.*rank=3: \\(256,"):
+            api.fp8_fp4_mega_moe(y, *weights, b, activation="gelu")
+        assert b._plan is None and b._generation == 0 and b._failure is None
+        assert not native_launches(backend)
+
+        mismatched_batch = False
+        api.fp8_fp4_mega_moe(y, *weights, b, activation="gelu")
+        assert [x[-1] for x in native_launches(backend)] == [1, 2]
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize("explicit_prepare", [False, True])
+def test_windowed_urma_remote_plan_failure_discards_local_plan_for_retry(backend, monkeypatch, explicit_prepare):
+    from deep_ep._store import StoreGroup
+
+    group = StoreGroup(None, 0, 8, prefix="window-plan-test")
+    remote_failure = True
+
+    def gather(value, stage):
+        peers = [value] * group.size()
+        if stage == "check:window plan" and remote_failure:
+            peers[1] = ("peer allocation failed", value[1])
+        return peers
+
+    group.all_gather = gather
+    b, weights = windowed_urma_buffer(backend, monkeypatch, 257, 25, group=group)
+    y = Tensor(np.zeros((257, b.hidden)), "bfloat16")
+    try:
+        with pytest.raises(ValueError, match="rank=1: peer allocation failed"):
+            if explicit_prepare:
+                b.prepare(257)
+            else:
+                api.fp8_fp4_mega_moe(y, *weights, b, activation="gelu")
+        assert b._plan is None and b._plan_bs is None and b._generation == 0 and b._failure is None
+        assert not native_launches(backend)
+
+        remote_failure = False
+        api.fp8_fp4_mega_moe(y, *weights, b, activation="gelu")
+        assert [x[-1] for x in native_launches(backend)] == [1, 2]
+        assert backend.events.count(("prepare", 256)) == 2
+    finally:
+        b.destroy()
+
+
+def test_windowed_urma_timer_validation_precedes_launch(backend, monkeypatch):
+    b, weights = windowed_urma_buffer(backend, monkeypatch, 257, 25)
+    y = Tensor(np.zeros((257, b.hidden)), "bfloat16")
+    try:
+        wrong_timer = Tensor(np.zeros(64), "int64")
+        with pytest.raises(ValueError, match="window inputs.*Invalid native timer"):
+            api.fp8_fp4_mega_moe(y, *weights, b, activation="gelu", timer=wrong_timer)
+        assert b._plan is None and b._generation == 0 and b._failure is None
+        assert not native_launches(backend)
+    finally:
+        b.destroy()
+
+
+def test_windowed_urma_failed_launch_poisoning_and_stats(backend, monkeypatch):
+    b, weights = windowed_urma_buffer(backend, monkeypatch, 513, 25)
+    y = Tensor(np.zeros((513, b.hidden)), "bfloat16")
+    stats = Tensor(np.zeros(b.num_experts // b.group.size()), "int32")
+    try:
+        b.prepare(513)
+        forward = b._plan.forward
+
+        def fail_second_window(*args):
+            if args[-2] == 2:
+                raise RuntimeError("device launch failed")
+            return forward(*args)
+
+        monkeypatch.setattr(b._plan, "forward", fail_second_window)
+        with pytest.raises(RuntimeError, match="device launch failed"):
+            api.fp8_fp4_mega_moe(y, *weights, b, activation="gelu", cumulative_local_expert_recv_stats=stats)
+        assert b._generation == 2
+        assert [x[-1] for x in native_launches(backend)] == [1]
+        assert stats._version == 0
+        with pytest.raises(RuntimeError, match="buffer failed.*restart"):
+            api.fp8_fp4_mega_moe(y, *weights, b, activation="gelu")
+        assert [x[-1] for x in native_launches(backend)] == [1]
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize(
+    "topk,options,match",
+    [
+        (33, {}, "num_topk"),
+        (32, {"topk_weights_type": 0}, "topk_weights_type=1"),
+        (32, {"ranks_per_node": 4}, "requires one host"),
+    ],
+)
+def test_windowed_urma_invalid_configuration_rejected(backend, monkeypatch, topk, options, match):
+    from deep_ep_experimental.megamoe import backend as selector
+
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
+    monkeypatch.setattr(api, "_host_boot_id", lambda: "ab" * 16)
+    with pytest.raises(ValueError, match=match):
+        api.SymmBuffer(backend.group_type(8), 64, 257, topk, 256, 256, activation="gelu", **options)
+    assert sum(event[0] == "buffer_size" for event in backend.events if isinstance(event, tuple)) == 1
+
+
+def test_windowed_urma_rejects_different_hosts_even_with_ranks_per_node_8(backend, monkeypatch):
+    from deep_ep_experimental.megamoe import backend as selector
+
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
+    monkeypatch.setattr(api, "_host_boot_id", lambda: "ab" * 16)
+
+    def gather(output, value, **kwargs):
+        error, config = value
+        output[:] = [value] * len(output)
+        output[1] = (error, (*config[:-1], "cd" * 16))
+
+    monkeypatch.setattr(backend.dist, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="configuration.*ranks disagree"):
+        api.SymmBuffer(backend.group_type(8), 64, 257, 32, 256, 256, activation="gelu", ranks_per_node=8)
+    assert sum(event[0] == "buffer_size" for event in backend.events if isinstance(event, tuple)) == 1
+
+
+def test_windowed_urma_target_prepares_256_rows_for_39280_token_capacity(backend, monkeypatch):
+    from deep_ep_experimental.megamoe import backend as selector
+
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
+    monkeypatch.setattr(api, "_host_boot_id", lambda: "ab" * 16)
+    torch = sys.modules["torch"]
+
+    def shape_only(shape, dtype, device):
+        return Tensor(np.broadcast_to(np.zeros((), dtype=DTYPES[dtype]), shape), dtype, device)
+
+    monkeypatch.setattr(torch, "empty", shape_only)
+    monkeypatch.setattr(torch, "empty_like", lambda t, dtype: shape_only(t.shape, dtype, t.device))
+    b = api.SymmBuffer(backend.group_type(8), 800, 39280, 25, 4096, 1536, activation="gelu", ranks_per_node=8)
+    try:
+        assert b.x.shape == (39280, 4096) and b.topk_idx.shape == (39280, 25)
+        assert b.num_forward_windows(39280) == 154
+        assert ("buffer_size", (8, 100, 256, 25, 4096), "urma", True) in backend.events
+        b.prepare(39280)
+        assert b._plan.windowed and b._plan.bs == b._plan.max_tokens == 256
+        assert b._plan.local_experts == 100 and b._plan.topk_weights_type == 1
+        assert not native_launches(backend)
+    finally:
+        b.destroy()
+
+
+def test_shared_expert_activation_policy_matches_gmm2_tile_counts(tmp_path):
+    compiler = next((path for name in ("c++", "g++", "clang++") if (path := shutil.which(name))), None)
+    if compiler is None:
+        pytest.skip("A host C++17 compiler is required for the native policy regression")
+    csrc = Path(__file__).resolve().parents[1] / "csrc"
+    source = tmp_path / "shared_policy.cpp"
+    executable = tmp_path / ("shared_policy.exe" if sys.platform == "win32" else "shared_policy")
+    source.write_text(
+        r'''#include "kernels/mega_moe_common/common/mega_moe_shared_policy.hpp"
+#include <cstdint>
+#include <iostream>
+
+uint32_t Tiles(uint32_t hidden, uint32_t tileN)
+{
+    return (hidden + tileN - 1U) / tileN;
+}
+
+int main()
+{
+    const uint32_t batches[] = {1U, 17U, 256U, 257U};
+    const uint32_t hiddenSizes[] = {1024U, 4096U};
+    for (uint32_t bs : batches) {
+        for (uint32_t hidden : hiddenSizes) {
+            const auto geluProducer = MegaMoeImpl::SelectSharedExpertPolicyForActivation(true, true, 1U, bs);
+            const auto geluConsumer = MegaMoeImpl::SelectSharedExpertPolicyForActivation(true, true, 1U, bs);
+            if (geluProducer.gmm2TileN != 256U || geluConsumer.gmm2TileN != geluProducer.gmm2TileN ||
+                Tiles(hidden, geluProducer.gmm2TileN) != Tiles(hidden, geluConsumer.gmm2TileN)) {
+                std::cerr << "GELU producer/consumer mismatch at BS=" << bs << " H=" << hidden << '\n';
+                return 1;
+            }
+            const auto swigluProducer = MegaMoeImpl::SelectSharedExpertPolicyForActivation(true, false, 1U, bs);
+            const auto swigluConsumer = MegaMoeImpl::SelectSharedExpertPolicyForActivation(true, false, 1U, bs);
+            const uint32_t expectedN = bs <= 256U ? 224U : 256U;
+            if (swigluProducer.gmm2TileN != expectedN || swigluConsumer.gmm2TileN != expectedN ||
+                Tiles(hidden, swigluProducer.gmm2TileN) != Tiles(hidden, swigluConsumer.gmm2TileN)) {
+                std::cerr << "SwiGLU policy regression at BS=" << bs << " H=" << hidden << '\n';
+                return 2;
+            }
+        }
+    }
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [compiler, "-std=c++17", "-I", str(csrc), str(source), "-o", str(executable)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run([str(executable)], check=True, capture_output=True, text=True)
+    for relative in (
+        "kernels/mega_moe_common/common/mega_moe_gmm_common.hpp",
+        "kernels/mega_moe/stage/mega_moe_unpermute.hpp",
+    ):
+        assert "SelectSharedExpertPolicyForActivation(" in (csrc / relative).read_text(encoding="utf-8")
+
+
+def test_mte_wave_window_mapping_and_target_capacity(tmp_path):
+    compiler = next((path for name in ("c++", "g++", "clang++") if (path := shutil.which(name))), None)
+    if compiler is None:
+        pytest.skip("A host C++17 compiler is required for the native wave-window regression")
+    csrc = Path(__file__).resolve().parents[1] / "csrc"
+    source = tmp_path / "wave_window.cpp"
+    executable = tmp_path / ("wave_window.exe" if sys.platform == "win32" else "wave_window")
+    source.write_text(
+        r'''#include "kernels/mega_moe_common/common/mega_moe_wave_window.hpp"
+#include <cstdint>
+#include <iostream>
+#include <vector>
+
+struct Range {
+    uint64_t storageBegin;
+    uint64_t storageEnd;
+};
+
+bool Overlaps(Range a, Range b)
+{
+    return a.storageBegin < b.storageEnd && b.storageBegin < a.storageEnd;
+}
+
+int main()
+{
+    if (MegaMoeImpl::WaveWindowSlotCount(true, true) != 3U ||
+        MegaMoeImpl::WaveWindowSlotCount(true, false) != 2U ||
+        MegaMoeImpl::WaveWindowSlotCount(false, true) != 1U) {
+        return 6;
+    }
+    const uint32_t lengths[] = {1U, 255U, 256U, 257U, 1024U, 17U, 1024U, 31U, 256U, 511U};
+    const uint64_t maxRows = 100000U;
+    for (uint32_t slots : {2U, 3U}) {
+        const uint32_t groups = 4U;
+        const uint64_t storageRows = MegaMoeImpl::WaveWindowRowCapacity(maxRows, groups, slots);
+        if (storageRows != slots * 1024U) return 1;
+        std::vector<Range> ranges;
+        uint64_t logical = 0U;
+        for (uint32_t wave = 0U; wave < 8U; ++wave) {
+            const uint32_t length = lengths[wave];
+            const auto mapping = MegaMoeImpl::MakeWaveRowMapping(maxRows, storageRows, groups, slots, wave, logical);
+            const uint64_t begin = MegaMoeImpl::MapWaveRow(mapping, logical);
+            const uint64_t end = MegaMoeImpl::MapWaveRow(mapping, logical + length - 1U) + 1U;
+            if (begin != (wave % slots) * 1024U || end > storageRows || end - begin != length) {
+                std::cerr << "invalid wave mapping at wave=" << wave << " slots=" << slots << '\n';
+                return 2;
+            }
+            ranges.push_back({begin, end});
+            logical += length;
+        }
+        for (uint32_t wave = 1U; wave < ranges.size(); ++wave) {
+            const uint32_t previous = slots == 2U ? wave : wave - 1U;
+            for (uint32_t other = wave; other < ranges.size() && other <= wave + 1U; ++other) {
+                if (previous != other && Overlaps(ranges[previous], ranges[other])) {
+                    std::cerr << "in-flight overlap at wave=" << wave << " slots=" << slots << '\n';
+                    return 3;
+                }
+            }
+            if (slots == 3U && wave > 0U && wave + 1U < ranges.size() && Overlaps(ranges[wave], ranges[wave + 1U])) {
+                return 3;
+            }
+        }
+    }
+    const auto identity = MegaMoeImpl::MakeWaveRowMapping(1000U, 1000U, 4U, 3U, 9U, 777U);
+    if (identity.logicalStart != 0U || identity.storageStart != 0U || MegaMoeImpl::MapWaveRow(identity, 777U) != 777U) {
+        return 4;
+    }
+    constexpr uint64_t bytesPerRow = 4096U + 256U + 1536U + 48U + 32U + 3072U + 8192U;
+    for (uint32_t ep : {8U, 16U, 32U}) {
+        const uint64_t logicalRows = static_cast<uint64_t>(39280U) * ep * 25U;
+        const uint64_t fullBytes = logicalRows * bytesPerRow;
+        const uint64_t a8w4Rows = MegaMoeImpl::WaveWindowRowCapacity(logicalRows, 16U, 3U);
+        const uint64_t a8w8Rows = MegaMoeImpl::WaveWindowRowCapacity(logicalRows, 16U, 2U);
+        if (fullBytes < (100ULL << 30) || a8w4Rows != 12288U || a8w8Rows != 8192U ||
+            a8w4Rows * bytesPerRow >= (256ULL << 20) || a8w8Rows * bytesPerRow >= (256ULL << 20)) {
+            std::cerr << "target capacity regression at EP=" << ep << '\n';
+            return 5;
+        }
+    }
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [compiler, "-std=c++17", "-I", str(csrc), str(source), "-o", str(executable)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run([str(executable)], check=True, capture_output=True, text=True)
+    expected = {
+        "kernels/mega_moe_common/common/mega_moe_workspace.hpp": "MteWorkspaceRowCapacity",
+        "kernels/mega_moe/stage/mega_moe_token_dispatch.hpp": "MapWaveRow",
+        "kernels/mega_moe_common/stage/mega_moe_gmm1_activation.hpp": "ExpertStorageRow",
+        "kernels/mega_moe/stage/mega_moe_gmm2_combine.hpp": "ExpertStorageRow",
+        "kernels/mega_moe/mega_moe_wave_a8w4.hpp": "SyncAll<false>",
+        "kernels/mega_moe/mega_moe_wave_a8w8.hpp": "SyncAll<false>",
+    }
+    for relative, marker in expected.items():
+        assert marker in (csrc / relative).read_text(encoding="utf-8")

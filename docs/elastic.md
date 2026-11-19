@@ -44,7 +44,7 @@ combine 根据 `handle.is_low_latency` 执行匹配路径，不改变 handle 的
 | 项目 | 约束 |
 | --- | --- |
 | EP | dispatch / combine：2、4、8、16、32、64、128、256、512 |
-| Shape | 0<H≤7168；BF16 的 H 为 16 的倍数，FP8 为 128 的倍数；1≤T≤16384，1≤K≤16，P≤E≤1024 |
+| Shape | 0<H≤7168；BF16 的 H 为 16 的倍数，FP8 为 128 的倍数；1≤T≤65536，1≤K≤32，P≤E≤1024 |
 | 编码与容量 | `P*T*K < 2**31`；dst 使用 int64，实际接收/gather 行数还须通过布局检查 |
 | 输入 | BF16 `[T,H]`，或 `(FP8 E4M3FN [T,H], FP32 scales [T,H/128])` |
 | 路由 | int64 `topk_idx [T,K]`；可选 FP32 `topk_weights [T,K]` |
@@ -134,7 +134,7 @@ Dispatch 的接口与流选项不因本次 Combine 接入而变化。
 
 ## 工作区与输出所有权
 
-HT 的 `num_bytes` 包含 Notify/dispatch 和 combine 两个固定半区，按 2 MiB 对齐。size hint 的接收/gather 行预算为 `min(P,4)*T*K`，不是最坏路由上界。严重热点需要更大的显式容量；超过实际容量时在 payload 启动前报错，不自动扩容。
+HT 的 `num_bytes` 包含 Notify/dispatch 和 combine 两个固定半区，按 2 MiB 对齐。size hint 的 `server_partial` 按 `next_pow2(P*T)` 行（token 级上界）预算，`gather_input`/`returned_partial` 按 `T*K` 平均路由行预算，不是最坏路由上界。严重热点需要更大的显式容量；超过实际容量时在 payload 启动前报错，不自动扩容。
 
 `get_buffer_size_hint()` 同时估算 Notify、dispatch 和 combine 的容量；实际可分配大小还取决于设备内存和 SHMEM 的虚拟地址空间。
 

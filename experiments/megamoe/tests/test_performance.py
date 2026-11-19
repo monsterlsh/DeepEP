@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from deep_ep_experimental.megamoe import performance
 from deep_ep_experimental.megamoe.benchmark import load_config
 from deep_ep_experimental.megamoe.performance import (
     alignment_config,
@@ -92,15 +93,17 @@ def test_tail_half_selection_even_odd_and_single_round(iterations, first, select
     assert report["rank_min_rounds_us"][-1] == iterations
 
 
-def test_aligned_batch_only_final_round_has_timer():
+def test_aligned_batch_only_final_round_has_timer(monkeypatch):
     log, prefix, timer = [], object(), object()
     torch = SimpleNamespace(exp=lambda data, out: log.append(("exp", data, out)))
+    monkeypatch.setattr(performance, "flush_l2_before_call", lambda: log.append("flush"))
     enqueue_batch(lambda t: log.append(("call", t)), torch, prefix, dict(repeats=2), 3, timer)
-    assert log == [("exp", prefix, prefix)] * 2 + [("call", None)] * 2 + [("call", timer)]
+    assert log == [("exp", prefix, prefix)] * 2 + ["flush", ("call", None)] * 2 + ["flush", ("call", timer)]
 
 
 def test_profiler_barrier_after_enter_no_per_round_synchronize(tmp_path, monkeypatch):
     log = []
+    monkeypatch.setattr(performance, "flush_l2_before_call", lambda: log.append("flush"))
 
     class Profile:
         def __enter__(self):
@@ -144,7 +147,9 @@ def test_profiler_barrier_after_enter_no_per_round_synchronize(tmp_path, monkeyp
         "profiler ready BS=96",
         "exp",
         "exp",
+        "flush",
         ("call", None),
+        "flush",
         ("call", None),
         "sync",
         "step",
@@ -163,3 +168,69 @@ def test_alignment_is_explicit_validated_and_recorded(tmp_path):
     path = tmp_path / "case.json"
     path.write_text(json.dumps(config))
     assert load_config(path)["alignment"] == config["alignment"]
+
+
+def test_urma_profile_groups_window_kernels_by_logical_forward(tmp_path, monkeypatch):
+    calls = []
+    directory = tmp_path / "profile"
+
+    class Profile:
+        def __enter__(self):
+            calls.append("enter")
+            return self
+
+        def step(self):
+            calls.append("step")
+
+        def __exit__(self, *args):
+            # Files arrive out of launch order and contain a non-MegaMoE task.
+            name = "mega_moe_urma_kernel(MegaMoeUrma::Arguments)"
+            rows = [kernel(10 * i, i, name) for i in range(1, 9)]
+            write_samples(directory / "b/kernel_details.csv", rows[4:] + [kernel(35, 200, "sum")])
+            write_samples(directory / "a/kernel_details.csv", list(reversed(rows[:4])))
+
+    profiler = SimpleNamespace(
+        _ExperimentalConfig=lambda **kw: kw,
+        ExportType=SimpleNamespace(Text="text"),
+        AiCMetrics=SimpleNamespace(AiCoreNone="none"),
+        ProfilerLevel=SimpleNamespace(Level0=0),
+        ProfilerActivity=SimpleNamespace(CPU="cpu", NPU="npu"),
+        profile=lambda **kw: Profile(),
+        schedule=lambda **kw: kw,
+        tensorboard_trace_handler=lambda path: path,
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(profiler=profiler))
+    monkeypatch.setattr(performance, "flush_l2_before_call", lambda: calls.append("flush"))
+    guard = SimpleNamespace(
+        begin=lambda: calls.append("begin"),
+        before_forward=lambda: calls.append("guard"),
+        end=lambda: calls.append("end"),
+    )
+    capture = performance.measure_profiled_forward(
+        lambda: calls.append("formal"),
+        warmup=1,
+        iters=2,
+        guard=guard,
+        directory=directory,
+        fine_forward=lambda: calls.append("fine"),
+        windows_per_forward=2,
+    )
+    assert calls == ["enter", "begin", *(["guard", "flush", "formal"] * 3), "guard", "flush", "fine", "end", "step"]
+    assert capture["durations_us"] == [7.0, 11.0]
+    assert capture["diagnostics"]["fine"] == capture["diagnostic_sample"]
+    assert capture["diagnostic_sample"]["window"] == 0
+    assert capture["diagnostic_sample"]["duration_us"] == 7.0
+    assert [(s["phase"], s["iteration"], s["window"]) for s in capture["samples"]] == [
+        (phase, iteration, window)
+        for iteration, phase in enumerate(("warmup", "formal", "formal", "fine"))
+        for window in range(2)
+    ]
+
+
+def test_packaged_ep8_gelu_topk25_case_crosses_a_window():
+    config = load_config("stage_a_ep8_gelu_k25")
+    model = config["model"]
+    assert model["num_experts"] // 8 == 100
+    assert model["num_topk"] == 25 and model["num_shared_experts"] == 0
+    assert model["activation"] == "gelu" and model["mma_type"] == "fp8xfp4" and model["topk_weights_type"] == 1
+    assert min(config["bs_values"]) < 256 < max(config["bs_values"])

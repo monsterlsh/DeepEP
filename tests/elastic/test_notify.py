@@ -20,6 +20,11 @@ import time
 import traceback
 import random
 
+# Mirrored from csrc/kernels/ht_limits.h; this script must stay importable
+# without the deep_ep wheel on sys.path.
+MAX_TOKENS_PER_RANK = 65536
+MAX_TOPK = 32
+
 
 _ROUTES = ("normal", "random", "duplicates", "invalid", "empty", "hotspot")
 _cases = runpy.run_path(str(Path(__file__).with_name("combine_cases.py")))
@@ -79,7 +84,7 @@ def build_notify_golden(routes, experts, chunk_tokens, *, rank_dedup=False):
     topk = len(routes[0][0]) if tokens else 0
     if (
         chunk_tokens <= 0
-        or not 1 <= topk <= 16
+        or not 1 <= topk <= MAX_TOPK
         or any(len(rows) != tokens or any(len(row) != topk for row in rows) for rows in routes)
     ):
         raise ValueError("routes must have a common [tokens, topk] shape")
@@ -1763,8 +1768,8 @@ def main():
     args.tokens, args.chunk_tokens = cases[0]["tokens"], cases[0]["chunk_tokens"]
     if not __debug__ or os.environ.get("PYTHONOPTIMIZE") or args.repeat < 1:
         parser.error("Enable assertions and use --repeat >=1")
-    if not 1 <= args.tokens <= 16384 or not 1 <= args.topk <= 16:
-        parser.error("tokens1..16384 and topk1..16 required")
+    if not 1 <= args.tokens <= MAX_TOKENS_PER_RANK or not 1 <= args.topk <= MAX_TOPK:
+        parser.error(f"tokens1..{MAX_TOKENS_PER_RANK} and topk1..{MAX_TOPK} required")
     if args.experts < args.ep_size or args.experts > 1024 or args.experts % args.ep_size:
         parser.error("experts must be divisible by EP and <=1024")
     _launch(args, notify_only_worker)
@@ -2086,7 +2091,7 @@ def test_notify_cli_runs_only_metadata(monkeypatch, tmp_path):
         )
         main()
         assert calls.pop()[0].notify_num_cores == cores
-    for flags in (("--repeat", "0"), ("--tokens", "32768"), ("--profile-op", "dispatch"), ("--notify-num-cores", "63")):
+    for flags in (("--repeat", "0"), ("--tokens", "65537"), ("--profile-op", "dispatch"), ("--notify-num-cores", "63")):
         monkeypatch.setattr(sys, "argv", ["test_notify.py", "--output", str(tmp_path), *flags])
         with pytest.raises(SystemExit):
             main()

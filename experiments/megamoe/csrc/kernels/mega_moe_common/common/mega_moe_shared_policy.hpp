@@ -30,5 +30,10 @@ MEGAMOE_SHARED_POLICY_INLINE constexpr SharedExpertPolicy SelectSharedExpertPoli
     const bool decode = shared && bs <= SHARED_DECODE_MAX_BS;
     return {decode, shared && !decode, decode ? 192U : 256U, decode ? 224U : 256U};
 }
+MEGAMOE_SHARED_POLICY_INLINE constexpr SharedExpertPolicy SelectSharedExpertPolicyForActivation(
+    bool isA8W4, bool singleProjection, uint32_t sharedExperts, uint32_t bs)
+{
+    return SelectSharedExpertPolicy(isA8W4 && !singleProjection, sharedExperts, bs);
+}
 }  // namespace DEEPEP_MEGAMOE_IMPL_NAMESPACE
 #undef MEGAMOE_SHARED_POLICY_INLINE

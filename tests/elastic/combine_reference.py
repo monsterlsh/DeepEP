@@ -7,6 +7,10 @@ is a test planner, not a production distributed Notify implementation.
 from array import array
 from dataclasses import dataclass
 
+# Mirrored from csrc/kernels/ht_limits.h; these scripts must stay importable
+# without the deep_ep wheel on sys.path.
+MAX_TOPK = 32
+
 INT32_MAX = (1 << 31) - 1
 REDUCE_ROW_MASK = (1 << 32) - 1
 GATEWAY_CONTROL_UB_BYTES = 44 * 1024
@@ -93,8 +97,8 @@ class CombineCase:
             or self.group_size not in (1, 2, 4, 8, 16, 32, 64, 128)
         ):
             raise ValueError("group_size must be a power of two in [1,128]")
-        if not 0 < self.tokens or not 1 <= self.topk <= 16:
-            raise ValueError("require tokens>0 and 1<=topk<=16")
+        if not 0 < self.tokens or not 1 <= self.topk <= MAX_TOPK:
+            raise ValueError(f"require tokens>0 and 1<=topk<={MAX_TOPK}")
         if not isinstance(self.chunk_tokens, int) or not 0 < self.chunk_tokens <= INT32_MAX:
             raise ValueError("chunk_tokens must be a positive int32")
         if (

@@ -18,6 +18,7 @@
 #include "kernels/mega_moe_common/mega_moe_tiling.hpp"
 #include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
 #include "kernels/mega_moe_common/common/mega_moe_workspace.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_wave_window.hpp"
 #if defined(ENABLE_MEGA_MOE_LAYERED_KERNEL)
 #include "adv_api/hcomm/hcomm.h"
 #endif
@@ -38,7 +39,13 @@ struct ExpertLoopState {
     int64_t globalTokenStartIndex = 0;
     uint32_t expertIdx = 0U;
     bool expertCountTableReady = false;
+    WaveRowMapping waveMapping{};
 };
+
+HOST_DEVICE inline uint64_t ExpertStorageRow(const ExpertLoopState& state, uint32_t rowOffsetInExpert)
+{
+    return MapWaveRow(state.waveMapping, static_cast<uint64_t>(state.globalTokenStartIndex) + rowOffsetInExpert);
+}
 
 // GMM1/GMM2 执行期间共同维护的流水状态；引用成员将更新直接回写到调用方持有的状态。
 struct GmmRuntimeState {
@@ -152,6 +159,7 @@ struct MoeStageCommonConfig {
     uint32_t topK;
     uint32_t tokenHiddenDim;
     uint32_t gmm1OutputDim;
+    uint32_t activationFactor = ACTIVATION_N_HALF;
 };
 
 // GMM1/GMM2 共用的执行方式：当前 block 的任务分工、矩阵模板模式和专家权重布局。

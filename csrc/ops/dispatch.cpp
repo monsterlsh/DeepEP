@@ -9,6 +9,7 @@
 #include <array>
 #include "kernels/dispatch/tiling.hpp"
 #include "kernels/dispatch/launch.hpp"
+#include "kernels/ht_limits.h"
 #include "kernels/notify/launch.hpp"
 #include "runtime/session.hpp"
 
@@ -19,11 +20,12 @@ ascend_deepep::DispatchTiling layout(int rank, int world, int tokens, int topk, 
                                      bool weights = false, int hidden = 7168)
 {
     if (world < 2 || world > 512 || (world & (world - 1)) || rank < 0 || rank >= world || tokens < 1 ||
-        tokens > 16384 || topk < 1 || topk > 16 || experts < world || experts > 1024 || experts % world || rows < 1 ||
+        tokens > ascend_deepep::kHtMaxTokensPerRank || topk < 1 || topk > ascend_deepep::kHtMaxTopk ||
+        experts < world || experts > 1024 || experts % world || rows < 1 ||
         uint64_t(rows) > uint64_t(world) * tokens * topk || uint64_t(world) * tokens * topk >= (1ULL << 31) ||
         hidden <= 0 || hidden > 7168 || hidden % (fp8 ? 128 : 16)) {
         throw std::invalid_argument(
-            "Invalid dispatch shape (EP2..512, H<=7168 aligned to BF16:16/FP8:128, T1..16384, K1..16, E<=1024)");
+            "Invalid dispatch shape (EP2..512, H<=7168 aligned to BF16:16/FP8:128, T1..65536, K1..32, E<=1024)");
     }
     auto t = ascend_deepep::MakeDispatchTiling(rank, world, tokens, topk, experts, rows, fp8, weights, hidden);
     if (uint64_t(world) * t.address_stride >= (1ULL << 63) || t.workspace_bytes > (1ULL << 63)) {

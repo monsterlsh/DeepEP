@@ -135,7 +135,7 @@ bash experiments/megamoe/scripts/build.sh
 
 Prefill 与 Decode 共用 `ElasticBuffer.dispatch()` / `combine()`。在支持的配置下，`num_max_tokens_per_rank ≤ 256` 适用低时延，其余配置使用高吞吐。该参数是每 rank 的 token 容量上限，不是本次实际 token 数。
 
-以下 BF16 示例假定已设置 NPU、SHMEM endpoint 和 EP 进程组 `ep_group`。模型提供当前 NPU 上的 `x [T,H]`（BF16）、`topk_idx [T,K]`（INT64）和 `topk_weights [T,K]`（FP32）。各 rank 的 T/H/K 相同，且 `T ≤ max_tokens_per_rank`、专家数可被 EP size 整除。高吞吐支持 `0 < H ≤ 7168`，BF16 的 H 为 16 的倍数，FP8 的 H 为 128 的倍数，1≤K≤16。
+以下 BF16 示例假定已设置 NPU、SHMEM endpoint 和 EP 进程组 `ep_group`。模型提供当前 NPU 上的 `x [T,H]`（BF16）、`topk_idx [T,K]`（INT64）和 `topk_weights [T,K]`（FP32）。各 rank 的 T/H/K 相同，且 `T ≤ max_tokens_per_rank`、专家数可被 EP size 整除。高吞吐支持 `0 < H ≤ 7168`，BF16 的 H 为 16 的倍数，FP8 的 H 为 128 的倍数，1≤K≤32。
 
 低时延使用 8 GiB 工作区，高吞吐由 Buffer 自动估算容量。
 

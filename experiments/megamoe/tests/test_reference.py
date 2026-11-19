@@ -1,6 +1,8 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by SimpleBright_Man 2026
 
+import math
+
 import numpy as np
 import pytest
 
@@ -8,12 +10,15 @@ from deep_ep_experimental.megamoe.reference import (
     FP4,
     FP8_POSITIVE,
     bf16,
+    dequantize_activation,
     dequantize_input,
     error_metrics,
     expert_forward,
     fp8_decode,
     fp8_encode,
+    gelu,
     local_reference,
+    quantize_activation,
     quantize_input,
     unpack_weight,
 )
@@ -189,3 +194,37 @@ def test_early_weight_clamp_order_and_zero_negative_routes():
     np.testing.assert_array_equal(early[0], 0)
     late = expert_forward(x, w1, w2, 0.25) * weights[:, None]
     assert error_metrics(early, late)["relative_rmse"] > 1e-3
+
+
+def test_gelu_uses_scalar_erf_contract_not_tanh_approximation():
+    x = np.array([-4, -1, -0.25, 0, 0.5, 1, 4], dtype=np.float32)
+    expected = np.array([0.5 * float(v) * (1 + math.erf(float(v) / math.sqrt(2))) for v in x], dtype=np.float32)
+    np.testing.assert_array_equal(gelu(x), expected)
+    tanh_approximation = 0.5 * x * (1 + np.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x**3)))
+    assert np.max(np.abs(gelu(x) - tanh_approximation)) > 1e-4
+
+
+def test_fp4_mx32_packing_scale_and_exact_decode():
+    x = np.full((1, 64), 0.5, dtype=np.float32)
+    x[:, 32:] = 2.0
+    codes, scales = quantize_activation(x, "fp4xfp4")
+    assert codes.shape == (1, 32) and codes.dtype == np.uint8
+    np.testing.assert_array_equal(scales, [[124, 126]])
+    np.testing.assert_array_equal(dequantize_activation(codes, scales, "fp4xfp4"), x)
+
+
+@pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8", "fp4xfp4"])
+def test_single_projection_gelu_weights_happen_before_mx_quant(mma_type):
+    rng = np.random.default_rng(101)
+    x = rng.normal(size=(4, 64)).astype(np.float32) * 0.2
+    w1 = rng.normal(size=(64, 64)).astype(np.float32) * 0.1
+    w2 = rng.normal(size=(64, 64)).astype(np.float32) * 0.1
+    route = np.array([0.1, -0.4, 0.7, 1.0], dtype=np.float32)
+    activated = bf16(gelu(bf16(x @ w1.T)) * route[:, None])
+    expected = bf16(dequantize_activation(*quantize_activation(activated, mma_type), mma_type) @ w2.T)
+    actual = expert_forward(x, w1, w2, route_weights=route, activation="gelu", mma_type=mma_type)
+    np.testing.assert_array_equal(actual, expected)
+    late = expert_forward(x, w1, w2, activation="gelu", mma_type=mma_type) * route[:, None]
+    assert error_metrics(actual, late)["relative_rmse"] > 1e-4
+    with pytest.raises(ValueError, match="activation_clamp"):
+        expert_forward(x, w1, w2, 0.2, activation="gelu", mma_type=mma_type)

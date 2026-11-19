@@ -269,7 +269,7 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
         // interleaved源布局为[x1, x2]连续存放在同一行，下一行stride是2*validColumnCount。
         // 注意：2*validColumnCount==实际行距(TileN) 仅在满 tile 成立；tiling 已约束 hiddenDim%256==0，
         // 交织调度宽度为完整 hiddenDim，故交织路径不会出现尾 tile；若未来放宽须改用 TileN。
-        inputRowStrideElements = static_cast<uint32_t>(validColumnCount) * 2U;
+        inputRowStrideElements = static_cast<uint32_t>(validColumnCount) * ActivationFactor(actMode_);
     } else {
         // 非交织源是两块独立 UB tile，生产端按固定行距 TileN 写入（MakeLayoutC(tileM, L1_TILE_N)）；
         // 尾块 validColumnCount < TileN 时行距不随有效宽度收缩，否则第 1 行起整行错位。
@@ -318,6 +318,7 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
     } else {
         gatedActivationContext.topkWeights = nullptr;
     }
+    gatedActivationContext.topkWeightIndex = topkWeightIndex_;
     gatedActivationContext.gateTail = gateTail;
     gatedActivationContext.upTail = upTail;
     gatedActivationContext.outputTail = outputTail;
@@ -334,7 +335,9 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
 
     const ActMode actMode = static_cast<ActMode>(actMode_);
     const ActSubMode actSubMode = static_cast<ActSubMode>(actSubMode_);
-    if (actMode == ActMode::SITU) {
+    if (actMode == ActMode::GELU) {
+        Activation::RunGELU<DataTypeIn, TopkWeightsPrefetch>(gatedActivationContext);
+    } else if (actMode == ActMode::SITU) {
         const float invBeta = activationBeta_ != 0.0f ? 1.0f / activationBeta_ : 1.0f;
         if (actSubMode == ActSubMode::LINEAR) {
             const float invAlpha = activationAlpha_ != 0.0f ? 1.0f / activationAlpha_ : 1.0f;

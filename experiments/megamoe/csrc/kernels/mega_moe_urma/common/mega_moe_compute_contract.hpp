@@ -66,6 +66,12 @@ struct ComputeBatchRange {
 #define MEGAMOE_URMA_COMPUTE_INLINE inline
 #endif
 
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm1LogicalTileN(const Config& c)
+{
+    return DEEPEP_MEGAMOE_IMPL_NAMESPACE::ActivationFactor(static_cast<uint8_t>(c.activationMode)) == 1U ? kComputeTileN
+                                                                                           : kGmm1LogicalTileN;
+}
+
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t CommunicationWorkers(uint32_t world)
 {
     return world - 1U;
@@ -184,8 +190,8 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ComputeTileCount(uint32_t rows, u
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm1ComputeTileCount(uint32_t rows, const Config& c)
 {
-    return ((rows + kComputeTileM - 1U) / kComputeTileM) *
-           ((c.intermediate + kGmm1LogicalTileN - 1U) / kGmm1LogicalTileN);
+    const uint32_t tileN = Gmm1LogicalTileN(c);
+    return ((rows + kComputeTileM - 1U) / kComputeTileM) * ((c.intermediate + tileN - 1U) / tileN);
 }
 
 // All stage task IDs are global prefix sums. Sparse experts cannot repeatedly

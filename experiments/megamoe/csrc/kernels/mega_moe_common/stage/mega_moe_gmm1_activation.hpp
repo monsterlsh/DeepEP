@@ -99,7 +99,7 @@ __aicore__ inline void Gmm1AicMmadTileToGmGeneric(BlockMmad& blockMmad, const Co
             gmC.Slice(Te::MakeCoord(mLoc, nLoc), Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
         blockMmad(gmBlockA, gmBlockB, gmBlockScaleA, gmBlockScaleB, gmBias, tensorBlockGm, singleShape);
     } else {
-        for (uint32_t weightBlock = 0; weightBlock < ACTIVATION_N_HALF; ++weightBlock) {
+        for (uint32_t weightBlock = 0; weightBlock < config.activationFactor; ++weightBlock) {
             uint32_t nOffset = nLoc + weightBlock * config.outputN;
             auto gmBlockB = gmB.Slice(Te::MakeCoord(kLoc, nOffset),
                                       Te::MakeShape(Get<K_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
@@ -138,7 +138,7 @@ __aicore__ inline void Gmm1AicMmadTileToUbGeneric(BlockMmad& blockMmad, const Co
             Te::MakeCoord(0, 0), Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
         auto tensorBlockUbSecond = l0cOutUbSecond.Slice(
             Te::MakeCoord(0, 0), Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
-        for (uint32_t weightBlock = 0; weightBlock < ACTIVATION_N_HALF; ++weightBlock) {
+        for (uint32_t weightBlock = 0; weightBlock < config.activationFactor; ++weightBlock) {
             auto gmBlockB = gmB.Slice(Te::MakeCoord(kLoc, nLoc + weightBlock * config.outputN),
                                       Te::MakeShape(Get<K_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
             auto gmBlockScaleB = gmScaleB.Slice(Te::MakeCoord(0, nLoc + weightBlock * config.outputN),
@@ -313,8 +313,8 @@ __aicore__ inline void Gmm1Aiv0PrefetchInterleavedEpilogueTileGeneric(
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
 
-        uint32_t epilogueN = Get<N_VALUE>(actualShape) / ACTIVATION_N_HALF;
-        uint32_t epilogueNLoc = nLoc / ACTIVATION_N_HALF;
+        uint32_t epilogueN = Get<N_VALUE>(actualShape) / config.activationFactor;
+        uint32_t epilogueNLoc = nLoc / config.activationFactor;
         Std::tuple<int64_t, int64_t, int64_t, int64_t> epilogueShape{subM, epilogueN, 0, 0};
         Std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t> epilogueOffset{
             subMLoc * config.outputN + epilogueNLoc,
@@ -343,8 +343,8 @@ __aicore__ inline void Gmm1Aiv0InterleavedEpilogueTileGeneric(const Config& conf
     if (Get<M_VALUE>(actualShape) == 0U) {
         return;
     }
-    uint32_t epilogueN = Get<N_VALUE>(actualShape) / ACTIVATION_N_HALF;
-    uint32_t epilogueNLoc = nLoc / ACTIVATION_N_HALF;
+    uint32_t epilogueN = Get<N_VALUE>(actualShape) / config.activationFactor;
+    uint32_t epilogueNLoc = nLoc / config.activationFactor;
     Std::tuple<int64_t, int64_t, int64_t, int64_t> epilogueShape{Get<M_VALUE>(actualShape), epilogueN, 0, 0};
     Std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t> epilogueOffset{
         mLoc * config.outputN + epilogueNLoc,
@@ -397,10 +397,12 @@ __aicore__ inline void Gmm1Aiv0PrefetchEpilogueTileGeneric(const Config& config,
 
         auto tensorBlockGmFirst =
             gmC.Slice(Te::MakeCoord(subMLoc, nLoc), Te::MakeShape(subM, Get<N_VALUE>(actualShape)));
-        auto tensorBlockGmSecond =
-            gmC.Slice(Te::MakeCoord(subMLoc, nLoc + config.outputN), Te::MakeShape(subM, Get<N_VALUE>(actualShape)));
         AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, tensorBlockGmFirst);
-        AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
+        if (config.activationFactor == ACTIVATION_N_HALF) {
+            auto tensorBlockGmSecond =
+                gmC.Slice(Te::MakeCoord(subMLoc, nLoc + config.outputN), Te::MakeShape(subM, Get<N_VALUE>(actualShape)));
+            AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
 
@@ -479,14 +481,18 @@ __aicore__ inline void Gmm1Aiv1PrefetchEpilogueTileA8W4(ActivationQuantOp& activ
         if (subOffset != 0) {
             AscendC::DataCopy(topkWeightTensor, metaInfoGm[metaInfoRow * INT32_PER_256B], subM * INT32_PER_256B);
         }
-        const uint32_t gateLoc = Config::FUSED_GATE_UP ? nLoc * ACTIVATION_N_HALF : nLoc;
+        const uint32_t gateLoc = Config::FUSED_GATE_UP && config.activationFactor == ACTIVATION_N_HALF
+                                 ? nLoc * ACTIVATION_N_HALF
+                                 : nLoc;
         const uint32_t upLoc = gateLoc + (Config::FUSED_GATE_UP ? Get<N_VALUE>(actualShape) : config.outputN);
         auto tensorBlockGmFirst =
             l0cOutGm.Slice(Te::MakeCoord(subMLoc, gateLoc), Te::MakeShape(subM, Get<N_VALUE>(actualShape)));
-        auto tensorBlockGmSecond =
-            l0cOutGm.Slice(Te::MakeCoord(subMLoc, upLoc), Te::MakeShape(subM, Get<N_VALUE>(actualShape)));
         AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, tensorBlockGmFirst);
-        AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
+        if (config.activationFactor == ACTIVATION_N_HALF) {
+            auto tensorBlockGmSecond =
+                l0cOutGm.Slice(Te::MakeCoord(subMLoc, upLoc), Te::MakeShape(subM, Get<N_VALUE>(actualShape)));
+            AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
         Std::tuple<int64_t, int64_t, int64_t, int64_t> epilogueShape{subM, Get<N_VALUE>(actualShape), 0, 0};
@@ -518,12 +524,12 @@ __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQua
     }
     AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(0);
     AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);
-    const uint32_t gateLoc = Config::FUSED_GATE_UP ? nLoc * ACTIVATION_N_HALF : nLoc;
+    const uint32_t gateLoc = Config::FUSED_GATE_UP && config.activationFactor == ACTIVATION_N_HALF
+                                 ? nLoc * ACTIVATION_N_HALF
+                                 : nLoc;
     const uint32_t upLoc = gateLoc + (Config::FUSED_GATE_UP ? Get<N_VALUE>(actualShape) : config.outputN);
     auto tensorBlockGmFirst = l0cOutGm.Slice(Te::MakeCoord(mLoc, gateLoc),
                                              Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
-    auto tensorBlockGmSecond =
-        l0cOutGm.Slice(Te::MakeCoord(mLoc, upLoc), Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
     auto layoutL0cUb = MakeLayoutC{}(config.tileM, L1_TILE_N);
     int64_t ubOffsetFirst = 0;
     uint32_t ubBufferSize =
@@ -533,7 +539,11 @@ __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQua
     auto tensorBlockUbSecond = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetSecond), layoutL0cUb);
     auto copyGm2Ub = AscendC::Te::MakeCopy(AscendC::Te::CopyGM2UB{});
     AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, tensorBlockGmFirst);
-    AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
+    if (config.activationFactor == ACTIVATION_N_HALF) {
+        auto tensorBlockGmSecond = l0cOutGm.Slice(
+            Te::MakeCoord(mLoc, upLoc), Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
+        AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
+    }
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
     Std::tuple<int64_t, int64_t, int64_t, int64_t> epilogueShape{Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape),
@@ -1036,12 +1046,12 @@ __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
     int64_t n = Get<N_VALUE>(state.problemShape);
     int64_t k = Get<K_VALUE>(state.problemShape);
     int64_t expertOffset = state.expertIdx;
-    int64_t globalTokenStartIndex = state.globalTokenStartIndex + rowOffsetInExpert;
+    int64_t storageTokenStartIndex = static_cast<int64_t>(ExpertStorageRow(state, rowOffsetInExpert));
     uint32_t expertMGroupOffset = rowOffsetInExpert / L1_TILE_M_256;
     int64_t scaleK = Ops::Base::CeilDiv(k, static_cast<int64_t>(MXFP_DIVISOR_SIZE)) * MXFP_MULTI_BASE_SIZE;
 
     if constexpr (EnableA8W4 || TopkWeightsPrefetch) {
-        gmmAddrInfo.gmm1OutGlobal = workspace.gmm1MmadResPtr + globalTokenStartIndex * n * sizeof(bfloat16_t);
+        gmmAddrInfo.gmm1OutGlobal = workspace.gmm1MmadResPtr + storageTokenStartIndex * n * sizeof(bfloat16_t);
     }
     if constexpr (TopkWeightsPrefetch) {
         gmmAddrInfo.gmm1TileStatus = reinterpret_cast<__gm__ int32_t*>(workspace.gmm1TileStatusPtr) +
@@ -1054,8 +1064,8 @@ __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
                                        expertOffset * syncLayout.activationFlagSlotCountPerExpert +
                                        static_cast<uint64_t>(expertMGroupOffset) * INT_CACHELINE;
     gmmAddrInfo.aGlobal =
-        workspace.dispatchRevDataPtr + globalTokenStartIndex * k / ActivationElementsPerByte * sizeof(ActivationType);
-    gmmAddrInfo.aScaleGlobal = workspace.dispatchRevScalePtr + globalTokenStartIndex * scaleK * sizeof(QuantScaleType);
+        workspace.dispatchRevDataPtr + storageTokenStartIndex * k / ActivationElementsPerByte * sizeof(ActivationType);
+    gmmAddrInfo.aScaleGlobal = workspace.dispatchRevScalePtr + storageTokenStartIndex * scaleK * sizeof(QuantScaleType);
     gmmAddrInfo.bGlobal =
         GetExpertWeightAddr<ActivationType>(weights.weight1, gmmConfig.isPerExpertWeightTensor, state.expertIdx,
                                             static_cast<uint64_t>(state.expertIdx) * n * k / weightElementsPerByte);
@@ -1068,11 +1078,14 @@ __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
             runsActivation = GetSubBlockIdx() == 1;
         }
         if (runsActivation) {
-            int64_t scaleN = Ops::Base::CeilDiv(n / ACTIVATION_N_HALF, static_cast<int64_t>(MXFP_DIVISOR_SIZE)) *
+            const int64_t activationFactor = Get<ACTIVATION_FACTOR_VALUE>(state.problemShape) == ACTIVATION_N_SINGLE
+                                                 ? ACTIVATION_N_SINGLE
+                                                 : ACTIVATION_N_HALF;
+            int64_t scaleN = Ops::Base::CeilDiv(n / activationFactor, static_cast<int64_t>(MXFP_DIVISOR_SIZE)) *
                              MXFP_MULTI_BASE_SIZE;
             AscendC::Coord<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t> vecBaseOffset{
-                globalTokenStartIndex * n / ACTIVATION_N_HALF / outputElementsPerByte,
-                globalTokenStartIndex * scaleN,
+                storageTokenStartIndex * n / activationFactor / outputElementsPerByte,
+                storageTokenStartIndex * scaleN,
                 expertOffset * syncLayout.activationFlagSlotCountPerExpert / INT_CACHELINE + expertMGroupOffset,
                 0L,
                 0L,
@@ -1136,7 +1149,7 @@ __aicore__ inline void UpdateSharedExpertGmm1GlobalBuffer(const MoeStageCommonCo
     uint64_t n = commonConfig.gmm1OutputDim;
     uint64_t k = commonConfig.tokenHiddenDim;
     uint64_t scaleK = Ops::Base::CeilDiv(k, static_cast<uint64_t>(MXFP_DIVISOR_SIZE)) * MXFP_MULTI_BASE_SIZE;
-    uint64_t activationN = n / ACTIVATION_N_HALF;
+    uint64_t activationN = n / commonConfig.activationFactor;
     uint64_t scaleN = Ops::Base::CeilDiv(activationN, static_cast<uint64_t>(MXFP_DIVISOR_SIZE)) * MXFP_MULTI_BASE_SIZE;
     uint64_t expertIdx = sharedExpertIdx;
 

@@ -241,8 +241,9 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Init(
     worldSize_ = tilingData->epWorldSize;
     moeExpertPerRank_ = tilingData->moeExpertPerRank;
     sharedExpertNum_ = tilingData->sharedExpertNum;
-    sharedPolicy_ = SelectSharedExpertPolicy(ENABLE_A8W4, sharedExpertNum_, tilingData->bs);
-    decodeInputReady_ = UseDecodeInputReady(ENABLE_A8W4, tilingData->bs);
+    const bool useGelu = tilingData->actMode == static_cast<uint8_t>(MegaMoeActMode::GELU);
+    sharedPolicy_ = SelectSharedExpertPolicy(ENABLE_A8W4 && !useGelu, sharedExpertNum_, tilingData->bs);
+    decodeInputReady_ = UseDecodeInputReady(ENABLE_A8W4 && !useGelu, tilingData->bs);
     mGroupsPerWave_ = tilingData->mGroupsPerWave;
     gmm2PingPongIdx_ = 0;
     mc2Context_ = reinterpret_cast<__gm__ Mc2MoeContext*>(context);
@@ -282,7 +283,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Init(
                      .tokenNum = tilingData->bs,
                      .topK = tilingData->topK,
                      .tokenHiddenDim = k_,
-                     .gmm1OutputDim = tilingData->hiddenDim};
+                     .gmm1OutputDim = tilingData->hiddenDim,
+                     .activationFactor = ActivationFactor(tilingData->actMode)};
     const int64_t maxOutput = static_cast<int64_t>(tilingData->maxOutputSize);
     const int64_t tileM = static_cast<int64_t>(GMM1_TILE_M);
     int32_t dispatchFlagSlotsPerExpert = static_cast<int32_t>(Ops::Base::CeilDiv(maxOutput, tileM)) * INT_CACHELINE;
@@ -499,6 +501,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm1
     Get<M_VALUE>(problemShape) = commonConfig_.tokenNum;
     Get<N_VALUE>(problemShape) = commonConfig_.gmm1OutputDim;
     Get<K_VALUE>(problemShape) = commonConfig_.tokenHiddenDim;
+    Get<ACTIVATION_FACTOR_VALUE>(problemShape) = commonConfig_.activationFactor;
     GMMAddrInfo gmmAddrInfo{};
     uint32_t startBlockIdx = 0U;
     int32_t vecSetSyncCom = 0;
@@ -552,9 +555,10 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertActi
     Get<M_VALUE>(shape) = commonConfig_.tokenNum;
     Get<N_VALUE>(shape) = commonConfig_.gmm1OutputDim;
     Get<K_VALUE>(shape) = commonConfig_.tokenHiddenDim;
+    Get<ACTIVATION_FACTOR_VALUE>(shape) = commonConfig_.activationFactor;
     const uint32_t tileCount =
         Ops::Base::CeilDiv(commonConfig_.tokenNum, GMM1_TILE_M) *
-        Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF, static_cast<uint32_t>(L1_TILE_N));
+        Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / commonConfig_.activationFactor, static_cast<uint32_t>(L1_TILE_N));
     GMMAddrInfo addr{};
     for (uint32_t expert = 0; expert < sharedExpertNum_; ++expert) {
         UpdateSharedExpertGmm1GlobalBuffer<ActivationType, Weight1Type, ActivationQuantOutType, QuantScaleOutType,
@@ -590,7 +594,7 @@ __aicore__ inline bool MegaMoe<TemplateMegaMoeTypeFunc>::TryRunSharedExpertActiv
         cursor.nextTile = blockIdx_;
         cursor.tileCount =
             Ops::Base::CeilDiv(commonConfig_.tokenNum, GMM1_TILE_M) *
-            Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF, static_cast<uint32_t>(L1_TILE_N));
+            Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / commonConfig_.activationFactor, static_cast<uint32_t>(L1_TILE_N));
     }
     if (cursor.nextTile < cursor.tileCount) {
         // AIV1 did not enter shared GMM1. Rebind its separate epilogue and shared GM views;
@@ -608,6 +612,7 @@ __aicore__ inline bool MegaMoe<TemplateMegaMoeTypeFunc>::TryRunSharedExpertActiv
         Get<M_VALUE>(shape) = commonConfig_.tokenNum;
         Get<N_VALUE>(shape) = commonConfig_.gmm1OutputDim;
         Get<K_VALUE>(shape) = commonConfig_.tokenHiddenDim;
+        Get<ACTIVATION_FACTOR_VALUE>(shape) = commonConfig_.activationFactor;
         GMMAddrInfo addr{};
         UpdateSharedExpertGmm1GlobalBuffer<ActivationType, Weight1Type, ActivationQuantOutType, QuantScaleOutType,
                                            ENABLE_A8W4>(commonConfig_, gmmExecutionConfig_, params_.workspaceInfo,
@@ -689,6 +694,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm2
     Get<M_VALUE>(problemShape) = commonConfig_.tokenNum;
     Get<N_VALUE>(problemShape) = commonConfig_.gmm1OutputDim;
     Get<K_VALUE>(problemShape) = commonConfig_.tokenHiddenDim;
+    Get<ACTIVATION_FACTOR_VALUE>(problemShape) = commonConfig_.activationFactor;
     uint32_t startBlockIdx = 0U;
     int32_t vecSetSyncCom = 0;
     GmmRuntimeState runtimeState{startBlockIdx, vecSetSyncCom, gmm2PingPongIdx_};

@@ -6,6 +6,10 @@ import html
 import json
 from pathlib import Path
 
+# Mirrored from csrc/kernels/ht_limits.h; these scripts must stay importable
+# without the deep_ep wheel on sys.path.
+MAX_TOKENS_PER_RANK = 65536
+
 EP8_SINGLE_QP_FLAG = 0x45505131
 VERSION, MAGIC, WORDS, TICKS_PER_US = 2, 0x43484B50, 36, 1000
 FIELDS = (
@@ -32,7 +36,7 @@ NOTE = (
 def shape(world, tokens, chunk_tokens=256):
     if chunk_tokens not in (256, 512, 1024):
         raise ValueError("chunk_tokens must be 256, 512 or 1024")
-    if world not in (2, 4, 8, 16, 32, 64, 128, 256, 512) or not 1 <= tokens <= 16384:
+    if world not in (2, 4, 8, 16, 32, 64, 128, 256, 512) or not 1 <= tokens <= MAX_TOKENS_PER_RANK:
         raise ValueError("Invalid Combine chunk shape")
     groups = world // min(world, 64)
     chunks = (tokens + chunk_tokens - 1) // chunk_tokens + min(4, tokens, chunk_tokens) - 1

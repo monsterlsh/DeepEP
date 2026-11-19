@@ -95,9 +95,10 @@ public:
     template <class Problem>
     __aicore__ inline void UpdateProblem(const Problem& config, const UrmaMegaMoeImpl::GMMAddrInfo& addr, bool gmm1)
     {
-        fused_ = gmm1 && Problem::FUSED_GATE_UP;
+        const bool gated = gmm1 && config.activationFactor == UrmaMegaMoeImpl::ACTIVATION_N_HALF;
+        fused_ = gated && Problem::FUSED_GATE_UP;
         Pipeline::UpdateProblem(config, addr, gmm1 ? addr.gmm1OutGlobal : addr.gmm2OutGlobal);
-        gateUp_ = gmm1;
+        gateUp_ = gated;
         halfN_ = config.outputN;
     }
 

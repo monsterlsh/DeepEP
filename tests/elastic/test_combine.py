@@ -1496,18 +1496,26 @@ def test_sq_pressure_routes():
 def test_large_shape_and_capacity_bounds(monkeypatch):
     import importlib
     import pytest
-    from deep_ep.buffers._elastic_layout import combine_layout, dispatch_layout, elastic_size_hint
+    from deep_ep.buffers._elastic_layout import (
+        MAX_TOKENS_PER_RANK,
+        combine_layout,
+        dispatch_layout,
+        elastic_size_hint,
+    )
 
     elastic = importlib.import_module("deep_ep.backends.mesh_clos.elastic")
     monkeypatch.setattr(elastic, "require_native", lambda *_: None)
     for world in (256, 512):
         for tokens in (4608, 4609, 8192, 16383, 16384):
             for topk in (6, 16):
-                rows = 4 * tokens * topk
+                receive_rows = 1 << (world * tokens - 1).bit_length()
+                route_rows = tokens * topk
                 for fp8 in (False, True):
-                    d = dispatch_layout(world, tokens, topk, 1024, rows, fp8, weights=True)
-                    c = combine_layout(world, tokens, topk, rows, rows)
-                    size = elastic_size_hint(world, tokens, topk, 1024, rows, rows, fp8)
+                    d = dispatch_layout(world, tokens, topk, 1024, receive_rows, fp8, weights=True)
+                    c = combine_layout(world, tokens, topk, receive_rows, route_rows)
+                    size = elastic_size_hint(
+                        world, tokens, topk, 1024, receive_rows, route_rows, fp8
+                    )
                     assert max(d["workspace_bytes"], c["workspace_bytes"]) <= size // 2
                     assert size % (2 << 20) == 0
                     assert (
@@ -1522,7 +1530,7 @@ def test_large_shape_and_capacity_bounds(monkeypatch):
     c = combine_layout(512, 16384, 16, 1, 1)
     assert c["output"] - c["returned_partial"] == 14 << 30
     assert elastic_size_hint(512, 16384, 16, 1024, 1048576, 1048576) > 32 << 30
-    for world, tokens in ((1024, 16384), (512, 16385)):
+    for world, tokens in ((1024, 16384), (512, MAX_TOKENS_PER_RANK + 1)):
         with pytest.raises(ValueError):
             dispatch_layout(world, tokens, 6, 1024, 1)
         with pytest.raises(ValueError):
@@ -3452,7 +3460,7 @@ def test_session_order_capacity_validation_and_output_paths(tmp_path):
     assert len({_session_CASES["case_args"](args, c, True).output for c in cases}) == 6
     assert _session_CASES["case_args"](args, cases[0], False).output == tmp_path
     assert _session_CASES["from_args"](parser.parse_args([])) == _session_CASES["make_cases"]([16384], [256])
-    for t, c in ((0, 256), (32768, 256), (4096, 128), (True, 256), (4096, 256.0)):
+    for t, c in ((0, 256), (65537, 256), (4096, 128), (True, 256), (4096, 256.0)):
         with pytest.raises(ValueError):
             _session_CASES["make_cases"]([t], [c])
     for broken in ([], list(reversed(cases)), [dict(cases[0], case_id="../../escape")]):

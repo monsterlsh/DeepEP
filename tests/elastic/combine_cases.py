@@ -4,6 +4,10 @@ import argparse
 import json
 from pathlib import Path
 
+# Mirrored from csrc/kernels/ht_limits.h; these scripts must stay importable
+# without the deep_ep wheel on sys.path.
+MAX_TOKENS_PER_RANK = 65536
+
 
 def add_arguments(parser, default_tokens):
     tokens = parser.add_mutually_exclusive_group()
@@ -19,9 +23,13 @@ def make_cases(tokens, chunks, notify_cores=None):
     if not pairs:
         raise ValueError("Combine case list must not be empty")
     if any(
-        type(t) is not int or not 1 <= t <= 16384 or type(c) is not int or c not in (256, 512, 1024) for t, c in pairs
+        type(t) is not int
+        or not 1 <= t <= MAX_TOKENS_PER_RANK
+        or type(c) is not int
+        or c not in (256, 512, 1024)
+        for t, c in pairs
     ):
-        raise ValueError("Cases require tokens 1..16384 and chunks 256/512/1024")
+        raise ValueError(f"Cases require tokens 1..{MAX_TOKENS_PER_RANK} and chunks 256/512/1024")
     if notify_cores is None:
         return [dict(case_id=f"case-{i:03d}-t{t}-c{c}", tokens=t, chunk_tokens=c) for i, (t, c) in enumerate(pairs)]
     if not notify_cores or any(type(n) is not int or n not in (32, 64) for n in notify_cores):

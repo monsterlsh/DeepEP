@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Expert100 EP32 需求与候选方案</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6fa;
+      --paper: #ffffff;
+      --ink: #172033;
+      --muted: #5d687a;
+      --line: #dfe4ec;
+      --primary: #2457c5;
+      --primary-soft: #edf3ff;
+      --green: #16734b;
+      --green-soft: #eaf7f0;
+      --amber: #925d00;
+      --amber-soft: #fff6df;
+      --red: #a43b3b;
+      --code: #eef1f6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", Arial, sans-serif;
+      line-height: 1.72;
+    }
+    main {
+      max-width: 1120px;
+      margin: 32px auto;
+      padding: 0 24px 48px;
+    }
+    header, section {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 28px 32px;
+      margin-bottom: 20px;
+    }
+    header { border-top: 5px solid var(--primary); }
+    h1 { margin: 0 0 8px; font-size: 30px; line-height: 1.35; }
+    h2 { margin: 0 0 18px; font-size: 23px; border-bottom: 2px solid var(--primary-soft); padding-bottom: 10px; }
+    h3 { margin: 26px 0 10px; font-size: 18px; }
+    h4 { margin: 20px 0 8px; font-size: 16px; }
+    p { margin: 8px 0 12px; }
+    ul, ol { margin: 8px 0 12px; padding-left: 24px; }
+    li { margin: 4px 0; }
+    table { width: 100%; border-collapse: collapse; margin: 12px 0 20px; font-size: 14px; }
+    th, td { border: 1px solid var(--line); padding: 10px 12px; text-align: left; vertical-align: top; }
+    th { background: #f0f3f8; font-weight: 700; }
+    code {
+      background: var(--code);
+      border-radius: 4px;
+      padding: 2px 5px;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 0.93em;
+    }
+    pre {
+      margin: 12px 0;
+      padding: 15px 18px;
+      overflow-x: auto;
+      background: #111a2c;
+      color: #e9efff;
+      border-radius: 9px;
+      font: 14px/1.65 Consolas, "Courier New", monospace;
+    }
+    pre code { background: transparent; padding: 0; color: inherit; }
+    a { color: var(--primary); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .subtitle { color: var(--muted); font-size: 16px; margin-bottom: 18px; }
+    .meta { display: flex; flex-wrap: wrap; gap: 10px 24px; color: var(--muted); font-size: 14px; }
+    .badge {
+      display: inline-block;
+      padding: 1px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .confirmed { color: var(--green); background: var(--green-soft); }
+    .recommended { color: var(--primary); background: var(--primary-soft); }
+    .tbd { color: var(--amber); background: var(--amber-soft); }
+    .note, .decision, .warning {
+      padding: 13px 16px;
+      border-radius: 8px;
+      margin: 12px 0;
+    }
+    .note { background: var(--primary-soft); border-left: 4px solid var(--primary); }
+    .decision { background: var(--green-soft); border-left: 4px solid var(--green); }
+    .warning { background: var(--amber-soft); border-left: 4px solid #c17b00; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .card { border: 1px solid var(--line); border-radius: 9px; padding: 15px 17px; }
+    .card h4 { margin-top: 0; }
+    .small { color: var(--muted); font-size: 13px; }
+    .req-id { color: var(--primary); font-weight: 700; }
+    .nowrap { white-space: nowrap; }
+    footer { color: var(--muted); text-align: center; font-size: 13px; padding: 8px; }
+    @media (max-width: 760px) {
+      main { margin: 12px auto; padding: 0 10px 24px; }
+      header, section { padding: 20px 18px; }
+      .grid { grid-template-columns: 1fr; }
+      table { display: block; overflow-x: auto; }
+    }
+    @media print {
+      body { background: white; }
+      main { max-width: none; margin: 0; padding: 0; }
+      header, section { border: 0; border-radius: 0; padding: 16px 0; margin: 0; break-inside: auto; }
+      .card, tr { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Expert100 EP32 需求与候选方案</h1>
+    <div class="subtitle">UBX / 非 UBX 双场景评审稿</div>
+    <div class="meta">
+      <span>日期：2026-11-17</span>
+      <span>状态：需求整理，推荐方案尚待评审</span>
+      <span>适用分支：<code>feat/Eexpert100-ep32</code>、<code>feat/Expert100-ep32-main</code></span>
+    </div>
+  </header>
+
+  <section>
+    <h2>1. 文档约定与目标</h2>
+    <p>
+      本方案将内容分为三类：<span class="badge confirmed">已确认需求</span>表示用户已经明确提出；
+      <span class="badge recommended">推荐方案</span>表示基于当前代码和目标配置给出的首选路径；
+      <span class="badge tbd">TBD</span>表示尚未决策，备选方案不等于已批准实现。
+    </p>
+    <p>主要使用方为算子开发、精度验证和性能验证人员。完成条件是：两个场景使用一致的需求定义，在目标拓扑和配置下完成新流程，并满足最终确认的精度标准。</p>
+    <div class="note">
+      <strong>核心目标：</strong>新增 GELU，复用并扩展 Quant 前 Logits 加权，TopK 最大支持 32，逐步覆盖 8 卡单机、16 卡单机和 32 卡跨机，支持 A8W4、A8W8、A4W4，同时控制 UBX 与主干代码差异。
+    </div>
+  </section>
+
+  <section>
+    <h2>2. 分支策略与共同约束</h2>
+    <table>
+      <thead><tr><th>场景</th><th>基线分支</th><th>开发分支</th><th>最终合入</th></tr></thead>
+      <tbody>
+        <tr><td>UBX</td><td><code>feat/roce-support</code></td><td><code>feat/Eexpert100-ep32</code></td><td><code>feat/roce-support</code></td></tr>
+        <tr><td>非 UBX</td><td><code>main</code></td><td><code>feat/Expert100-ep32-main</code></td><td><code>main</code></td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>两个分支的功能范围、计算语义、配置定义和验收标准保持一致。</li>
+      <li>核心算法、模块边界和接口设计尽可能一致；仅保留平台、通信或底层算子必需的场景差异。</li>
+      <li>公共需求变更及公共问题修复同步到两个分支，避免独立演进。</li>
+      <li>场景差异集中在适配层、配置或局部实现，不在核心流程中散布平台判断。</li>
+      <li>不引入与本需求无关的重构，避免扩大两个基线之间的差异。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>3. 当前实现基线与主要差距</h2>
+    <p>以下现状来自当前 UBX 分支 <code>feat/Eexpert100-ep32</code>。非 UBX 的 <code>main</code> 基线需在详细设计前单独核对，不能默认两者现状完全一致。</p>
+    <table>
+      <thead><tr><th>能力</th><th>当前实现</th><th>与目标的关系</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>激活</td>
+          <td>公共 API 仅开放 SwiGLU；激活内部使用 FP32 计算并输出 BF16。</td>
+          <td>GELU 需要新增，不是替换已有 GELU 公式。</td>
+        </tr>
+        <tr>
+          <td>Logits / TopK 加权</td>
+          <td><code>topk_weights_type=0</code> 在 GMM2 后加权；<code>topk_weights_type=1</code> 已在 SwiGLU 后、Quant 前加权。</td>
+          <td>目标前移路径已有实现，可扩展复用，不需要从零迁移。</td>
+        </tr>
+        <tr>
+          <td>量化</td>
+          <td>采用 MX 量化，每 32 个元素共享 E8M0 Scale；公共 API 支持 FP8×FP4 和 FP8×FP8，A4W4 已有内核路径但未在公共 API 开放。</td>
+          <td>优先继承现有量化语义；A4W4 需要补齐公开配置和完整验证。</td>
+        </tr>
+        <tr>
+          <td>TopK / 拓扑</td>
+          <td>MTE 入口允许 TopK≤32；URMA 入口限制 TopK≤8、EP4/8/16，且单卡 Token 上限为 16384。</td>
+          <td>目标 TopK25/32、EP32 和 39280 Token 是否要求 URMA 全支持，需要明确后端范围。</td>
+        </tr>
+        <tr>
+          <td>精度判定</td>
+          <td>Golden 当前使用统一的混合误差规则，没有按 A8W4/A8W8/A4W4 分别定义阈值。</td>
+          <td>先沿用现有规则，是否按精度分别设定阈值留待验证数据决策。</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="small">
+      代码依据：
+      <a href="experiments/megamoe/python/deep_ep_experimental/megamoe/api.py">api.py L76–112</a>；
+      <a href="experiments/megamoe/README.md">README.md L116–129</a>；
+      <a href="experiments/megamoe/csrc/kernels/mega_moe/epilogue/activation/swiglu_activation.hpp">swiglu_activation.hpp L71–99</a>；
+      <a href="experiments/megamoe/csrc/forward.cpp">forward.cpp L651–675</a>；
+      <a href="experiments/megamoe/csrc/kernels/mega_moe/mega_moe_arch35.hpp">mega_moe_arch35.hpp L152–178</a>；
+      <a href="experiments/megamoe/python/deep_ep_experimental/megamoe/golden.py">golden.py L243–274</a>。
+    </p>
+  </section>
+
+  <section>
+    <h2>4. 目标计算流程</h2>
+    <p><span class="badge confirmed">已确认需求</span> Logits 专家加权由 Finalize 前移至 Quant 前，Finalize 不再重复加权。</p>
+    <pre><code>原默认流程：
+GMM1 → SwiGLU → BF16/MX Quant → GMM2 → Logits/TopK 加权 → Finalize
+
+本需求目标流程：
+GMM1 → GELU → Logits/TopK 加权 → Quant → GMM2 → Finalize（不再加权）</code></pre>
+    <p><span class="badge recommended">推荐数据路径</span> 沿用当前前移模式的数值顺序：</p>
+    <pre><code>GMM1 → GELU（FP32 内部计算）→ FP32 Logits 加权 → BF16 → MX Quant → GMM2 → Finalize</code></pre>
+    <div class="warning">
+      两种加权位置因量化顺序不同，不要求结果逐位一致。验收应分别建立对应 Golden，不能用旧的 GMM2 后加权结果直接作为新流程的唯一真值。
+    </div>
+  </section>
+
+  <section>
+    <h2>5. 功能需求与候选方案</h2>
+
+    <h3><span class="req-id">FR-01</span> GELU 激活</h3>
+    <ul>
+      <li>新增 GELU 配置，执行位置为 GMM1 后、Logits 加权前。</li>
+      <li>保留现有 SwiGLU 能力，不因新增 GELU 改变原配置的默认行为。</li>
+      <li>UBX 与非 UBX 使用相同公式、参数定义和 Golden 语义。</li>
+      <li>不支持的激活名称或参数组合应明确报错，不允许静默回退到 SwiGLU。</li>
+    </ul>
+    <h4>D1：GELU 输入结构 <span class="badge tbd">TBD，开发前确定</span></h4>
+    <div class="grid">
+      <div class="card">
+        <h4>方案 A：标准单路 GELU <span class="badge recommended">推荐</span></h4>
+        <p>GMM1 直接输出待激活结果，再逐元素执行 GELU。与目标 GMM1 K/N=4096/1536、GMM2 K/N=1536/4096 直接对应。</p>
+        <p class="small">需要新增单输入激活处理，并核对权重布局及 tiling 对 gate/up 双路的假设。</p>
+      </div>
+      <div class="card">
+        <h4>方案 B：门控 GEGLU</h4>
+        <p>GMM1 输出 gate/up 两路，执行 <code>GELU(gate) × up</code>。仅当目标模型权重本身就是门控结构时采用。</p>
+        <p class="small">该方案的 GMM1 物理输出宽度需要重新核算，不能直接沿用方案 A 对目标 K/N 的解释。</p>
+      </div>
+    </div>
+    <h4>D2：GELU 公式 <span class="badge tbd">TBD，开发前确定</span></h4>
+    <table>
+      <thead><tr><th>方案</th><th>规则</th><th>适用条件</th></tr></thead>
+      <tbody>
+        <tr><td><strong>A：精确 erf 版（推荐基线）</strong></td><td><code>0.5x[1 + erf(x/√2)]</code>；Kernel 与 Golden 均以此为准。</td><td>目标模型未指定近似方式时，先消除公式歧义；需评估内核实现成本。</td></tr>
+        <tr><td><strong>B：tanh 近似版</strong></td><td><code>0.5x[1 + tanh(√(2/π)(x + 0.044715x³))]</code>。</td><td>目标模型明确使用 tanh 近似，或精确版经评估不适合作为内核实现时启用。</td></tr>
+      </tbody>
+    </table>
+    <p class="small">两种公式不能混用为同一数值合同。若选择 tanh，Golden、测试和文档必须同步切换。</p>
+
+    <h3><span class="req-id">FR-02</span> Logits 加权前移</h3>
+    <ul>
+      <li>GELU 流程固定执行 Quant 前加权，Finalize 中不得重复执行。</li>
+      <li>优先复用当前 <code>topk_weights_type=1</code> 的调度、元数据和通信逻辑。</li>
+      <li>共享专家是否加权沿用当前规则：共享专家不乘路由权重。</li>
+      <li>前移后需检查量化输入范围、Scale 分布和精度变化。</li>
+    </ul>
+    <h4>D3：旧流程兼容策略 <span class="badge tbd">TBD</span></h4>
+    <table>
+      <thead><tr><th>方案</th><th>行为</th><th>影响</th></tr></thead>
+      <tbody>
+        <tr><td><strong>A：仅 GELU 固定前移（推荐）</strong></td><td>GELU 使用 Quant 前加权；现有 SwiGLU 的 type 0/1 行为保持不变。</td><td>改动范围最小，旧数值合同和回归风险较低。</td></tr>
+        <tr><td><strong>B：所有激活统一切换默认前移</strong></td><td>新流程成为默认，旧 GMM2 后加权可暂时保留为兼容选项。</td><td>流程更统一，但会改变 SwiGLU 默认数值行为，需要额外迁移和回归。</td></tr>
+      </tbody>
+    </table>
+    <h4>D4：加权与 Quant 之间的数据类型 <span class="badge tbd">TBD</span></h4>
+    <table>
+      <thead><tr><th>方案</th><th>数据路径</th><th>启用条件</th></tr></thead>
+      <tbody>
+        <tr><td><strong>A：FP32 加权 → BF16 → Quant（推荐）</strong></td><td>TopK 权重为 FP32，乘法在 FP32 中完成，结果按现有路径转 BF16 后量化。</td><td>默认继承当前实现，优先验证。</td></tr>
+        <tr><td><strong>B：FP32 加权结果直接进入 Quant</strong></td><td>取消加权后的 BF16 中间落地，由 Quant 直接消费 FP32。</td><td>仅在精度数据证明 BF16 中间舍入不满足要求时启用；需修改 Quant 输入路径并重建 Golden。</td></tr>
+      </tbody>
+    </table>
+
+    <h3><span class="req-id">FR-03</span> TopK 最大支持 32</h3>
+    <ul>
+      <li>必须覆盖目标 TopK=25，并验证 TopK=32 边界。</li>
+      <li>TopK 索引、权重、元数据、通信、缓冲区、调度和 Finalize 必须共同支持，不允许只放开参数校验。</li>
+      <li>TopK 超出支持范围、专家数不足或索引/权重形状不匹配时，应在执行前明确报错。</li>
+      <li>两个分支的 TopK 能力定义保持一致。</li>
+    </ul>
+    <div class="note"><strong>当前差距：</strong>MTE 已允许 TopK≤32；URMA 当前限制为 TopK≤8。是否将 URMA 扩展至 32 属于 D8 的后端范围决策。</div>
+
+    <h3><span class="req-id">FR-04</span> EP 拓扑</h3>
+    <table>
+      <thead><tr><th>阶段</th><th>拓扑</th><th>完成条件</th></tr></thead>
+      <tbody>
+        <tr><td>第一阶段</td><td>8 卡单机</td><td>完成新流程、精度模式和 TopK25/32 的基础验证。</td></tr>
+        <tr><td>第二阶段</td><td>16 卡单机</td><td>验证 EP 扩展、通信和归并正确性。</td></tr>
+        <tr><td>第三阶段</td><td>32 卡跨机</td><td>验证跨机通信、目标专家配置和完整精度。</td></tr>
+      </tbody>
+    </table>
+    <p>核心实现不得固定依赖 8 卡拓扑。各阶段通过不代表后续阶段自动通过，16 卡和 32 卡需分别留存验证结果。</p>
+
+    <h3><span class="req-id">FR-05</span> A8W4、A8W8、A4W4</h3>
+    <table>
+      <thead><tr><th>模式</th><th>逻辑数据类型</th><th>当前基础</th><th>目标</th></tr></thead>
+      <tbody>
+        <tr><td>A8W4</td><td>FP8 E4M3 激活 + FP4 E2M1 权重</td><td>公共 API 已有</td><td>适配 GELU 和 Quant 前加权。</td></tr>
+        <tr><td>A8W8</td><td>FP8 E4M3 激活 + FP8 E4M3 权重</td><td>公共 API 已有</td><td>适配 GELU 和 Quant 前加权。</td></tr>
+        <tr><td>A4W4</td><td>FP4 E2M1 激活 + FP4 E2M1 权重</td><td>内核已有路径，公共 API 未开放</td><td>补齐公开配置、权重准备、Golden 和精度验证。</td></tr>
+      </tbody>
+    </table>
+    <h4>D5：量化格式 <span class="badge tbd">TBD</span></h4>
+    <table>
+      <thead><tr><th>方案</th><th>规则</th><th>启用条件</th></tr></thead>
+      <tbody>
+        <tr><td><strong>A：全部继承 MX32 + E8M0（推荐）</strong></td><td>每 32 个元素共享一个 Scale，沿用当前输入、权重和中间 Quant 语义。</td><td>默认方案，保持两个分支和三种模式的一致性。</td></tr>
+        <tr><td><strong>B：按目标模型引入其他量化粒度</strong></td><td>仅针对明确不兼容的模型格式新增配置、数据布局和 Golden。</td><td>只有目标输入格式证明 MX32 无法直接消费时启用，不作为预先扩展。</td></tr>
+      </tbody>
+    </table>
+    <h4>D6：A4W4 开放方式 <span class="badge tbd">TBD</span></h4>
+    <ul>
+      <li><strong>方案 A（最终推荐）：</strong>通过统一公共配置暴露 A4W4，两个分支的配置语义一致，并覆盖完整测试。</li>
+      <li><strong>方案 B（阶段备选）：</strong>先通过内部内核配置完成 A4W4 功能验证，再开放公共 API。该方案只能作为开发阶段安排，不能替代最终公开支持。</li>
+    </ul>
+
+    <h3><span class="req-id">FR-06</span> 目标配置</h3>
+    <table>
+      <tbody>
+        <tr><th>单卡 Token 数</th><td>39280</td><th>专家数</th><td>800</td></tr>
+        <tr><th>EP</th><td>32</td><th>TopK</th><td>25</td></tr>
+        <tr><th>GMM1 K/N</th><td>4096 / 1536</td><th>GMM2 K/N</th><td>1536 / 4096</td></tr>
+      </tbody>
+    </table>
+    <p>该配置用于验证功能、精度、工作空间、通信和性能。目标 K/N 与标准单路 GELU 方案直接匹配；若选择 GEGLU，必须重新确认形状定义。</p>
+
+    <h3><span class="req-id">FR-07</span> 双场景代码结构</h3>
+    <ul>
+      <li>两个分支采用相同的激活类型定义、Logits 顺序、量化语义和配置名称。</li>
+      <li>Golden 的数学公式和舍入顺序保持一致，避免同一输入产生两套参考定义。</li>
+      <li>必要的平台差异通过适配接口隔离，不复制完整 GMM1—Finalize 流程。</li>
+      <li>保留 SwiGLU 和既有精度路径的回归验证，防止新增功能改变旧行为。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>6. 后端覆盖范围与精度判定</h2>
+    <h4>D7：精度阈值 <span class="badge tbd">TBD，最迟在最终验收前确定</span></h4>
+    <table>
+      <thead><tr><th>方案</th><th>规则</th><th>建议</th></tr></thead>
+      <tbody>
+        <tr><td><strong>A：沿用当前统一 Golden 规则（推荐起步）</strong></td><td>混合误差阈值 0.01、超限元素不超过 5%、最大混合误差不超过 0.1。</td><td>先用于 A8W4/A8W8 和新增流程的对比，不在没有数据时预设新阈值。</td></tr>
+        <tr><td><strong>B：按精度模式分别设阈值</strong></td><td>根据目标模型、参考实现和实测误差分别定义 A8W4/A8W8/A4W4 标准。</td><td>统一规则不适用时启用；新阈值必须在验收前评审，不能为通过测试临时放宽。</td></tr>
+      </tbody>
+    </table>
+    <h4>D8：MTE / URMA 最终覆盖范围 <span class="badge tbd">TBD，详细设计前确定</span></h4>
+    <table>
+      <thead><tr><th>方案</th><th>最终范围</th><th>影响</th></tr></thead>
+      <tbody>
+        <tr><td><strong>A：仅目标实际后端完整支持</strong></td><td>目标后端覆盖 TopK32、EP32、39280 Token；另一后端保留现有限制并明确记录。</td><td>范围最聚焦，但必须确认目标后端，不能默认 URMA 也满足目标。</td></tr>
+        <tr><td><strong>B：MTE 与 URMA 均完整支持</strong></td><td>两种后端都扩展到目标 TopK、EP 和 Token 配置。</td><td>需要解除 URMA 当前 TopK≤8、EP≤16、Token≤16384 的限制，工作量和验证范围更大。</td></tr>
+      </tbody>
+    </table>
+    <p><span class="badge recommended">推荐</span> 先确认目标实际后端，再决定 D8。开发顺序可先在限制较少的路径打通功能，但阶段实现不能代替最终范围承诺。</p>
+    <h4>D9：精度模式与拓扑的组合覆盖 <span class="badge tbd">TBD</span></h4>
+    <ul>
+      <li><strong>方案 A（推荐）：</strong>最终三种精度模式均覆盖 8 卡、16 卡和 32 卡目标场景。</li>
+      <li><strong>方案 B：</strong>定义明确的支持矩阵，部分模式仅覆盖指定拓扑；必须在交付前公开限制，不能静默跳过组合。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>7. 推荐方案组合</h2>
+    <div class="decision">
+      <strong>推荐基线，不代表已经批准：</strong>
+      标准单路 GELU + 精确 erf 公式 + GELU 固定 Quant 前加权 + FP32 加权后转 BF16 + MX32/E8M0 + 保留现有 SwiGLU 行为 + 统一开放 A4W4 + 先 8 卡再 16/32 卡 + 先沿用当前 Golden 规则。
+    </div>
+    <table>
+      <thead><tr><th>决策点</th><th>首选</th><th>备选及触发条件</th></tr></thead>
+      <tbody>
+        <tr><td>D1 激活结构</td><td>标准单路 GELU</td><td>目标权重为门控结构时改 GEGLU，并重审形状。</td></tr>
+        <tr><td>D2 公式</td><td>精确 erf 版</td><td>目标模型指定 tanh 或实现评估要求时切 tanh。</td></tr>
+        <tr><td>D3 旧流程</td><td>仅 GELU 固定前移</td><td>需要统一所有激活默认行为时再全局迁移。</td></tr>
+        <tr><td>D4 中间类型</td><td>FP32 → BF16 → Quant</td><td>BF16 舍入精度不足时改 FP32 直接 Quant。</td></tr>
+        <tr><td>D5 量化格式</td><td>MX32 + E8M0</td><td>目标模型格式不兼容时新增明确配置。</td></tr>
+        <tr><td>D6 A4W4</td><td>最终统一公开支持</td><td>开发阶段可先内部验证，再开放接口。</td></tr>
+        <tr><td>D7 精度阈值</td><td>先沿用现有统一规则</td><td>数据证明不适用时按模式评审独立阈值。</td></tr>
+        <tr><td>D8 后端范围</td><td>先明确实际目标后端</td><td>若要求双后端，则同步解除 URMA 现有限制。</td></tr>
+        <tr><td>D9 组合覆盖</td><td>三种模式覆盖全部目标拓扑</td><td>若存在限制，交付明确的支持矩阵。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>8. 验证与验收标准</h2>
+    <h3>功能与回归</h3>
+    <ul>
+      <li>GELU 在 GMM1 后执行，公式与 Golden 一致，UBX 与非 UBX 数值语义一致。</li>
+      <li>Logits 在 Quant 前完成，Finalize 无重复加权，共享专家规则保持不变。</li>
+      <li>TopK25 和 TopK32 均通过功能验证，非法 TopK 有明确错误反馈。</li>
+      <li>A8W4、A8W8、A4W4 均覆盖完整新流程。</li>
+      <li>现有 SwiGLU 的 type 0/1 及既有精度模式完成回归，不发生非预期行为变化。</li>
+    </ul>
+    <h3>拓扑与目标配置</h3>
+    <ul>
+      <li>按 8 卡单机、16 卡单机、32 卡跨机分别验证并留存结果。</li>
+      <li>在最终承诺的后端上，完整运行 39280 Token、800 专家、EP32、TopK25、GMM1 4096/1536、GMM2 1536/4096。</li>
+      <li>验证工作空间和通信缓冲区无越界、无因固定卡数或固定 TopK 导致的失败。</li>
+    </ul>
+    <h3>精度与代码</h3>
+    <ul>
+      <li>精度结果满足 D7 最终确认的标准；前移和旧流程分别使用匹配的 Golden。</li>
+      <li>若采用独立精度阈值，需在测试前固定并记录，不根据单次结果临时调整。</li>
+      <li>两个分支核心流程和配置保持一致，差异均可追溯到具体平台原因。</li>
+      <li>记录目标配置性能结果；性能达标值当前为 <span class="badge tbd">TBD</span>，不虚构验收指标。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>9. 决策时点</h2>
+    <table>
+      <thead><tr><th>时点</th><th>需要确定的事项</th></tr></thead>
+      <tbody>
+        <tr><td>详细设计前</td><td>D1 GELU 结构、D2 公式、D3 旧流程兼容、D4 中间类型、D5 量化格式、D8 后端范围。</td></tr>
+        <tr><td>公共接口开发前</td><td>D6 A4W4 配置方式及两个分支统一的参数定义。</td></tr>
+        <tr><td>最终验收前</td><td>D7 精度阈值、D9 模式与拓扑支持矩阵、性能验收指标。</td></tr>
+      </tbody>
+    </table>
+    <p class="small">在上述事项未确认前，可按推荐方案开展设计和准备，但推荐方案不应被记录为已批准结论。</p>
+  </section>
+
+  <footer>Expert100 EP32 需求与候选方案 · 评审稿</footer>
+</main>
+</body>
+</html>

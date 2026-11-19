@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by SimpleBright_Man 2026
 
-"""Explicit host-side preflight, never a hidden scan in the kernel hot path."""
+"""Routing and collective preflight checks for MegaMoE."""
 
 import math
 from deep_ep._store import StoreGroup
@@ -20,6 +20,23 @@ def check_routing(indices, weights, num_experts, num_topk):
             raise ValueError(f"token={token}: duplicate expert IDs are unsupported")
         if any(not math.isfinite(value) for value in probs):
             raise ValueError(f"token={token}: route weights must be finite")
+
+
+def check_window_routes(indices, weights, num_experts):
+    """Check the entire logical batch before any EP8 window starts exchanging payloads."""
+    import torch
+
+    ordered = indices.sort(dim=1).values
+    invalid_id = (ordered[:, 0] < 0).any() | (ordered[:, -1] >= num_experts).any()
+    failures = [(invalid_id, f"expert IDs must be in [0,{num_experts})")]
+    if ordered.shape[1] > 1:
+        duplicate = (ordered[:, 1:] == ordered[:, :-1]).any()
+        failures.append((duplicate, "duplicate expert IDs are unsupported"))
+    failures.append((~torch.isfinite(weights).all(), "route weights must be finite"))
+    flags = torch.stack([flag for flag, _ in failures]).cpu().tolist()
+    for failed, (_, reason) in zip(flags, failures):
+        if failed:
+            raise ValueError(reason)
 
 
 def collective_check(group, stage, error, signature=None):

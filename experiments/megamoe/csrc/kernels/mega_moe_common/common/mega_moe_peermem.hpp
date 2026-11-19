@@ -143,7 +143,7 @@ HOST_DEVICE int64_t CalcRailTopkIdsRecvSize(const MegaMoeTilingData* tilingData)
 // falls back to direct routing; single-server EP2..8 is also supported.
 HOST_DEVICE bool UseDecodeRailRouting(const MegaMoeTilingData* t)
 {
-    return t->topoType == TOPO_TYPE_MTE &&
+    return t->topoType == TOPO_TYPE_MTE && t->actMode != static_cast<uint8_t>(MegaMoeActMode::GELU) &&
            UseDecodeInputReady(t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4, t->bs) &&
            (t->epWorldSize <= MEGA_MOE_SERVER_SIZE || t->epWorldSize % MEGA_MOE_SERVER_SIZE == 0) &&
            t->blockAivNum > CalcServerNum(t->epWorldSize);

@@ -38,6 +38,7 @@ struct TokenDispatchConfig {
     uint32_t quantScaleAlignBytes;
     uint32_t quantTokenScaleAlignBytes;
     uint32_t ranksPerNode;
+    WaveRowMapping waveMapping{};
 };
 
 template <typename ActivationType>
@@ -139,7 +140,8 @@ __aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
     }
 }
 
-// copyIdx 是 workspace 绝对行号；待写行可能来自上一个 peer，不能再读取已复用的 route-index 缓冲。
+// copyIdx 是逻辑 workspace 绝对行号，经 waveMapping 转换为物理槽内行号；
+// 待写行可能来自上一个 peer，不能再读取已复用的 route-index 缓冲。
 template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
 __aicore__ inline void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig& context, const Params& params,
                                                      TokenDispatchScratch<ActivationType>& scratch, int32_t bufferIdx,
@@ -154,6 +156,7 @@ __aicore__ inline void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
         reinterpret_cast<__gm__ QuantScaleType*>(params.workspaceInfo.dispatchRevScalePtr));
     metaInfoGlobalTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr));
     TEventID eventId = static_cast<TEventID>(bufferIdx);
+    const uint64_t storageCopyIdx = MapWaveRow(context.waveMapping, static_cast<uint64_t>(copyIdx));
     WaitFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
     LocalTensor<ActivationType> tokenScaleBuffer = GetDispatchCopyBuffer(context, scratch, bufferIdx);
     LocalTensor<QuantScaleType> scaleBuffer =
@@ -167,12 +170,12 @@ __aicore__ inline void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
         scratch.metaInfoTensor[bufferIdx * INT32_PER_256B].SetValue(WEIGHT_INDEX, weightBits);
         SetFlag<AscendC::HardEvent::S_MTE3>(eventId);
     }
-    DataCopyPad(tokenRevGlobalTensor[copyIdx * scratch.revTokenElemCnt], tokenScaleBuffer,
+    DataCopyPad(tokenRevGlobalTensor[storageCopyIdx * scratch.revTokenElemCnt], tokenScaleBuffer,
                 {1, static_cast<uint16_t>(scratch.revTokenElemCnt * sizeof(ActivationType)), 0U, 0U, 0U});
-    DataCopyPad(scaleRevGlobalTensor[copyIdx * scratch.revScaleElemCnt], scaleBuffer,
+    DataCopyPad(scaleRevGlobalTensor[storageCopyIdx * scratch.revScaleElemCnt], scaleBuffer,
                 {1, static_cast<uint16_t>(scratch.revScaleElemCnt * sizeof(QuantScaleType)), 0U, 0U, 0U});
     WaitFlag<AscendC::HardEvent::S_MTE3>(eventId);
-    DataCopy(metaInfoGlobalTensor[copyIdx * INT32_PER_256B], scratch.metaInfoTensor[bufferIdx * INT32_PER_256B],
+    DataCopy(metaInfoGlobalTensor[storageCopyIdx * INT32_PER_256B], scratch.metaInfoTensor[bufferIdx * INT32_PER_256B],
              INT32_PER_256B);
     SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
     SetFlag<AscendC::HardEvent::MTE3_S>(eventId);
@@ -485,11 +488,13 @@ __aicore__ inline void DispatchPeerBalancedRows(const TokenDispatchConfig& conte
  */
 template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTileM, bool TopkWeightsPrefetch,
           bool PeerBalanced = false>
-__aicore__ inline void DispatchTokenRange(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
+__aicore__ inline void DispatchTokenRange(TokenDispatchConfig context, const MoeStageCommonConfig& common,
                                           const BlockJobContext& blockJob, const MoeSyncWorkspaceLayout& syncLayout,
                                           const Params& params, GM_ADDR* winRankAddr,
-                                          TokenDispatchScratch<ActivationType>& scratch, const ExpertTokenRange& range)
+                                          TokenDispatchScratch<ActivationType>& scratch, const ExpertTokenRange& range,
+                                          WaveRowMapping waveMapping = {})
 {
+    context.waveMapping = waveMapping;
     if constexpr (g_coreType == AIC) {
         return;
     }

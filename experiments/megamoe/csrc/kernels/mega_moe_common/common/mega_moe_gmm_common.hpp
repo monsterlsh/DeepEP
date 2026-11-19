@@ -127,6 +127,7 @@ struct Config {
         uint32_t k = 0;
         uint32_t outputN = 0;
         uint32_t schedulerN = 0;
+        uint32_t activationFactor = ACTIVATION_N_HALF;
         uint32_t tileN = L1_TILE_N;
         SharedExpertPolicy sharedPolicy{};
         uint32_t blockNum = 0;
@@ -153,7 +154,8 @@ struct Config {
         config.blockIdx = blockJob.jobIndex;
         config.scaleK = CeilDiv(config.k, MXFP_DIVISOR_SIZE) * MXFP_MULTI_BASE_SIZE;
         config.activationTileM = TopkWeightsPrefetch ? L1_TILE_M_128 : gmm1TileM;
-        config.sharedPolicy = SelectSharedExpertPolicy(IsA8W4 && !IsLayered, IsShared ? 1U : 0U, config.m);
+        config.sharedPolicy = SelectSharedExpertPolicyForActivation(
+            IsA8W4 && !IsLayered, config.activationFactor == ACTIVATION_N_SINGLE, IsShared ? 1U : 0U, config.m);
         config.blockMmadTiling = SelectBlockMmadTilingConfig(config.m, config.k, config.tileM);
     }
 
@@ -164,13 +166,17 @@ struct Config {
         config.m = Get<M_VALUE>(problemShape);
         config.n = Get<N_VALUE>(problemShape);
         config.k = Get<K_VALUE>(problemShape);
-        config.outputN = config.n / ACTIVATION_N_HALF;
+        config.activationFactor = Get<ACTIVATION_FACTOR_VALUE>(problemShape) == ACTIVATION_N_SINGLE
+                                      ? ACTIVATION_N_SINGLE
+                                      : ACTIVATION_N_HALF;
+        config.outputN = config.n / config.activationFactor;
         config.tileM = gmm1TileM;
         FinalizeProblemConfig(config, blockJob, gmm1TileM);
         config.schedulerN = (IsGmm1Interleaved || config.sharedPolicy.decode) ? config.n : config.outputN;
-        // Fused routed tasks are logical N128 with physical N256 MMAD/prologue.
-        config.tileN = FuseGateUp ? GMM1_FUSED_TILE_N : config.sharedPolicy.gmm1TileN;
-        config.blockMmadTiling.tileN = FuseGateUp ? L1_TILE_N : config.tileN;
+        // Fused routed tasks are logical N128 with physical N256 MMAD/prologue; GELU is always single projection.
+        const bool fusedGateUp = FuseGateUp && config.activationFactor == ACTIVATION_N_HALF;
+        config.tileN = fusedGateUp ? GMM1_FUSED_TILE_N : config.sharedPolicy.gmm1TileN;
+        config.blockMmadTiling.tileN = fusedGateUp ? L1_TILE_N : config.tileN;
         return config;
     }
 
@@ -180,7 +186,10 @@ struct Config {
         ProblemConfig config;
         config.m = Get<M_VALUE>(problemShape);
         config.n = Get<K_VALUE>(problemShape);
-        config.k = Get<N_VALUE>(problemShape) / ACTIVATION_N_HALF;
+        config.activationFactor = Get<ACTIVATION_FACTOR_VALUE>(problemShape) == ACTIVATION_N_SINGLE
+                                      ? ACTIVATION_N_SINGLE
+                                      : ACTIVATION_N_HALF;
+        config.k = Get<N_VALUE>(problemShape) / config.activationFactor;
         config.outputN = config.n;
         config.schedulerN = config.outputN;
         config.tileM = L1_TILE_M_256;

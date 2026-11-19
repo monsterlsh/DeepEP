@@ -148,8 +148,9 @@ __aicore__ inline void AccumulateSharedExpertForToken(const MoeStageCommonConfig
         reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.sharedExpertGmm2TileCounterPtr) +
             static_cast<uint64_t>(sharedExpertIdx) * sharedExpertStride,
         tokenGroupIndex);
-    const auto sharedPolicy = SelectSharedExpertPolicy(params.tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4,
-                                                       common.sharedExpertNum, common.tokenNum);
+    const auto sharedPolicy = SelectSharedExpertPolicyForActivation(
+        params.tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4,
+        common.activationFactor == ACTIVATION_N_SINGLE, common.sharedExpertNum, common.tokenNum);
     uint32_t gmm2NTilesPerGroup = Ops::Base::CeilDiv(common.tokenHiddenDim, sharedPolicy.gmm2TileN);
     WaitUntilGmFlagEquals(counterAddr, static_cast<int32_t>(gmm2NTilesPerGroup));
 

@@ -5,6 +5,7 @@
 
 #include "kernels/mega_moe_urma/common/mega_moe_route_views.hpp"
 #include "kernel_operator.h"
+#include "shmem.h"
 #include "kernels/mega_moe_urma/common/mega_moe_compute_contract.hpp"
 #include <type_traits>
 
@@ -58,6 +59,31 @@ __aicore__ inline void BuildReduceDependencies(const Arguments& args, uint64_t f
         dependency = uint64_t(peer) * args.config.maxPeerChunks + peerRow / args.config.cvRows;
         dependencies.SetValue(i, dependency);
     }
+}
+
+template <typename Element>
+__aicore__ inline void AccumulateReturnRow(AscendC::LocalTensor<float>& accumulator,
+                                         AscendC::LocalTensor<float>& term, AscendC::LocalTensor<Element>& input,
+                                         AscendC::LocalTensor<float>& weights, uint32_t route, uint32_t columns,
+                                         bool first, bool applyRouteWeight)
+{
+    using namespace AscendC;
+    if (first && !applyRouteWeight) {
+        Cast(accumulator, input, RoundMode::CAST_NONE, columns);
+        return;
+    }
+    Cast(term, input, RoundMode::CAST_NONE, columns);
+    PipeBarrier<PIPE_V>();
+    if (applyRouteWeight) {
+        const float weight = weights.GetValue(route);
+        if (first) {
+            Muls(accumulator, term, weight, columns);
+            return;
+        }
+        Muls(term, term, weight, columns);
+        PipeBarrier<PIPE_V>();
+    }
+    Add(accumulator, accumulator, term, columns);
 }
 
 }  // namespace MegaMoeUrma
@@ -225,19 +251,10 @@ public:
         const auto event = static_cast<TEventID>(slot);
         const uint32_t route = routes_.GetValue(slot);
         const uint32_t topk = route % Ub::topk;
-        const float weight = applyRouteWeight_ ? weights_.GetValue(route) : 1.0F;
         LocalTensor<Element> input = inputs_[slot * Ub::hidden];
         LocalTensor<float> term = terms_[slot * Ub::hidden];
         WaitFlag<HardEvent::MTE2_V>(event);
-        Cast(term, input, RoundMode::CAST_NONE, Ub::hidden);
-        PipeBarrier<PIPE_V>();
-        if (topk == 0U) {
-            Muls(accumulator_, term, weight, Ub::hidden);
-        } else {
-            Muls(term, term, weight, Ub::hidden);
-            PipeBarrier<PIPE_V>();
-            Add(accumulator_, accumulator_, term, Ub::hidden);
-        }
+        AccumulateReturnRow(accumulator_, term, input, weights_, route, Ub::hidden, topk == 0U, applyRouteWeight_);
         SetFlag<HardEvent::V_MTE2>(event);
         if (topk == Ub::topk - 1U) {
             const uint32_t outputSlot = (consumed_ / Ub::topk) % Ub::outputs;
@@ -297,11 +314,8 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
     const uint64_t firstToken = ReduceRowBegin(args.config.bs, worker, args.config.world);
     const uint64_t firstRoute = firstToken * Ub::topk;
     GlobalTensor<int64_t> inverse;
-    GlobalTensor<float> weights;
     inverse.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(args.reduceIndex));
-    weights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(args.weights));
     LocalTensor<int64_t> inverseUb(TPosition::VECCALC, Ub::inverseOffset, Ub::maxRoutes);
-    LocalTensor<float> weightsUb(TPosition::VECCALC, Ub::weightsOffset, Ub::maxRoutes);
     LocalTensor<uint64_t> dependenciesUb(TPosition::VECCALC, Ub::dependenciesOffset, Ub::maxRoutes);
     LocalTensor<uint32_t> remoteCache(TPosition::VECCALC, Ub::remoteCacheOffset, Ub::remoteCacheBytes / 4U);
     LocalTensor<uint32_t> selfCache(TPosition::VECCALC, Ub::selfCacheOffset, Ub::selfCacheBytes / 4U);
@@ -312,7 +326,12 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
     if (allInputsReady) GateReduceInputs();
     WaitPackInverseReady(args);
     DataCopy(inverseUb, inverse[firstRoute], owned * Ub::topk);
-    DataCopy(weightsUb, weights[firstRoute], owned * Ub::topk);
+    if (args.config.topkWeightsType == 0U) {
+        GlobalTensor<float> weights;
+        weights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(args.weights));
+        LocalTensor<float> weightsUb(TPosition::VECCALC, Ub::weightsOffset, Ub::maxRoutes);
+        DataCopy(weightsUb, weights[firstRoute], owned * Ub::topk);
+    }
 
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
@@ -368,21 +387,22 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
 
 namespace MegaMoeUrma::GenericReduce {
 
-// H sliced at 2048 columns; TopK 1..8; BS16384 over at least 41 reducers. Every worker keeps all of its
-// metadata resident so a late token cannot block another metadata batch.
+// H is sliced at 2048 columns. Each worker keeps its metadata resident so a
+// late token cannot block another metadata batch. Legacy K<=8 at BS16384
+// determines the capacity; EP8's short K<=32 windows also fit it.
 struct ReduceUbContract {
     static constexpr uint32_t hidden = 2048U;
-    static constexpr uint32_t topk = 8U;  // capacity, NOT the active token stride
+    static constexpr uint32_t legacyTopk = 8U;
     static constexpr uint32_t inputs = 6U;
     static constexpr uint32_t outputs = 2U;
     static constexpr uint32_t readyGateEvent = 6U;
     static constexpr uint32_t maxTokens = (kMaxTokensPerRank + kReduceWorkers - 1U) / kReduceWorkers;
-    static constexpr uint32_t maxRoutes = maxTokens * topk;
+    static constexpr uint32_t maxRoutes = maxTokens * legacyTopk;
     static constexpr uint32_t maxRemoteDependencies = kWorld * kMaxPeerChunks;
     // Conservative bound across EP4/8/16: at most 16*16384*8 received rows
     // and kMaxLocalExperts experts, each contributing one partial M256 group.
     static constexpr uint32_t maxSelfDependencies =
-        kWorld * kMaxTokensPerRank * topk / kComputeTileM + kMaxLocalExperts;
+        kWorld * kMaxTokensPerRank * legacyTopk / kComputeTileM + kMaxLocalExperts;
     static constexpr uint32_t bf16RowBytes = hidden * sizeof(uint16_t);
     static constexpr uint32_t fp32RowBytes = hidden * sizeof(float);
     static constexpr uint32_t inputBf16Offset = 0U;
@@ -403,6 +423,10 @@ struct ReduceUbContract {
     static constexpr uint32_t end = routeRingOffset + routeRingBytes;
 };
 static_assert(ReduceUbContract::maxTokens == 400U);
+constexpr uint32_t kEp8ReduceWorkers = ReduceWorkers(8U);
+constexpr uint32_t kEp8ReduceTokens = (kEp8WindowTokens + kEp8ReduceWorkers - 1U) / kEp8ReduceWorkers;
+static_assert(kEp8ReduceTokens <= ReduceUbContract::maxTokens);
+static_assert(kEp8ReduceTokens * kEp8MaxTopk <= ReduceUbContract::maxRoutes);
 static_assert(ReduceUbContract::end <= kRequiredUbBytes);
 static_assert(ReduceUbContract::inputFp32Offset % 32U == 0U && ReduceUbContract::accumulatorOffset % 32U == 0U &&
               ReduceUbContract::outputOffset % 32U == 0U && ReduceUbContract::inverseOffset % 32U == 0U &&
@@ -433,11 +457,13 @@ __aicore__ inline void GenericSetReduceBit(AscendC::LocalTensor<uint32_t>& bits,
 template <uint32_t TopK>
 __aicore__ inline bool GenericTryReduceToken(const Arguments& args, AscendC::LocalTensor<uint64_t>& dependencies,
                                              AscendC::LocalTensor<uint32_t>& remoteCache,
-                                             AscendC::LocalTensor<uint32_t>& selfCache, uint32_t firstRoute)
+                                             AscendC::LocalTensor<uint32_t>& selfCache, uint32_t firstRoute,
+                                             uint32_t topk)
 {
     using namespace AscendC;
+    const uint32_t width = TopK == 0U ? topk : TopK;
     const uint32_t expectedSelfTiles = (args.config.hidden + kComputeTileN - 1U) / kComputeTileN;
-    for (uint32_t slot = 0U; slot < TopK; ++slot) {
+    for (uint32_t slot = 0U; slot < width; ++slot) {
         const uint64_t dependency = dependencies.GetValue(firstRoute + slot);
         const bool self = (dependency & kReduceSelfDependency) != 0U;
         const uint32_t index = static_cast<uint32_t>(dependency & ~kReduceSelfDependency);
@@ -473,7 +499,8 @@ __aicore__ inline void GenericGateReduceInputs()
 // One local stream of routes in actual admission order. The six-item ring is
 // slot metadata, not a queue waiting for a batch of ready tokens to accumulate.
 // Consumer commands are submitted before reusing a full slot; no token switch
-// resets events or drains any hardware engine.
+// resets events or drains any hardware engine. TopK=0 uses the window's
+// runtime width, keeping the legacy specializations at constant stride.
 template <typename Element, bool KeepFp32 = false, uint32_t TopK = 8U>
 class ReduceRoutePipeline {
 public:
@@ -482,6 +509,7 @@ public:
         using namespace AscendC;
         firstToken_ = firstToken;
         applyRouteWeight_ = args.config.topkWeightsType == 0U;
+        topk_ = TopK == 0U ? args.config.topk : TopK;
         stride_ = args.config.hidden;
         column_ = column;
         columns_ = columns;
@@ -515,9 +543,10 @@ public:
     __aicore__ inline void SubmitToken(uint32_t token)
     {
         using namespace AscendC;
-        for (uint32_t topk = 0U; topk < TopK; ++topk) {
+        const uint32_t width = TopK == 0U ? topk_ : TopK;
+        for (uint32_t topk = 0U; topk < width; ++topk) {
             if (submitted_ - consumed_ == Ub::inputs) ConsumeOne();
-            const uint32_t route = token * TopK + topk;
+            const uint32_t route = token * width + topk;
             const uint32_t slot = submitted_ % Ub::inputs;
             const auto event = static_cast<TEventID>(slot);
             const uint64_t row = static_cast<uint64_t>(inverse_.GetValue(route));
@@ -535,23 +564,15 @@ public:
         const uint32_t slot = consumed_ % Ub::inputs;
         const auto event = static_cast<TEventID>(slot);
         const uint32_t route = routes_.GetValue(slot);
-        const uint32_t topk = route % TopK;
-        const float weight = applyRouteWeight_ ? weights_.GetValue(route) : 1.0F;
+        const uint32_t width = TopK == 0U ? topk_ : TopK;
+        const uint32_t topk = route % width;
         LocalTensor<Element> input = inputs_[slot * Ub::hidden];
         LocalTensor<float> term = terms_[slot * Ub::hidden];
         WaitFlag<HardEvent::MTE2_V>(event);
-        Cast(term, input, RoundMode::CAST_NONE, columns_);
-        PipeBarrier<PIPE_V>();
-        if (topk == 0U) {
-            Muls(accumulator_, term, weight, columns_);
-        } else {
-            Muls(term, term, weight, columns_);
-            PipeBarrier<PIPE_V>();
-            Add(accumulator_, accumulator_, term, columns_);
-        }
+        AccumulateReturnRow(accumulator_, term, input, weights_, route, columns_, topk == 0U, applyRouteWeight_);
         SetFlag<HardEvent::V_MTE2>(event);
-        if (topk == TopK - 1U) {
-            const uint32_t outputSlot = (consumed_ / TopK) % Ub::outputs;
+        if (topk == width - 1U) {
+            const uint32_t outputSlot = (consumed_ / width) % Ub::outputs;
             const auto outputEvent = static_cast<TEventID>(outputSlot);
             LocalTensor<Output> result = outputs_[outputSlot * Ub::hidden];
             WaitFlag<HardEvent::MTE3_V>(outputEvent);
@@ -562,7 +583,7 @@ public:
                 Cast(result, accumulator_, RoundMode::CAST_RINT, columns_);
             SetFlag<HardEvent::V_MTE3>(outputEvent);
             WaitFlag<HardEvent::V_MTE3>(outputEvent);
-            DataCopy(output_[(firstToken_ + route / TopK) * stride_ + column_], result, columns_);
+            DataCopy(output_[(firstToken_ + route / width) * stride_ + column_], result, columns_);
             SetFlag<HardEvent::MTE3_V>(outputEvent);
         }
         ++consumed_;
@@ -592,6 +613,7 @@ private:
     using Output = std::conditional_t<KeepFp32, float, Element>;
     uint64_t firstToken_ = 0U;
     bool applyRouteWeight_ = true;
+    uint32_t topk_ = 0U;
     uint32_t stride_ = 0, column_ = 0, columns_ = 0;
     uint32_t submitted_ = 0U;
     uint32_t consumed_ = 0U;
@@ -610,19 +632,19 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uin
 {
     using namespace AscendC;
     using Ub = ReduceUbContract;
+    static_assert(TopK <= Ub::legacyTopk);
+    const uint32_t topk = TopK == 0U ? args.config.topk : TopK;
     const uint32_t owned =
         static_cast<uint32_t>((args.config.bs / workers + (worker < args.config.bs % workers ? 1U : 0U)));
     if (owned == 0U) return;
     const uint64_t reduceStart = timer.TraceBegin();
     const uint64_t firstToken = (uint64_t(worker) * (args.config.bs / workers) +
                                  (worker < args.config.bs % workers ? worker : args.config.bs % workers));
-    const uint64_t firstRoute = firstToken * TopK;
+    const uint64_t firstRoute = firstToken * topk;
+    const uint32_t routes = owned * topk;
     GlobalTensor<int64_t> inverse;
-    GlobalTensor<float> weights;
     inverse.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(args.reduceIndex));
-    weights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(args.weights));
     LocalTensor<int64_t> inverseUb(TPosition::VECCALC, Ub::inverseOffset, Ub::maxRoutes);
-    LocalTensor<float> weightsUb(TPosition::VECCALC, Ub::weightsOffset, Ub::maxRoutes);
     LocalTensor<uint64_t> dependenciesUb(TPosition::VECCALC, Ub::dependenciesOffset, Ub::maxRoutes);
     LocalTensor<uint32_t> remoteCache(TPosition::VECCALC, Ub::remoteCacheOffset, Ub::remoteCacheBytes / 4U);
     LocalTensor<uint32_t> selfCache(TPosition::VECCALC, Ub::selfCacheOffset, Ub::selfCacheBytes / 4U);
@@ -632,23 +654,29 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uin
     pipeline.Init(args, firstToken, column, columns);
     bool allInputsReady = GenericAllReduceInputsReady(args);
     if (allInputsReady) GenericGateReduceInputs();
-    static_assert(TopK >= 1U && TopK <= ReduceUbContract::topk);
     if (column == 0U) {
         // These three arrays are outside the column payload scratch and remain
         // resident across all H slices. Build readiness exactly once per entry,
         // never once per polling pass or once per 2048-column slice.
         WaitPackInverseReady(args);
-        if constexpr (TopK == 8U) {
-            DataCopy(inverseUb, inverse[firstRoute], owned * TopK);
-            DataCopy(weightsUb, weights[firstRoute], owned * TopK);
+        if constexpr (TopK == Ub::legacyTopk) {
+            DataCopy(inverseUb, inverse[firstRoute], routes);
         } else {
-            const uint32_t routes = owned * TopK;
             DataCopyPad(inverseUb, inverse[firstRoute], {1U, routes * 8U, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-            DataCopyPad(weightsUb, weights[firstRoute], {1U, routes * 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0.0F});
+        }
+        if (args.config.topkWeightsType == 0U) {
+            GlobalTensor<float> weights;
+            weights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(args.weights));
+            LocalTensor<float> weightsUb(TPosition::VECCALC, Ub::weightsOffset, Ub::maxRoutes);
+            if constexpr (TopK == Ub::legacyTopk) {
+                DataCopy(weightsUb, weights[firstRoute], routes);
+            } else {
+                DataCopyPad(weightsUb, weights[firstRoute], {1U, routes * 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0.0F});
+            }
         }
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-        if (!allInputsReady) BuildReduceDependencies(args, firstRoute, owned * TopK, inverseUb, dependenciesUb);
+        if (!allInputsReady) BuildReduceDependencies(args, firstRoute, routes, inverseUb, dependenciesUb);
     }
     for (uint32_t word = 0U; word < Ub::issuedBytes / 4U; ++word) issued.SetValue(word, 0U);
     if (!allInputsReady) {
@@ -671,7 +699,7 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uin
                 ++probes;
             }
             if (!allInputsReady &&
-                !GenericTryReduceToken<TopK>(args, dependenciesUb, remoteCache, selfCache, token * TopK)) {
+                !GenericTryReduceToken<TopK>(args, dependenciesUb, remoteCache, selfCache, token * topk, topk)) {
                 // Keep prior ready tokens moving while inspecting other work.
                 if (pipeline.HasPending()) pipeline.ConsumeOne();
                 continue;
@@ -708,9 +736,15 @@ struct NoReduceObserver {
 template <bool KeepFp32 = false, class T, class O>
 __aicore__ inline void ReduceGeneric(const Arguments& a, uint32_t worker, uint32_t workers, T& timer, O& observer)
 {
-    for (uint32_t col = 0; col < a.config.hidden; col += GenericReduce::ReduceUbContract::hidden) {
-        // Native/API validation guarantees [1,8]. Compile-time strides retain
-        // constant division and loop bounds; no per-route runtime TopK division.
+    using Ub = GenericReduce::ReduceUbContract;
+    if (a.config.topk == 0U ||
+        (a.config.topk > Ub::legacyTopk &&
+         (a.config.world != 8U || a.config.bs > kEp8WindowTokens || a.config.topk > kEp8MaxTopk ||
+          a.config.maxPeerChunks > kMaxPeerChunks || workers < GenericReduce::kEp8ReduceWorkers))) {
+        aclshmemi_kernel_abort("MegaMoE URMA Reduce shape is outside the UB contract\n");
+        return;
+    }
+    for (uint32_t col = 0; col < a.config.hidden; col += Ub::hidden) {
         switch (a.config.topk) {
             case 1:
                 GenericReduce::ReduceColumns<KeepFp32, 1>(a, worker, workers, col, timer, observer);
@@ -735,6 +769,9 @@ __aicore__ inline void ReduceGeneric(const Arguments& a, uint32_t worker, uint32
                 break;
             case 8:
                 GenericReduce::ReduceColumns<KeepFp32, 8>(a, worker, workers, col, timer, observer);
+                break;
+            default:
+                GenericReduce::ReduceColumns<KeepFp32, 0>(a, worker, workers, col, timer, observer);
                 break;
         }
     }

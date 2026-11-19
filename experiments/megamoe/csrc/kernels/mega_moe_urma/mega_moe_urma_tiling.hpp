@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
 
 namespace MegaMoeUrma {
 // Fixed descriptor/cache capacity. The active communicator is Config::world.
@@ -16,12 +17,17 @@ constexpr uint32_t kLocalWorkers = 2U * kAic;
 // EP16 bounds/defaults; active work partitions are derived from Config::world.
 constexpr uint32_t kCommunicationWorkers = kWorld - 1U;
 constexpr uint32_t kActivationWorkers = kAic - kCommunicationWorkers;
-// Host planner limit and per-peer Combine scan metadata capacity.
+// The full-batch path retains its original limits. The EP8 GELU path issues
+// one token window at a time, so its higher TopK fits the same peer scratch.
 constexpr uint32_t kMaxTokensPerRank = 16384U;
+constexpr uint32_t kEp8WindowTokens = 256U;
+constexpr uint32_t kEp8MaxTopk = 32U;
 constexpr uint32_t kMaxPeerChunks = kMaxTokensPerRank * 8U / 128U;
 // One source contributes at most BS16384 * TopK8 rows; every reorder span
 // contains at least one row. Each peer therefore needs at most 16KiB of bits.
 constexpr uint32_t kMaxPeerReorderSpans = kMaxTokensPerRank * 8U;
+static_assert((kEp8WindowTokens * kEp8MaxTopk + 127U) / 128U <= kMaxPeerChunks);
+static_assert(kEp8WindowTokens * kEp8MaxTopk <= kMaxPeerReorderSpans);
 constexpr uint64_t kFlagBytes = 128;
 // Per-invocation counters in localFlags, cleared before the start handshake.
 constexpr uint32_t kLocalFlagDispatchDone = 0U;
@@ -210,6 +216,7 @@ struct PackRound {
 
 struct Config {
     uint32_t topkWeightsType, dispatchScaleStride;
+    uint32_t activationMode = static_cast<uint32_t>(DEEPEP_MEGAMOE_IMPL_NAMESPACE::MegaMoeActMode::SWIGLU);
     uint32_t bs;
     uint32_t hidden;
     uint32_t intermediate;

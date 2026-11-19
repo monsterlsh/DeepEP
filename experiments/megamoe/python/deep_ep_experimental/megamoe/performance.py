@@ -344,16 +344,19 @@ def read_profiled_kernels(directory, expected_samples):
     return samples
 
 
-def measure_profiled_forward(forward, *, warmup, iters, guard, directory, fine_forward=None):
+def measure_profiled_forward(forward, *, warmup, iters, guard, directory, fine_forward=None, windows_per_forward=1):
     """Profile one guarded continuous block, with no Events or per-round sync.
 
     The optional fine call runs once after formal iterations in the same
-    profiler context and is excluded from formal statistics.
+    profiler context and is excluded from formal statistics. Each logical
+    iteration sums the kernel durations of its consecutive token windows.
     """
     import torch_npu
 
     if type(warmup) is not int or warmup < 0 or type(iters) is not int or iters < 1:
         raise ValueError("warmup must be a nonnegative integer and iters a positive integer")
+    if type(windows_per_forward) is not int or windows_per_forward < 1:
+        raise ValueError("windows_per_forward must be a positive integer")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     profiler = torch_npu.profiler
@@ -386,23 +389,25 @@ def measure_profiled_forward(forward, *, warmup, iters, guard, directory, fine_f
             fine_forward()
         guard.end()
         capture.step()
-    modes = ["fine"] if fine_forward is not None else []
-    samples = read_profiled_kernels(directory, warmup + iters + len(modes))
-    for iteration, sample in enumerate(samples):
+    formal_end = warmup + iters
+    has_fine = fine_forward is not None
+    samples = read_profiled_kernels(directory, (formal_end + has_fine) * windows_per_forward)
+    for index, sample in enumerate(samples):
+        iteration, window = divmod(index, windows_per_forward)
         sample["iteration"] = iteration
-        sample["phase"] = (
-            "warmup"
-            if iteration < warmup
-            else "formal"
-            if iteration < warmup + iters
-            else modes[iteration - warmup - iters]
-        )
-    diagnostics = dict(zip(modes, samples[warmup + iters :]))
+        sample["window"] = window
+        sample["phase"] = "warmup" if iteration < warmup else "formal" if iteration < formal_end else "fine"
+    durations = [
+        math.fsum(sample["duration_us"] for sample in samples[begin : begin + windows_per_forward])
+        for begin in range(warmup * windows_per_forward, formal_end * windows_per_forward, windows_per_forward)
+    ]
+    # The public forward attaches the diagnostic timer only to window zero.
+    diagnostic = samples[formal_end * windows_per_forward] if has_fine else None
     return dict(
         samples=samples,
-        durations_us=[sample["duration_us"] for sample in samples[warmup : warmup + iters]],
-        diagnostics=diagnostics,
-        diagnostic_sample=samples[-1] if modes else None,
+        durations_us=durations,
+        diagnostics={"fine": diagnostic} if has_fine else {},
+        diagnostic_sample=diagnostic,
         profile_dir=str(directory),
     )
 

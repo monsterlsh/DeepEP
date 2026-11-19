@@ -12,8 +12,35 @@
 // peermem 窗口的布局与尺寸（含 HOST_DEVICE / GM_ADDR 宏与基础 include）。
 #include "kernels/mega_moe_common/implementation_namespace.hpp"
 #include "kernels/mega_moe_common/common/mega_moe_peermem.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_wave_window.hpp"
 
 namespace DEEPEP_MEGAMOE_IMPL_NAMESPACE {
+
+HOST_DEVICE inline uint32_t MteWorkspaceWindowSlots(const MegaMoeTilingData& tilingData)
+{
+    const bool unsupported = tilingData.topoType != TOPO_TYPE_MTE || tilingData.combineQuantMode != COMBINE_NO_QUANT ||
+                             tilingData.groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
+                             tilingData.groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ;
+    return WaveWindowSlotCount(!unsupported, tilingData.groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4);
+}
+
+HOST_DEVICE inline uint64_t MteWorkspaceRowCapacity(const MegaMoeTilingData& tilingData)
+{
+    return WaveWindowRowCapacity(tilingData.maxOutputSize, tilingData.mGroupsPerWave,
+                                 MteWorkspaceWindowSlots(tilingData));
+}
+
+HOST_DEVICE inline bool MteWorkspaceWindowed(const MegaMoeTilingData& tilingData)
+{
+    return MteWorkspaceRowCapacity(tilingData) < tilingData.maxOutputSize;
+}
+
+HOST_DEVICE inline WaveRowMapping MteWaveRowMapping(const MegaMoeTilingData& tilingData, uint64_t waveId,
+                                                    uint64_t logicalStart)
+{
+    return MakeWaveRowMapping(tilingData.maxOutputSize, MteWorkspaceRowCapacity(tilingData),
+                              tilingData.mGroupsPerWave, MteWorkspaceWindowSlots(tilingData), waveId, logicalStart);
+}
 
 constexpr int64_t EXCEPTION_DUMP_REGION_SIZE = 60 * 1024LL;  // 异常dump区
 constexpr int64_t SIZE_INT_8 = 1U;
@@ -73,15 +100,24 @@ private:
     HOST_DEVICE void InitializeWorkspaceLayout(GM_ADDR base, const MegaMoeTilingData* tilingData, uint32_t serverNum)
     {
         workspaceSize = 0;
+        const int64_t rowCapacity = static_cast<int64_t>(MteWorkspaceRowCapacity(*tilingData));
+        const int64_t dispatchElementsPerByte = tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
+                                                        tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ
+                                                    ? 2
+                                                    : 1;
+        // 混合 A4W4 的 ActivationQuant 提升为 FP8；仅泛型 A4W4_NZ 保持 FP4 激活输出。
+        const int64_t activationElementsPerByte =
+            tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ ? 2 : 1;
         dispatchRevDataPtr = base;
-        workspaceSize += Ops::Base::CeilAlign(SIZE_INT_8 * tilingData->maxOutputSize * tilingData->h, ALIGN_512);
+        workspaceSize += Ops::Base::CeilAlign(
+            SIZE_INT_8 * rowCapacity * tilingData->h / dispatchElementsPerByte, ALIGN_512);
         dispatchRevScalePtr = base + workspaceSize;
 
         int64_t dispatchScaleElementsPerToken =
             Ops::Base::CeilDiv(static_cast<int64_t>(tilingData->h), static_cast<int64_t>(MXFP_DIVISOR_SIZE)) *
             MXFP_MULTI_BASE_SIZE;
         workspaceSize +=
-            Ops::Base::CeilAlign(SIZE_INT_8 * tilingData->maxOutputSize * dispatchScaleElementsPerToken, ALIGN_512);
+            Ops::Base::CeilAlign(SIZE_INT_8 * rowCapacity * dispatchScaleElementsPerToken, ALIGN_512);
 
         if (tilingData->topkWeightsPrefetch == 1 && tilingData->topoType == TOPO_TYPE_URMA) {
             dispatchRevWeightsPtr = base + workspaceSize;
@@ -92,12 +128,13 @@ private:
         }
 
         activationQuantDataPtr = base + workspaceSize;
-        workspaceSize += Ops::Base::CeilAlign(
-            SIZE_INT_8 * tilingData->maxOutputSize * tilingData->hiddenDim / ACTIVATION_N_HALF, ALIGN_512);
+        workspaceSize += Ops::Base::CeilAlign(SIZE_INT_8 * rowCapacity * tilingData->hiddenDim /
+                                                  ActivationFactor(tilingData->actMode) / activationElementsPerByte,
+                                              ALIGN_512);
 
         activationQuantScalePtr = base + workspaceSize;
         workspaceSize += Ops::Base::CeilAlign(
-            SIZE_INT_8 * tilingData->maxOutputSize * tilingData->hiddenDim / ACTIVATION_N_HALF / MXFP_SCALE_GROUP_NUM,
+            SIZE_INT_8 * rowCapacity * tilingData->hiddenDim / ActivationFactor(tilingData->actMode) / MXFP_SCALE_GROUP_NUM,
             ALIGN_512);
 
         expertRevTokenNumsPtr = base + workspaceSize;
@@ -112,7 +149,7 @@ private:
         workspaceSize += Ops::Base::CeilAlign(expertCountWorkspaceBytes, ALIGN_512);
 
         metaInfoPtr = base + workspaceSize;
-        workspaceSize += Ops::Base::CeilAlign(tilingData->maxOutputSize * ALIGN_32, ALIGN_512);
+        workspaceSize += Ops::Base::CeilAlign(rowCapacity * ALIGN_32, ALIGN_512);
 
         // 以下三组 flag 仅由 MoE 专家使用；共享专家路径不使用这些 flag。
         const bool useMteWaveCombine = tilingData->topoType == TOPO_TYPE_MTE;
@@ -211,11 +248,11 @@ private:
                              tilingData->aicNum;
         }
         if (tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 || tilingData->topkWeightsPrefetch == 1) {
-            // gmm1MmadRes：GMM1 matmul 输出，布局为 maxOutputSize × hiddenDim 个 BF16。
+            // gmm1MmadRes：GMM1 matmul 输出，布局为 rowCapacity × hiddenDim 个 BF16。
             gmm1MmadResPtr = base + workspaceSize;
-            workspaceSize += SIZE_BF_16 * tilingData->maxOutputSize * tilingData->hiddenDim;
+            workspaceSize += SIZE_BF_16 * rowCapacity * tilingData->hiddenDim;
         }
-        // gmm2MmadRes：GMM2 matmul 输出，布局为 maxOutputSize × h 个 BF16；
+        // gmm2MmadRes：GMM2 matmul 输出，布局为 rowCapacity × h 个 BF16；
         // A8W4 GMM1、A4W4 混合路径、A4W4_NZ 和 Combine 量化路径需要该区域。
         if (tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 ||
             tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
@@ -226,11 +263,9 @@ private:
                 workspaceSize = Ops::Base::CeilAlign(workspaceSize, static_cast<int64_t>(ALIGN_512));
             }
             gmm2MmadResPtr = base + workspaceSize;
-            // MTE wave 路径为每个 MoE token 行分配独立的 [H] BF16
-            // 区域，生命周期覆盖整个 kernel。它不是 batch 或 ring slot，
-            // 因此 AIC 推进游标前不需要等待 consumer ACK。
-            int64_t gmm2OutputBytes = static_cast<int64_t>(SIZE_BF_16) *
-                                      static_cast<int64_t>(tilingData->maxOutputSize) *
+            // MTE wave 路径只保留在途 wave；复用前由全角色 wave 屏障保证
+            // 上一个同槽 wave 的 GMM2/Combine 已排空。
+            int64_t gmm2OutputBytes = static_cast<int64_t>(SIZE_BF_16) * rowCapacity *
                                       static_cast<int64_t>(tilingData->h);
             workspaceSize += useMteWaveCombine ? Ops::Base::CeilAlign(gmm2OutputBytes, static_cast<int64_t>(ALIGN_512))
                                                : gmm2OutputBytes;
@@ -301,12 +336,12 @@ private:
             // sharedExpertActivationData：SwiGLU 量化输出 [sharedExpertNum × bs × hiddenDim / 2] FP8。
             sharedExpertActivationDataPtr = base + workspaceSize;
             workspaceSize += Ops::Base::CeilAlign(
-                SIZE_INT_8 * tilingData->bs * tilingData->sharedExpertNum * tilingData->hiddenDim / ACTIVATION_N_HALF,
+                SIZE_INT_8 * tilingData->bs * tilingData->sharedExpertNum * tilingData->hiddenDim / ActivationFactor(tilingData->actMode),
                 ALIGN_512);
             // sharedExpertActivationScale：SwiGLU scale [sharedExpertNum × bs × hiddenDim / 2 / 32]。
             sharedExpertActivationScalePtr = base + workspaceSize;
             workspaceSize += Ops::Base::CeilAlign(SIZE_INT_8 * tilingData->bs * tilingData->sharedExpertNum *
-                                                      tilingData->hiddenDim / ACTIVATION_N_HALF / MXFP_SCALE_GROUP_NUM,
+                                                      tilingData->hiddenDim / ActivationFactor(tilingData->actMode) / MXFP_SCALE_GROUP_NUM,
                                                   ALIGN_512);
         }
     }

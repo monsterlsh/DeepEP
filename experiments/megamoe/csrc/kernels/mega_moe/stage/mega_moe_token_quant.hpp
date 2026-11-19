@@ -85,7 +85,7 @@ __aicore__ inline void LoadTopkWeightsToUb(const Params& params, const QuantProc
 }
 
 // 原型：MegaMoe::QuantProcessInRank。量化一个逻辑 AIV 任务负责的本卡 token。
-// FP8 输入只重排为原来的逐 token 通信记录；不解量化、不重复量化。
+// 预量化 FP8/打包 FP4 输入只重排通信记录；不解量化、不重复量化。
 template <typename ActivationType, bool TopkWeightsPrefetch = false>
 __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidden, const Params& params,
                                           const QuantProcessConfig& config,
@@ -96,6 +96,7 @@ __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidde
     scales.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(params.inputScaleGmAddr));
     output.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(params.peermemInfo.quantTokenScalePtr));
     const uint32_t scaleBytes = config.quantScaleNumAlignPerToken;
+    const uint32_t inputBytes = hidden / PackedElementTraits<ActivationType>::ELEMENTS_PER_BYTE;
     SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
     SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
     for (uint32_t index = 0; index < range.count; ++index) {
@@ -104,7 +105,7 @@ __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidde
         auto buffer = (index % DOUBLE_BUFFER == 0 ? scratch.xOutTensor0 : scratch.xOutTensor1)
                           .template ReinterpretCast<uint8_t>();
         WaitFlag<HardEvent::MTE3_MTE2>(event);
-        DataCopyPad(buffer, input[row * hidden], {1U, hidden, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+        DataCopyPad(buffer, input[row * inputBytes], {1U, inputBytes, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
         DataCopyPad(buffer[config.quantTokenAlignBytes], scales[row * scaleBytes], {1U, scaleBytes, 0U, 0U, 0U},
                     {false, 0U, 0U, 0U});
         if constexpr (TopkWeightsPrefetch) {

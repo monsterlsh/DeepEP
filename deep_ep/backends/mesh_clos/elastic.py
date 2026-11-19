@@ -14,6 +14,8 @@ from ..._runtime import Runtime, rank_and_world, runtime_of, warn_unclosed
 from ..._machine import HandleSelector
 from ..._compat import public_keywords
 from ._elastic_layout import (
+    MAX_TOKENS_PER_RANK,
+    MAX_TOPK,
     combine_layout,
     dispatch_layout,
     elastic_size_hint,
@@ -237,8 +239,8 @@ class ElasticBuffer:
             raise TypeError("use_fp8_dispatch must be bool")
         if explicitly_destroy is not True:
             raise NotImplementedError("Runtime currently requires explicitly_destroy=True")
-        integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 0, 16384)
-        integer("num_topk", num_topk, 0, 16)
+        integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 0, MAX_TOKENS_PER_RANK)
+        integer("num_topk", num_topk, 0, MAX_TOPK)
         integer("hidden", hidden, 0, 7168)
         if hidden:
             validate_hidden(hidden, use_fp8_dispatch)
@@ -302,25 +304,34 @@ class ElasticBuffer:
         machine_type: str = "auto",
         rootinfo_path: Optional[str] = None,
     ) -> int:
-        """Two SHMEM arenas sized for 1024 experts and four times average rows.
+        """Two SHMEM arenas sized for the worst-case token rows.
 
-        Heavier skew requires explicit num_bytes; dispatch checks actual counts
-        before payload launch. Size hints include weights and optional FP8 scales; combine
-        uses BF16 expert and gateway rows in the reserved second half. Both operators
-        are included at every supported shape; actual allocation depends on the runtime.
+        A rank receives each source token at most once, so ``server_partial``
+        reserves the power-of-two stride over ``world * num_max_tokens_per_rank``.
+        ``gather_input`` and ``returned_partial`` reserve the average route rows
+        ``num_max_tokens_per_rank * num_topk``; heavier expanded skew requires an
+        explicit ``num_bytes``. Size hints include weights and optional FP8
+        scales. Both operators are included at every supported shape; actual
+        allocation depends on the runtime.
         """
         require_native("ElasticBuffer.get_buffer_size_hint")
         validate_hidden(hidden, use_fp8_dispatch)
         if allow_hybrid_mode is not True or allow_multiple_reduction is not True:
             raise NotImplementedError("Dispatch sizing supports only default algorithm options")
+        if num_topk <= 0:
+            raise ValueError("num_topk must be positive to size the route rows")
         _, world = rank_and_world(group, 0 if group is None else None, world_size)
+        tokens = num_max_tokens_per_rank
+        # The receive side uses a power-of-two stride; topk=1 must stay within the route bound.
+        receive_rows = min(1 << (world * tokens - 1).bit_length(), world * tokens * num_topk)
+        route_rows = tokens * num_topk
         return elastic_size_hint(
             world,
             num_max_tokens_per_rank,
             num_topk,
             1024,
-            min(world, 4) * num_max_tokens_per_rank * num_topk,
-            min(world, 4) * num_max_tokens_per_rank * num_topk,
+            receive_rows,
+            route_rows,
             use_fp8_dispatch,
             hidden,
         )
@@ -869,7 +880,7 @@ class ElasticBuffer:
                 num_max_tokens_per_rank = (
                     (bound or tokens) if num_max_tokens_per_rank is None else num_max_tokens_per_rank
                 )
-                integer("num_max_tokens_per_rank", num_max_tokens_per_rank, tokens, 16384)
+                integer("num_max_tokens_per_rank", num_max_tokens_per_rank, tokens, MAX_TOKENS_PER_RANK)
                 if bound and num_max_tokens_per_rank > bound:
                     raise ValueError("Input/capacity exceeds the buffer token bound")
                 if self.num_topk and self.num_topk != topk:
@@ -1419,7 +1430,7 @@ class ElasticBuffer:
                     raise ValueError("topk_weights must be contiguous FP32 [T,K] without grad")
                 bound = self.num_max_tokens_per_rank
                 capacity = (bound or tokens) if capacity is None else capacity
-                integer("num_max_tokens_per_rank", capacity, tokens, 16384)
+                integer("num_max_tokens_per_rank", capacity, tokens, MAX_TOKENS_PER_RANK)
                 if bound and (tokens > bound or capacity > bound):
                     raise ValueError("Input/capacity exceeds the buffer token bound")
                 if self.num_topk and self.num_topk != topk:

@@ -17,10 +17,12 @@ from deep_ep_experimental.megamoe import golden
 from deep_ep_experimental.megamoe.benchmark import accuracy, inputs
 from deep_ep_experimental.megamoe.reference import (
     bf16,
+    dequantize_activation,
     dequantize_input,
     expert_forward,
     local_reference,
     make_weights,
+    quantize_activation,
     quantize_input,
     unpack_weight,
 )
@@ -41,6 +43,7 @@ def config():
 def naive(config, world, source, bs, routing, check_tokens):
     """Old per-source/per-owner oracle, with no cached/batched Golden implementation."""
     model = config["model"]
+    activation, mma_type = model.get("activation", "swiglu"), model.get("mma_type", "fp8xfp4")
     local = model["num_experts"] // world
     counts = sum(
         np.bincount(inputs(config, r, bs, routing, world=world)[1].ravel(), minlength=model["num_experts"])
@@ -48,17 +51,26 @@ def naive(config, world, source, bs, routing, check_tokens):
     )
     x, ids, weights = inputs(config, source, bs, routing, world=world)
     selected = golden.token_indices(bs, check_tokens)
-    x = dequantize_input(*quantize_input(x[selected]))
+    x = dequantize_activation(*quantize_activation(x[selected], mma_type), mma_type)
     result = np.zeros_like(x)
     for owner in range(world):
-        raw = make_weights(local, model["hidden"], model["intermediate_hidden"], config["seed"] + owner)
-        result += local_reference(x, ids[selected], weights[selected], *map(unpack_weight, raw), owner * local)
+        raw = make_weights(local, model["hidden"], model["intermediate_hidden"], config["seed"] + owner, activation)
+        result += local_reference(
+            x,
+            ids[selected],
+            weights[selected],
+            *map(unpack_weight, raw),
+            owner * local,
+            activation,
+            mma_type,
+            model.get("topk_weights_type", 0),
+        )
     if model["num_shared_experts"]:
         raw = make_weights(
-            model["num_shared_experts"], model["hidden"], model["intermediate_hidden"], config["seed"] + 100000
+            model["num_shared_experts"], model["hidden"], model["intermediate_hidden"], config["seed"] + 100000, activation
         )
         for w1, w2 in zip(*map(unpack_weight, raw)):
-            result += expert_forward(x, w1, w2)
+            result += expert_forward(x, w1, w2, model.get("activation_clamp"), activation=activation, mma_type=mma_type)
     return bf16(result), counts[source * local : (source + 1) * local], selected
 
 
@@ -267,3 +279,20 @@ def test_early_weights_shared_expert_unweighted_and_cache_contract(config):
     changed = copy.deepcopy(config)
     changed["model"]["topk_weights_type"] = 0
     assert golden.contract(changed, 2, 7, "fp8", "random", 0) != spec
+
+
+@pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8", "fp4xfp4"])
+def test_gelu_prequant_weights_all_precisions_match_independent_oracle(config, mma_type):
+    config["model"].update(activation="gelu", mma_type=mma_type)
+    config["model"]["num_shared_experts"] = 0 if mma_type == "fp4xfp4" else 1
+    input_kind = "fp4" if mma_type == "fp4xfp4" else "fp8"
+    spec = golden.contract(config, 2, 7, input_kind, "random", 0)
+    assert spec["numerical_contract"] == "ascend_pre_quant_route_weight_v1"
+    actual = golden.generate(config, spec, [0, 1], workers=2, chunk_tokens=2)
+    for rank in (0, 1):
+        expected = naive(config, 2, rank, 7, "random", 0)
+        for value, reference in zip(actual[rank], expected):
+            np.testing.assert_array_equal(value, reference)
+    changed = copy.deepcopy(config)
+    changed["model"]["activation"] = "swiglu"
+    assert golden.contract(changed, 2, 7, input_kind, "random", 0) != spec

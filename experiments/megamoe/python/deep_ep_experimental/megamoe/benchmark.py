@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 
 from .timer.__main__ import parse_ranks
+from .numerics import prequant_route_weight
 from .performance import alignment_config, collect_profile, enqueue_batch, flush_l2_before_call, summarize_rounds
 
 
@@ -25,16 +26,29 @@ def load_config(name, bs_values=None):
     required = {"schema_version", "model", "bs_values", "warmup", "iters", "seed"}
     if not required <= set(config) or set(config) - required - {"alignment"} or config["schema_version"] != 1:
         raise ValueError("Invalid config schema; see the packaged smoke.json")
-    if set(config["model"]) - {"shared_intermediate_hidden", "shared_output_rounding", "activation_clamp", "topk_weights_type"} != {
-        "hidden",
-        "intermediate_hidden",
-        "num_experts",
-        "num_topk",
-        "num_shared_experts",
-    }:
+    optional = {
+        "shared_intermediate_hidden",
+        "shared_output_rounding",
+        "activation_clamp",
+        "topk_weights_type",
+        "activation",
+        "mma_type",
+    }
+    if set(config["model"]) - optional != {"hidden", "intermediate_hidden", "num_experts", "num_topk", "num_shared_experts"}:
         raise ValueError("Model must specify H, intermediate width, global experts, top-k and shared experts")
     from .numerics import normalize_clamp
-    normalize_clamp(config["model"].get("activation_clamp"))
+
+    model = config["model"]
+    if model.get("activation", "swiglu") not in ("swiglu", "gelu"):
+        raise ValueError("activation must be 'swiglu' or 'gelu'")
+    mma_type = model.get("mma_type", "fp8xfp4")
+    if mma_type == "fp4xfp4":
+        raise ValueError("A4W4 (mma_type='fp4xfp4') is not enabled")
+    if mma_type not in ("fp8xfp4", "fp8xfp8"):
+        raise ValueError("mma_type must be fp8xfp4 or fp8xfp8")
+    if model.get("activation") == "gelu" and "activation_clamp" in model:
+        raise ValueError("activation_clamp is only defined for SwiGLU")
+    normalize_clamp(model.get("activation_clamp"))
     route_mode = config["model"].get("topk_weights_type", 0)
     if type(route_mode) is not int or route_mode not in (0, 1):
         raise ValueError("topk_weights_type must be 0 or 1")
@@ -194,7 +208,7 @@ def main():
     parser.add_argument("--config", default="smoke", help="Packaged name or JSON path")
     parser.add_argument("--bs-values", help="Only model config override, e.g. 96,4096")
     parser.add_argument("--mode", choices=("accuracy", "perf"), default="accuracy")
-    parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
+    parser.add_argument("--input", choices=("bf16", "fp8", "fp4"), default="bf16")
     parser.add_argument(
         "--routing",
         choices=("balanced", "random", "skewed", "random-balanced"),
@@ -237,7 +251,7 @@ def run(args, config, group):
     urma = backend == "urma"
     import torch
     from .api import SymmBuffer, fp8_fp4_mega_moe, transform_weights_for_mega_moe
-    from .reference import make_weights, quantize_input
+    from .reference import make_weights, quantize_activation
     from .validation import collective_check
 
     rank, world = group.rank(), group.size()
@@ -257,8 +271,12 @@ def run(args, config, group):
             bool(getattr(args, "dual_reference", False)),
         ),
     )
-    if urma and args.input != "fp8":
-        raise ValueError("URMA currently supports --input fp8; BF16 input remains a MTE capability")
+    mma_type = config["model"].get("mma_type", "fp8xfp4")
+    storage_kind = "fp4" if mma_type == "fp4xfp4" else "fp8"
+    if args.input != "bf16" and args.input != storage_kind:
+        raise ValueError(f"{mma_type} buffered input must be {storage_kind}")
+    if urma and (args.input != "fp8" or mma_type != "fp8xfp4"):
+        raise ValueError("URMA supports routed FP8xFP4 with --input fp8; other input/precision modes require MTE")
     timer_ranks = args.timer_ranks if args.timer_ranks is not None else list(range(min(world, 8)))
     if any(value >= world for value in timer_ranks):
         raise ValueError("timer rank exceeds EP world size")
@@ -297,7 +315,9 @@ def run(args, config, group):
         backend=backend,
         device_communication="shmem_mte_udma" if urma else "shmem_mte",
         api="fp8_fp4_mega_moe",
-        numerical_contract=("ascend_pre_quant_route_weight_v1" if config["model"].get("topk_weights_type", 0) else "ascend_post_gmm2_route_weight_v1"),
+        numerical_contract=(
+            "ascend_pre_quant_route_weight_v1" if prequant_route_weight(config["model"]) else "ascend_post_gmm2_route_weight_v1"
+        ),
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
     )
@@ -324,17 +344,33 @@ def run(args, config, group):
         ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
         **{k: v for k, v in model.items() if k not in ("shared_intermediate_hidden", "shared_output_rounding", "activation_clamp")},
     )
+    if urma:
+        windows_by_bs = {bs: buffer.num_forward_windows(bs) for bs in config["bs_values"]}
+        manifest.update(
+            windows_per_forward_by_bs=windows_by_bs,
+            kernel_duration_scope="sum_of_window_kernels_per_forward",
+            timer_scope="first_window_only" if args.timer else "disabled",
+        )
+        (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     def device_pair(pair):
         data, scale = pair
-        return (torch.from_numpy(data).npu(), torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
+        if mma_type == "fp8xfp8":
+            from .reference import expand_fp4_to_fp8
+
+            data, scale = expand_fp4_to_fp8(pair)
+        codes = torch.from_numpy(data).npu()
+        if mma_type == "fp8xfp8":
+            codes = codes.view(torch.float8_e4m3fn)
+        return codes, torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu)
 
     if args.timer and not buffer.timer_enabled:
         raise RuntimeError("Timer requires a W4A8 wheel built with DEEPEP_MEGAMOE_TIMER=ON")
+    activation_name = model.get("activation", "swiglu")
     raw = make_weights(
-        model["num_experts"] // world, model["hidden"], model["intermediate_hidden"], config["seed"] + rank
+        model["num_experts"] // world, model["hidden"], model["intermediate_hidden"], config["seed"] + rank, activation_name
     )
-    prepared = transform_weights_for_mega_moe(*map(device_pair, raw))
+    prepared = transform_weights_for_mega_moe(*map(device_pair, raw), activation=activation_name)
     shared_raw, shared_kwargs = None, {}
     if model["num_shared_experts"]:
         shared_raw = make_weights(
@@ -342,6 +378,7 @@ def run(args, config, group):
             model["hidden"],
             model.get("shared_intermediate_hidden", model["intermediate_hidden"]),
             config["seed"] + 100000,
+            activation_name,
         )
 
         def shared_pair(pair):
@@ -352,7 +389,7 @@ def run(args, config, group):
             data, scale = device_pair(expand_fp4_to_fp8(pair))
             return data.view(torch.float8_e4m3fn), scale
 
-        shared = transform_weights_for_mega_moe(*map(shared_pair, shared_raw), shared=True)
+        shared = transform_weights_for_mega_moe(*map(shared_pair, shared_raw), activation=activation_name, shared=True)
         shared_kwargs = dict(shared_l1_weights=shared[0], shared_l2_weights=shared[1])
     cascade = None
     cascade_owned = False
@@ -377,8 +414,9 @@ def run(args, config, group):
         if args.input == "bf16":
             activation = torch.from_numpy(x).to(device="npu", dtype=torch.bfloat16)
         else:
-            data, scale = quantize_input(x)
-            buffer.x[:bs].copy_(torch.from_numpy(data).npu().view(torch.float8_e4m3fn))
+            data, scale = quantize_activation(x, mma_type)
+            codes = torch.from_numpy(data).npu()
+            buffer.x[:bs].copy_(codes if mma_type == "fp4xfp4" else codes.view(torch.float8_e4m3fn))
             buffer.x_sf[:bs].copy_(torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
             activation = None
         buffer.topk_idx[:bs].copy_(torch.from_numpy(ids))
@@ -396,6 +434,7 @@ def run(args, config, group):
                 cumulative_local_expert_recv_stats=stats,
                 x=activation,
                 timer=timer,
+                activation=activation_name,
                 activation_clamp=model.get("activation_clamp"),
                 **shared_kwargs,
             )
@@ -508,11 +547,16 @@ def run(args, config, group):
                 guard=guard,
                 directory=case / "profiler",
                 fine_forward=(lambda: call(timer)) if args.timer else None,
+                windows_per_forward=windows_by_bs[bs],
             )
             (case / "kernel_samples.json").write_text(json.dumps(capture["samples"], indent=2), encoding="utf-8")
             per_rank = group.all_gather(capture["durations_us"], f"profiling BS={bs}")
             report = summarize_profile_rounds(per_rank, int(os.environ.get("LOCAL_WORLD_SIZE", world)))
-            report.update(includes_device_routing=True)
+            report.update(
+                includes_device_routing=True,
+                windows_per_forward=windows_by_bs[bs],
+                kernel_duration_scope=manifest["kernel_duration_scope"],
+            )
             (case / "performance.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         else:
             samples = collect_profile(call, group, torch, config, prefix, case / "profiler", bs)

@@ -3,6 +3,9 @@
 """Host workspace layouts for Elastic Notify, dispatch and combine."""
 
 WORLD_SIZES = (2, 4, 8, 16, 32, 64, 128, 256, 512)
+# Public HT shape limits, mirrored by csrc/kernels/ht_limits.h.
+MAX_TOKENS_PER_RANK = 65536
+MAX_TOPK = 32
 MAX_BYTES = (1 << 63) - 1
 PAGE_BYTES = 2 << 20
 
@@ -23,8 +26,8 @@ def workspace_layout(world, tokens, topk, experts=1024, chunk_tokens=256):
     """Mirror MakeNotifyTiling; launch also compares this with the native result."""
     if type(world) is not int or world not in WORLD_SIZES:
         raise ValueError("Notify supports EP2/4/8/16/32/64/128/256/512")
-    integer("tokens", tokens, 1, 16384)
-    integer("topk", topk, 1, 16)
+    integer("tokens", tokens, 1, MAX_TOKENS_PER_RANK)
+    integer("topk", topk, 1, MAX_TOPK)
     integer("experts", experts, world, 1024)
     if experts % world:
         raise ValueError("num_experts must be divisible by EP")
@@ -128,8 +131,8 @@ def _combine_resident_bytes(world, tokens, chunk_tokens=256):
 def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256, hidden=7168):
     if world not in WORLD_SIZES:
         raise ValueError("Combine supports EP2/4/8/16/32/64/128/256/512")
-    integer("tokens", tokens, 1, 16384)
-    integer("topk", topk, 1, 16)
+    integer("tokens", tokens, 1, MAX_TOKENS_PER_RANK)
+    integer("topk", topk, 1, MAX_TOPK)
     integer("rows", rows, 1, world * tokens * topk)
     integer("gather_rows", gather_rows, 1, world * tokens * topk)
     integer("chunk_tokens", chunk_tokens, 1, 16384)

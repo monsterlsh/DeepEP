@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "kernels/ht_limits.h"
 #include "kernels/notify/launch.hpp"
 #include "kernels/notify/tiling.hpp"
 #include "kernels/notify/profile.hpp"
@@ -24,11 +25,12 @@ ascend_deepep::NotifyTiling tiling(int rank, int world, int tokens, int topk, in
                                    uint32_t num_cores)
 {
     if (world < 2 || world > 512 || (world & (world - 1)) || rank < 0 || rank >= world || tokens < 1 ||
-        tokens > 16384 || (chunk_tokens != 256 && chunk_tokens != 512 && chunk_tokens != 1024) || topk < 1 ||
-        topk > 16 || experts < world || experts > 1024 || experts % world ||
+        tokens > ascend_deepep::kHtMaxTokensPerRank ||
+        (chunk_tokens != 256 && chunk_tokens != 512 && chunk_tokens != 1024) || topk < 1 ||
+        topk > ascend_deepep::kHtMaxTopk || experts < world || experts > 1024 || experts % world ||
         uint64_t(world) * tokens * topk >= (1ULL << 31)) {
         throw std::invalid_argument(
-            "Notify requires EP2..512 powers of two, T1..16384, K1..16, "
+            "Notify requires EP2..512 powers of two, T1..65536, K1..32, "
             "E<=1024 divisible by EP, and EP*T*K < 2**31");
     }
     if (num_cores != 32U && num_cores != 64U) {

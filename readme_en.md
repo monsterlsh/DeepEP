@@ -144,7 +144,7 @@ The script prepares dependencies and builds and installs a wheel with MegaMoE an
 
 Prefill and decode share `ElasticBuffer.dispatch()` / `combine()`. For supported configurations, `num_max_tokens_per_rank ≤ 256` uses low latency; other configurations use high throughput. This parameter is the per-rank token capacity, not the current token count.
 
-The BF16 example below assumes that the NPU device, SHMEM endpoint and EP process group `ep_group` are configured. The model supplies `x [T,H]` (BF16), `topk_idx [T,K]` (INT64) and `topk_weights [T,K]` (FP32) on the current NPU. All ranks use the same T/H/K, with `T ≤ max_tokens_per_rank` and an expert count divisible by the EP size. High throughput supports `0 < H ≤ 7168`: H must be divisible by 16 for BF16 or 128 for FP8, with 1≤K≤16.
+The BF16 example below assumes that the NPU device, SHMEM endpoint and EP process group `ep_group` are configured. The model supplies `x [T,H]` (BF16), `topk_idx [T,K]` (INT64) and `topk_weights [T,K]` (FP32) on the current NPU. All ranks use the same T/H/K, with `T ≤ max_tokens_per_rank` and an expert count divisible by the EP size. High throughput supports `0 < H ≤ 7168`: H must be divisible by 16 for BF16 or 128 for FP8, with 1≤K≤32.
 
 Low latency uses an 8 GiB workspace; for high throughput, the buffer estimates the capacity automatically.
 

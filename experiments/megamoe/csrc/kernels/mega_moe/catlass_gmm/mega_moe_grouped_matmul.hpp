@@ -224,8 +224,8 @@ public:
     __aicore__ inline void UpdateProblem(const ProblemConfig& config, const GMMAddrInfo& addr)
     {
         Pipeline::UpdateProblem(config, addr, addr.gmm1OutGlobal);
-        fused_ = ProblemConfig::FUSED_GATE_UP;
-        planarSingle_ = config.sharedPolicy.decode;
+        fused_ = ProblemConfig::FUSED_GATE_UP && config.activationFactor == ACTIVATION_N_HALF;
+        planarSingle_ = config.sharedPolicy.decode || config.activationFactor == ACTIVATION_N_SINGLE;
         halfN_ = config.outputN;
     }
     __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols)

@@ -8,9 +8,42 @@ Modified by Joyce_An 2026
 公开入口：`deep_ep_experimental.megamoe`。W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度。
 构建和多机测试入口位于本目录的 `scripts/`；机器地址及环境配置由使用者提供。
 
+## UBX 工作清单
+
+阶段 A 使用同一台 UBX 上的 8 个 rank、URMA、预量化 FP8 输入、FP4 路由专家和零共享专家。构造 `SymmBuffer`、准备 W1 和调用 `fp8_fp4_mega_moe` 时均传 `activation="gelu"`。各 rank 的实际 B 相同。
+
+| 状态 | 阶段 | 工作与验收条件 |
+| --- | --- | --- |
+| [x] | A · 计算 | 复用分支已有的单投影 W1。GMM1 输出按 BF16 舍入，FP32 计算 GELU 并乘当前 slot 的 `topk_weights`，再舍入、MXFP8 量化并进入 GMM2。源 rank 按原 slot 顺序用 FP32 累加，最后写 BF16。GELU 自动选择提前加权，阶段 A 显式传 0 会集体报错。 |
+| [x] | A · 路由 | 支持 `1 ≤ K ≤ min(32,E)`。K1–8 保留专用归约，K9–32 复用原有六槽流水，按实际 K 遍历。进入首个窗口前，全组核对 B、代号、张量形状和路由。拒绝越界 ID、同 token 重复专家和非有限权重，允许有限的零值及负权重。 |
+| [x] | A · 容量 | 对外 B 最大 65,536。Plan 按 `W=min(256, num_max_tokens_per_rank)` 分配工作区。源 rank 至多展开 W×K 行，目的 rank 为 8 个源预留 8×W×K 行。两个公开入口都复用同一个 Plan，尾窗按实际行数写入原输出，每次成功调用按专家汇总各窗计数。B=39,280 时为 153 个满窗和 112 行尾窗。 |
+| [x] | A · 本地回归 | Host C++ 执行设备侧路由与归约代码，覆盖 K1–32、空 peer、热点和非顺序回传行。CPU Golden 检查 GELU 与提前加权。API 测试覆盖满窗、尾窗、重复调用、跨 rank 拒绝非法输入和计划分配失败后的重试。 |
+| [ ] | A · 8 卡实机 | 用匹配 CANN 编译协议 12 的完整 wheel。在 EP8 上跑 K1/8/9/25/32 × B255/256/257，对比全量 BF16 输出与逐专家计数，覆盖均衡、热点和慢 rank。记录峰值 HBM、SHMEM 和端到端耗时。 |
+| [ ] | B · 16 卡机内 | 按可用 HBM 协商 256/128/64 窗口，扩展 EP16 的大 K 路径，验证 E800 下的热点、空接收 rank、跨窗复用及显存预算。 |
+| [ ] | C · 32 卡跨机 | 接入跨机数据与控制通路，验证远端完成、超时和窗口回收。最终按 EP32、每卡 B39280、E800、K25、H4096、I1536 全量比对，并以 K32 复验。 |
+
+本地回归可从仓库根目录执行：
+
+```shell
+python -m pytest -q experiments/megamoe/tests/test_public_api.py experiments/megamoe/tests/test_urma_ep8_routing.py experiments/megamoe/tests/test_urma_ep8_reduce.py experiments/megamoe/tests/test_reference.py experiments/megamoe/tests/test_golden.py experiments/megamoe/tests/test_performance.py
+```
+
+本轮 Windows 本地回归中，上述 194 项全部通过。MegaMoE 全套 257 项通过、10 项失败。10 项涉及 Linux 启动脚本或 Ascend SDK 打包环境，均在未修改的基线 `0647bd8` 上复现。设备编译、8 卡精度和性能仍待验收。
+
+已准备[单机 8 卡冒烟配置](python/deep_ep_experimental/megamoe/configs/stage_a_ep8_gelu_k25.json)，使用 E800、K25、H256、I256 和 B17/257。后续在设备上先生成 CPU Golden，再运行同配置的精度验证：
+
+```shell
+python -m deep_ep_experimental.megamoe.golden --config stage_a_ep8_gelu_k25 --ep-size 8 --ranks 0-7 --input fp8
+# 单机 SHMEM 引导端口，请选择本机空闲端口。
+export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:29180
+torchrun --standalone --nproc-per-node=8 -m deep_ep_experimental.megamoe.benchmark --config stage_a_ep8_gelu_k25 --mode accuracy --input fp8 --dual-reference --output-dir runs/stage-a-ep8-k25
+```
+
+性能报告按一次逻辑 forward 汇总各窗 kernel 耗时。该指标不含输入预检、主机协调及窗口间的计数累加。可选设备 timer 只采首窗。
+
 ## 1. 输入、输出与公开接口
 
-定义：`B` 为每卡 token 数，`H` 为隐藏维度，`I` 为 SwiGLU 后宽度，`K` 为 top-k，
+定义：`B` 为每卡 token 数，`H` 为隐藏维度，`I` 为激活后的宽度，`K` 为 top-k，
 `E` 为全局路由专家数，`L=E/EP` 为每卡路由专家数，`S` 为每卡共享专家数。
 
 ```python
@@ -37,7 +70,7 @@ def fp8_fp4_mega_moe(
 | `cumulative_local_expert_recv_stats` | 可选 int32 `[L]`，在原值上累加专家接收 token 数 |
 | `timer` | 可选 `buffer.allocate_timer()`；仅在单独诊断调用中传入 |
 
-`recipe/activation/fast_math` 当前仅支持签名中的默认值。
+`recipe/fast_math` 使用签名中的默认值，`activation` 支持与 buffer 一致的 `swiglu` 或 `gelu`。
 `activation_clamp` 支持非负 FP32 上限；`None` 或正无穷等价于 FLT_MAX。
 MTE/URMA 均在 SwiGLU 前将 gate 上截断至 limit，up 截断至 [-limit, limit]，路由和共享专家均适用。
 例如 `fp8_fp4_mega_moe(y, w1, w2, buffer, activation_clamp=7.0)`。
@@ -48,7 +81,8 @@ FP8 输入仍需打包到通信区，因此流水中的 `AIV_QUANT` 此时表示
 
 | 原始 ND 权重 | packed FP4（uint8，两个值/字节） | E8M0 scale |
 | --- | --- | --- |
-| GMM1 | `[L,2I,H/2]`，N 方向先 gate 后 up | `[L,2I,H/64,2]` |
+| GMM1（SwiGLU） | `[L,2I,H/2]`，N 方向先 gate 后 up | `[L,2I,H/64,2]` |
+| GMM1（GELU） | `[L,I,H/2]`，单投影 | `[L,I,H/64,2]` |
 | GMM2 | `[L,H,I/2]` | `[L,H,I/64,2]` |
 
 调用 `w1, w2 = transform_weights_for_mega_moe(raw_w1, raw_w2)` 得到 Ascend NZ 权重。FP4 routed GMM1 一次准备两套 weight/scale：实际 B≤256 使用 `[gate128, up128]` 融合布局，B>256 使用 `[gate | up]` 配对布局。转换不进入计时区间，但额外保留一份 GMM1 权重和 scale；GMM2 不复制。
@@ -76,15 +110,14 @@ buffer = SymmBuffer(
 执行成功后，所有 rank 按相同顺序调用 `buffer.destroy()`、`group.close()`；
 异常处理及完整可运行调用示例见 [example.py](python/deep_ep_experimental/megamoe/example.py)。
 
-约束：EP=2～128，E 可整除 EP 且每卡最多 128 个路由专家；S=0～8；B=1～65536；
+MTE 约束：EP=2～128，E 可被 EP 整除且每卡最多 128 个路由专家；S=0～8；B=1～65536；
 H=1024～8192 且为64的倍数，I=256～4096 且为128的倍数，1≤K≤min(32,E)。
 各 rank 必须同序、同 B 调用；仅推理，不支持反向、空/不等长 B 或图捕获。
 `mma_type="fp8xfp8"` 是保留入口，不支持共享专家/timer；**下文 benchmark 固定测试 W4A8，不提供权重 dtype 开关**。
 
 兼容入口 `mega_moe(x, ids, weights, w1, w2, buffer, ...)` 返回 `(y, per_call_counts)`。
 接口签名参照 DeepGEMM `78b6900`。本实现使用 int32 路由 ID、E8M0 输入 scale，
-输入 buffer 是普通 NPU 存储，需要打包进入通信区。路由权重在 GMM2 后施加，
-与在中间量化前施加权重的实现不保证数值等价；CPU 参考遵循本实现的计算顺序。
+输入 buffer 是普通 NPU 存储，需要打包进入通信区。路由权重的位置由激活与加权模式决定，CPU 参考使用相同计算顺序。
 
 ### 共享专家策略
 
@@ -116,7 +149,7 @@ CATLASS GMM 的布局和同步机制见 [GMM 说明](csrc/kernels/mega_moe/catla
 ## 路由权重位置与 ProcessGroup
 
 通信实现称为 **MTE** 和 **URMA**，产品识别仍自动选择实现。
-`SymmBuffer(..., topk_weights_type=0)` 的参数与 ops-transformer 一致：
+`SymmBuffer` 的 `topk_weights_type` 缺省时按激活选择，SwiGLU 为 0，GELU 为 1。SwiGLU 的两种取值如下：
 
 | 值 | 路由专家计算顺序 |
 | --- | --- |

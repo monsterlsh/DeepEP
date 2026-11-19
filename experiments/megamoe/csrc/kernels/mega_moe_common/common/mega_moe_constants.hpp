@@ -16,6 +16,12 @@
 #include <cstdint>
 #include "kernels/mega_moe_common/common/mega_moe_shared_policy.hpp"
 
+#if defined(__NPU_DEVICE__)
+#define MEGAMOE_CONSTANTS_INLINE __aicore__ inline
+#else
+#define MEGAMOE_CONSTANTS_INLINE inline
+#endif
+
 namespace DEEPEP_MEGAMOE_IMPL_NAMESPACE {
 
 enum class MegaMoeActMode : uint8_t {
@@ -23,6 +29,7 @@ enum class MegaMoeActMode : uint8_t {
     SITU = 1U,
     SWIGLU_STEP = 2U,
     SWIGLU_OAI = 3U,
+    GELU = 4U,
 };
 
 enum class MegaMoeActSubMode : uint8_t {
@@ -43,6 +50,7 @@ constexpr uint64_t IDX_FLAG_OFFSET = 7UL;
 constexpr uint64_t IDX_B2_OFFSET = 8UL;
 constexpr uint64_t IDX_B2_SCALE_OFFSET = 9UL;
 constexpr uint64_t IDX_Y2_OFFSET = 10UL;
+constexpr uint64_t ACTIVATION_FACTOR_VALUE = 3UL;
 constexpr uint64_t IDX_M_OFFSET = 11UL;
 constexpr uint64_t IDX_GMM1_OFFSET = 12UL;
 constexpr uint64_t IDX_GMM2_OFFSET = 13UL;
@@ -90,10 +98,16 @@ constexpr uint32_t L1_TILE_M_128 = 128U;
 constexpr uint32_t L1_TILE_N = 256U;
 constexpr uint32_t L0_TILE_K = 128U;
 constexpr uint32_t ACTIVATION_N_HALF = 2U;
+constexpr uint32_t ACTIVATION_N_SINGLE = 1U;
+MEGAMOE_CONSTANTS_INLINE constexpr uint32_t ActivationFactor(uint8_t actMode)
+{
+    return actMode == static_cast<uint8_t>(MegaMoeActMode::GELU) ? ACTIVATION_N_SINGLE : ACTIVATION_N_HALF;
+}
 // 路由 W4A8 GMM1：逻辑 gate/up 各 128 列，物理 GEMM 仍为 N256。
 constexpr uint32_t GMM1_FUSED_TILE_N = L1_TILE_N / ACTIVATION_N_HALF;
 // W4A8 的 host wave 预算和 device Dispatch 共用同一实际每卡 BS 边界。
 constexpr uint32_t W4A8_SMALL_BATCH_MAX_TOKENS = 256U;
 }  // namespace DEEPEP_MEGAMOE_IMPL_NAMESPACE
 
+#undef MEGAMOE_CONSTANTS_INLINE
 #endif  // MEGA_MOE_CONSTANTS_H

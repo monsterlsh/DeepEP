@@ -65,6 +65,7 @@ class SharedMxGmm {
     Block block_;
     UrmaMegaMoeImpl::GMMAddrInfo addr_{};
     uint32_t m_ = 0, n_ = 0, k_ = 0, scaleK_ = 0;
+    bool singleProjection_ = false;
     template <class Element, class Layout>
     __aicore__ inline auto View(GM_ADDR p, const Layout& layout)
     {
@@ -96,13 +97,16 @@ public:
         n_ = p.n;
         k_ = p.k;
         scaleK_ = p.scaleK;
+        singleProjection_ = p.activationFactor == UrmaMegaMoeImpl::ACTIVATION_N_SINGLE;
         addr_ = addr;
     }
     __aicore__ inline void Begin() {}
     __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols)
     {
         Projection(m, n, rows, cols);
-        if constexpr (First) Projection(m, n + n_ / 2U, rows, cols);
+        if constexpr (First) {
+            if (!singleProjection_) Projection(m, n + n_ / 2U, rows, cols);
+        }
     }
     __aicore__ inline void End(bool = false)
     {
@@ -329,8 +333,11 @@ public:
             op.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a_.sharedActivation),
                      .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a_.sharedActivationScale),
                      .clampLimit = a_.activationClamp,
+                     .actMode = static_cast<uint8_t>(a_.config.activationMode),
                      .ubOffsetBytes = highUb});
             const uint32_t inter = a_.sharedIntermediate, n = tile * 256U;
+            const uint32_t activationFactor =
+                UrmaMegaMoeImpl::ActivationFactor(static_cast<uint8_t>(a_.config.activationMode));
             op.UpdateGlobalAddr({static_cast<int64_t>(f.rowBegin * inter),
                                  static_cast<int64_t>(f.rowBegin * (inter / 32U)), 0, 0, 0, 0});
             op.UpdateNextProblem({f.rows, inter, 0, 0});
@@ -344,12 +351,14 @@ public:
             const auto start = timer_.TraceBegin();
             for (uint32_t sub = 0; sub < rows; sub += 64U) {
                 const uint32_t actual = rows - sub < 64U ? rows - sub : 64U;
-                const uint64_t input = (f.rowBegin + m + sub) * (2U * inter) + n;
-                const DataCopyExtParams copy{static_cast<uint16_t>(actual), 512U, (2U * inter - 256U) * 2U, 0U, 0U};
+                const uint64_t input = (f.rowBegin + m + sub) * activationFactor * inter + n;
+                const DataCopyExtParams copy{static_cast<uint16_t>(actual), 512U,
+                                             (activationFactor * inter - 256U) * 2U, 0U, 0U};
                 SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
                 WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
                 DataCopyPad(gate, gm[input], copy, {false, 0U, 0U, 0U});
-                DataCopyPad(up, gm[input + inter], copy, {false, 0U, 0U, 0U});
+                if (activationFactor == UrmaMegaMoeImpl::ACTIVATION_N_HALF)
+                    DataCopyPad(up, gm[input + inter], copy, {false, 0U, 0U, 0U});
                 SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
                 WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
                 SetCtrlSpr<60, 60>(0);
@@ -406,7 +415,8 @@ __aicore__ inline void RunActivationShared(Arguments& args, uint32_t worker, Tim
     // which clamps every up value to zero and makes the entire FFN zero.
     epilogue.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(args.activation),
                    .yScaleGmAddr = reinterpret_cast<GM_ADDR>(args.activationScale),
-                   .clampLimit = args.activationClamp});
+                   .clampLimit = args.activationClamp,
+                   .actMode = static_cast<uint8_t>(args.config.activationMode)});
     uint32_t nextGather = worker;
     uint32_t nextActivation = 0U;
     uint32_t activationTile = 0U;

@@ -30,8 +30,11 @@ def contract(config, world, bs, input_kind, routing, check_tokens):
 
     if world <= 0 or config["model"]["num_experts"] % world:
         raise ValueError("Global experts must divide positive EP size")
-    if input_kind not in ("bf16", "fp8") or routing not in ("balanced", "random", "skewed", "random-balanced"):
+    if input_kind not in ("bf16", "fp8", "fp4") or routing not in ("balanced", "random", "skewed", "random-balanced"):
         raise ValueError("Invalid Golden input/routing")
+    mma_type = config["model"].get("mma_type", "fp8xfp4")
+    if (input_kind == "fp4") != (mma_type == "fp4xfp4") and input_kind != "bf16":
+        raise ValueError("Golden input storage must match the configured activation precision")
     token_indices(bs, check_tokens)
     # 权重/输入或参考算法变化自动失效；编译参数、性能轮数不影响 Golden。
     source = inspect.getsource(numerics) + inspect.getsource(reference) + inspect.getsource(inputs) + Path(__file__).read_text(encoding="utf-8")
@@ -49,7 +52,7 @@ def contract(config, world, bs, input_kind, routing, check_tokens):
         input=input_kind,
         routing=routing,
         check_tokens=check_tokens,
-        numerical_contract=("ascend_pre_quant_route_weight_v1" if config["model"].get("topk_weights_type", 0) else "ascend_post_gmm2_route_weight_v1"),
+        numerical_contract=("ascend_pre_quant_route_weight_v1" if numerics.prequant_route_weight(config["model"]) else "ascend_post_gmm2_route_weight_v1"),
     )
 
 
@@ -126,13 +129,14 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
     """Compute a node's source ranks together; bound dense weights by worker count."""
     import numpy as np
     from .benchmark import inputs
-    from .reference import bf16, dequantize_input, expert_forward, make_weights, quantize_input, unpack_weight
+    from .reference import bf16, dequantize_activation, expert_forward, make_weights, quantize_activation, unpack_weight
 
     if workers < 1 or chunk_tokens < 1 or not ranks or len(set(ranks)) != len(ranks):
         raise ValueError("Need positive workers/chunk_tokens and distinct source ranks")
     if any(not 0 <= rank < spec["world"] for rank in ranks):
         raise ValueError("Golden source rank exceeds EP size")
     model, bs, world = spec["model"], spec["bs"], spec["world"]
+    activation, mma_type = model.get("activation", "swiglu"), model.get("mma_type", "fp8xfp4")
     local = model["num_experts"] // world
     selected = token_indices(bs, spec["check_tokens"])
     counts = np.zeros(model["num_experts"], dtype=np.int64)
@@ -141,7 +145,11 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
         x, ids, weights = inputs(config, source, bs, spec["routing"], world=world)
         counts += np.bincount(ids.ravel(), minlength=len(counts))
         if source in ranks:
-            sources[source] = (dequantize_input(*quantize_input(x[selected])), ids[selected], weights[selected])
+            sources[source] = (
+                dequantize_activation(*quantize_activation(x[selected], mma_type), mma_type),
+                ids[selected],
+                weights[selected],
+            )
         if source == 0 or (source + 1) % 8 == 0:
             print(f"[GOLDEN] BS={bs} input/counts source={source + 1}/{world}", flush=True)
     x = np.concatenate([sources[rank][0] for rank in ranks])
@@ -156,7 +164,7 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
             if not needed:
                 continue
             # 必须保留原始 RNG 的整组生成顺序；单专家重新播种会改变待测权重。
-            raw = make_weights(local, model["hidden"], model["intermediate_hidden"], config["seed"] + owner)
+            raw = make_weights(local, model["hidden"], model["intermediate_hidden"], config["seed"] + owner, activation)
             for expert in needed:
                 token, slot = np.where(ids == owner * local + expert)
                 pair = tuple((data[expert], scale[expert]) for data, scale in raw)
@@ -168,6 +176,7 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
                 model["hidden"],
                 model.get("shared_intermediate_hidden", model["intermediate_hidden"]),
                 config["seed"] + 100000,
+                activation,
             )
             for expert in range(shared):
                 yield np.arange(len(x)), None, tuple((data[expert], scale[expert]) for data, scale in raw)
@@ -178,10 +187,19 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
         result = np.empty((len(token), model["hidden"]), dtype=np.float32)
         for start in range(0, len(token), chunk_tokens):
             stop = start + chunk_tokens
+            early_weight = route_weight is not None and (
+                activation == "gelu" or model.get("topk_weights_type", 0) == 1
+            )
             result[start:stop] = expert_forward(
-                x[token[start:stop]], w1, w2, model.get("activation_clamp"),
-                route_weight[start:stop] if route_weight is not None and model.get("topk_weights_type", 0) == 1 else None)
-        if route_weight is not None and model.get("topk_weights_type", 0) == 0:
+                x[token[start:stop]],
+                w1,
+                w2,
+                model.get("activation_clamp"),
+                route_weight[start:stop] if early_weight else None,
+                activation,
+                mma_type,
+            )
+        if route_weight is not None and activation != "gelu" and model.get("topk_weights_type", 0) == 0:
             result *= route_weight[:, None]
         return token, result
 
@@ -281,7 +299,7 @@ def main():
     parser.add_argument("--ep-size", type=int, required=True)
     parser.add_argument("--ranks", required=True, help="Source ranks on this host, e.g. 0-7")
     parser.add_argument("--golden-dir", type=Path, default=Path("benchmark-golden"))
-    parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
+    parser.add_argument("--input", choices=("bf16", "fp8", "fp4"), default="bf16")
     parser.add_argument("--routing", choices=("balanced", "random", "skewed", "random-balanced"), default="balanced")
     parser.add_argument("--check-tokens", type=int, default=0)
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)

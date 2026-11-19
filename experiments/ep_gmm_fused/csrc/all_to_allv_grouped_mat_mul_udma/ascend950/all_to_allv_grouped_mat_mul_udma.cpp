@@ -29,7 +29,8 @@
 namespace deepep::ep_gmm_fused {
 namespace {
 
-constexpr uint32_t kMaxLocalExperts = 64;
+// Capacity check only; 128 covers E/P up to 128 (for example 800 experts on EP8).
+constexpr uint32_t kMaxLocalExperts = 128;
 constexpr uint64_t kSymmetricDataBytes = 200UL * 1024 * 1024 * sizeof(uint16_t);
 constexpr uint32_t kMaxK0 = 256;
 static_assert(sizeof(Catccos::DGemm::MoeRouteSegment) == 24, "unexpected MoeRouteSegment ABI");

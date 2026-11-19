@@ -453,6 +453,7 @@ __aicore__ inline ExpertLoopState CreateExpertLoopState(const MoeStageCommonConf
     ExpertLoopState state;
     Get<N_VALUE>(state.problemShape) = context.gmm1OutputDim;
     Get<K_VALUE>(state.problemShape) = context.tokenHiddenDim;
+    Get<ACTIVATION_FACTOR_VALUE>(state.problemShape) = context.activationFactor;
     return state;
 }
 
