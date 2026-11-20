@@ -391,13 +391,13 @@ private:
 
 struct SharedIncoming {
     const Arguments& a;
-    uint32_t core;
+    uint32_t owner;
     bool peer = false, self = false;
     DispatchReceiveObserver dispatch;
     __aicore__ inline void Poll()
     {
         dispatch.Poll();
-        if (core < CommunicationWorkers(a.config.world)) ObserveIncomingCompletion(a, core, peer, self);
+        if (owner < a.config.world - 1U) ObserveIncomingCompletion(a, owner, peer, self);
     }
 };
 

@@ -24,6 +24,7 @@
 #include "kernel_operator.h"
 #endif
 #include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_compute_contract.hpp"
 #include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
 #include "kernels/mega_moe_common/epilogue/activation/activation_common.hpp"
 #include "kernels/mega_moe_common/epilogue/activation/situglu_activation.hpp"
@@ -84,6 +85,23 @@ public:
 public:
     __aicore__ inline void Init(Params const& params);
     __aicore__ inline auto GetTopkWeightTensor();
+    __aicore__ inline void LoadWindowGeluTable(uint64_t address, uint32_t words)
+    {
+        using Layout = MegaMoeUrma::WindowGeluUb;
+        LocalTensor<uint32_t> table(TPosition::VECCALC, Layout::tableOffset, Layout::tableWords);
+        GlobalTensor<uint32_t> source;
+        source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(address));
+        AscendC::DataCopy(table, source, words);
+        AscendC::SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        AscendC::WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        geluTable_ = reinterpret_cast<__ubuf__ uint32_t*>(table.GetPhyAddr());
+    }
+    __aicore__ inline void SelectGeluMailboxRows(uint32_t first)
+    {
+        const uint32_t byteOffset = first * TileN * sizeof(DataTypeIn);
+        l0cOutUbFirst_ = LocalTensor<DataTypeIn>(TPosition::VECIN, byteOffset, TileM * TileN);
+        gluRes_ = LocalTensor<bfloat16_t>(TPosition::VECCALC, byteOffset, TileM * TileN);
+    }
     // 计算并写回一个激活/量化 tile，不包含流水通知。
     __aicore__ inline void operator()(const BlockShape& blockShape, const BlockCoord& blockCoord,
                                       uint16_t pingpongIdx = 0);
@@ -128,6 +146,7 @@ private:
     LocalTensor<uint16_t> maxExp_;
     LocalTensor<uint16_t> halfScale_;
     LocalTensor<float> weightUb_;
+    __ubuf__ uint32_t* geluTable_{nullptr};
 
     int64_t intermediateHiddenSize_;
     int64_t intermediateHiddenScaleElements_;
@@ -336,6 +355,12 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
     const ActMode actMode = static_cast<ActMode>(actMode_);
     const ActSubMode actSubMode = static_cast<ActSubMode>(actSubMode_);
     if (actMode == ActMode::GELU) {
+        if constexpr (TopkWeightsPrefetch && TileM == 128U && TileN == 256U && !IsInterleaved_) {
+            if (geluTable_ != nullptr) {
+                Activation::RunGELU<DataTypeIn, true, true>(gatedActivationContext, geluTable_);
+                return;
+            }
+        }
         Activation::RunGELU<DataTypeIn, TopkWeightsPrefetch>(gatedActivationContext);
     } else if (actMode == ActMode::SITU) {
         const float invBeta = activationBeta_ != 0.0f ? 1.0f / activationBeta_ : 1.0f;

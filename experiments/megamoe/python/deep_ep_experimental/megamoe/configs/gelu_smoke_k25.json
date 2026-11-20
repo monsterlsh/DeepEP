@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "model": {
+    "hidden": 1024,
+    "intermediate_hidden": 256,
+    "num_experts": 32,
+    "num_topk": 25,
+    "num_shared_experts": 0,
+    "activation": "gelu",
+    "mma_type": "fp8xfp4",
+    "topk_weights_type": 1
+  },
+  "bs_values": [17, 257],
+  "alignment": {"rows": 1024, "cols": 1024, "repeats": 1},
+  "warmup": 1,
+  "iters": 3,
+  "seed": 1234
+}

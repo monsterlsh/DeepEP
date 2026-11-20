@@ -62,7 +62,7 @@ void checked_barrier(int rank)
     check(destroy_status, "destroy SHMEM barrier stream");
 }
 
-std::string check_peer_access(int rank, int world, uint64_t required_transports)
+std::string check_peer_access(int rank, int world, uint64_t required_transports, uint32_t roce_ranks_per_host)
 {
     const auto* state = static_cast<const aclshmem_device_host_state_t*>(dlsym(RTLD_DEFAULT, "g_state"));
     if (state == nullptr) return "Cannot verify peer access: SHMEM lacks the pinned SDK's g_state symbol";
@@ -71,6 +71,11 @@ std::string check_peer_access(int rank, int world, uint64_t required_transports)
     std::string missing;
     std::string missing_udma;
     for (int peer = 0; peer < world; ++peer) {
+        if (roce_ranks_per_host && uint32_t(peer) / roce_ranks_per_host != uint32_t(rank) / roce_ranks_per_host) {
+            if ((state->topo_list[peer] & ACLSHMEM_TRANSPORT_ROCE) == 0)
+                return "MegaMoE rank=" + std::to_string(rank) + " has no RoCE path to remote peer=" + std::to_string(peer);
+            continue;
+        }
         if (peer != rank && (required_transports & ACLSHMEM_TRANSPORT_MTE) &&
             (state->topo_list[peer] & ACLSHMEM_TRANSPORT_MTE) == 0) {
             if (!missing.empty()) missing += ",";
@@ -118,15 +123,23 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     const char* backend_env = std::getenv("DEEPEP_LL_BACKEND");
     const std::string backend = backend_env ? backend_env : "mte";
     if (backend != "mte" && backend != "rdma") throw std::invalid_argument("DEEPEP_LL_BACKEND must be mte or rdma");
-    ll_rdma_ = backend == "rdma";
+    const bool windowed = options.window_ranks_per_host != 0;
+    // The UBX window transport has its own peer policy and never creates
+    // the legacy LL staging area, independent of the LL environment setting.
+    ll_rdma_ = !windowed && backend == "rdma";
     const bool udma = options.udma;
     const bool megamoe = options.megamoe;
+    megamoe_roce_ = windowed && size == 32;
+    if (windowed && (!megamoe || udma || (size != 8 && size != 16 && size != 32) ||
+                     options.window_ranks_per_host != uint32_t(size == 32 ? 16 : size)))
+        throw std::invalid_argument("Invalid UBX window rank layout");
     const bool mpi = options.mpi;
     const bool combine_only = options.combine_only;
     const bool use_1g_huge_pages = options.use_1g_huge_pages;
     if (ll_rdma_ && (udma || megamoe || combine_only || use_1g_huge_pages))
         throw std::invalid_argument("RDMA LL requires a plain LL Session; mixed HT/UDMA runtimes are unsupported");
 #ifndef DEEPEP_LL_RDMA
+    if (megamoe_roce_) throw std::runtime_error("Cross-host MegaMoE requires HNS RoCE support");
     if (ll_rdma_) throw std::runtime_error("RDMA selected but wheel lacks DEEPEP_LL_RDMA=ON; no MTE fallback");
 #endif
     if (combine_only && (!udma || megamoe)) throw std::invalid_argument("Combine-only requires UDMA");
@@ -190,6 +203,8 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     attr.option_attr.data_op_engine_type =
         udma ? static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA) : ACLSHMEM_DATA_OP_MTE;
 #ifdef DEEPEP_LL_RDMA
+    if (megamoe_roce_) attr.option_attr.data_op_engine_type =
+        static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_ROCE);
     if (ll_rdma_) attr.option_attr.data_op_engine_type = size > int(DispatchDedup::kLlPhysicalRanksPerHost)
         ? static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_ROCE) : ACLSHMEM_DATA_OP_MTE;
 #endif
@@ -209,6 +224,8 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     bool runtime_started = false;
     try {
 #ifdef DEEPEP_LL_RDMA
+        if (megamoe_roce_)
+            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, 2U), "MegaMoE RoCE data/mailbox QPs");
         if (ll_rdma_ && size > int(DispatchDedup::kLlPhysicalRanksPerHost)) check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, ll_rdma_qps_), "ROCE QP configuration");
 #endif
         if (options.dedicated_peer_qp) {
@@ -261,20 +278,22 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
             runtime_started = true;
             // Peer-table aggregate packets require physical 512B boundaries.
             init_trace(rank, "workspace allocation enter");
-            workspace_ = (udma || ll_rdma_) ? aclshmem_align(512U, allocation_bytes) : aclshmem_malloc(allocation_bytes);
+            workspace_ = (udma || ll_rdma_ || windowed) ? aclshmem_align(512U, allocation_bytes)
+                                                         : aclshmem_malloc(allocation_bytes);
             init_trace(rank, "workspace allocation return");
         }
         if (workspace_ == nullptr) {
             throw std::runtime_error("SHMEM workspace allocation or translation failed");
         }
-        if (ll_rdma_ && reinterpret_cast<uintptr_t>(workspace_) % 512U)
+        if ((ll_rdma_ || windowed) && reinterpret_cast<uintptr_t>(workspace_) % 512U)
             throw std::runtime_error("RDMA workspace requires 512-byte alignment");
         init_trace(rank, "workspace memset enter");
         check(aclrtMemset(workspace_, allocation_bytes, 0, allocation_bytes), "aclrtMemset");
         init_trace(rank, "workspace memset return");
         if (staging_bytes) ll_rdma_stage_ = static_cast<uint8_t*>(workspace_) + workspace_bytes;
         if (options.required_peer_transports) {
-            peer_access_error_ = check_peer_access(rank, size, options.required_peer_transports);
+            peer_access_error_ = check_peer_access(rank, size, options.required_peer_transports,
+                                                  options.window_ranks_per_host);
         }
         bytes_ = bytes;
         allocation_bytes_ = allocation_bytes;
@@ -467,8 +486,8 @@ void Session::barrier(bool host_coordinated)
 {
     std::lock_guard<std::mutex> guard(runtime_mutex);
     check_context();
-    if (ll_rdma_) {
-        if (!host_coordinated) throw std::runtime_error("NDR barrier requires HCCL Host coordination");
+    if (ll_rdma_ || megamoe_roce_) {
+        if (!host_coordinated) throw std::runtime_error("RoCE barrier requires host coordination");
         return;
     }
     try { checked_barrier(rank_); }
@@ -482,9 +501,9 @@ void Session::close(bool host_coordinated)
         return;
     }
     check_context();
-    if (ll_rdma_ && !host_coordinated)
-        throw std::runtime_error("NDR close requires HCCL Host coordination");
-    try { if (!ll_rdma_) checked_barrier(rank_); }
+    if ((ll_rdma_ || megamoe_roce_) && !host_coordinated)
+        throw std::runtime_error("RoCE close requires host coordination");
+    try { if (!ll_rdma_ && !megamoe_roce_) checked_barrier(rank_); }
     catch (...) { poisoned_ = true; throw; }
     if (workspace_ != nullptr && !use_1g_huge_pages_) {
         aclshmem_free(workspace_);

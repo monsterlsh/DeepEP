@@ -28,15 +28,15 @@ struct DeviceRouteInfo {
     // Keep the early Pack-only prefix on separate cache lines from the late
     // receive summary, which is published while Pack/Dispatch are running.
     uint32_t outgoingPadding[15U];
-    uint32_t incoming[kWorld][kMaxLocalExperts + 1U];  // source-local expert prefix
-    uint32_t sources[kMaxLocalExperts][kWorld + 1U];   // expert-local source prefix
+    uint32_t incoming[kMaxWorld][kMaxLocalExperts + 1U];  // source-local expert prefix
+    uint32_t sources[kMaxLocalExperts][kMaxWorld + 1U];   // expert-local source prefix
     uint32_t groupBase[kMaxLocalExperts + 1U];
     uint32_t compactBase[kMaxLocalExperts + 1U];
-    uint64_t returnBase[kWorld];
+    uint64_t returnBase[kMaxWorld];
     uint64_t gmm1Base[kMaxLocalExperts + 1U];
-    uint32_t sendCvBase[kWorld + 1U], recvCvBase[kWorld + 1U];
+    uint32_t sendCvBase[kMaxWorld + 1U], recvCvBase[kMaxWorld + 1U];
 };
-static_assert(sizeof(DeviceRouteInfo) < 32U * 1024U);
+static_assert(sizeof(DeviceRouteInfo) < 64U * 1024U);
 static_assert(offsetof(DeviceRouteInfo, incoming) % 64U == 0U);
 
 URMA_ROUTE_INLINE uint32_t RouteMin(uint32_t a, uint32_t b)
@@ -154,7 +154,7 @@ URMA_ROUTE_INLINE void CompileDeviceRoutes(Config& c, URMA_ROUTE_UB DeviceRouteI
     // data-dependent task queue. Existing static Pack ownership is unchanged.
     for (uint32_t cv = 0; cv < c.packRoundCount; ++cv) {
         uint64_t rows = 0U;
-        for (uint32_t peer = 0; peer < kWorld; ++peer) {
+        for (uint32_t peer = 0; peer < kMaxWorld; ++peer) {
             Chunk chunk{};
             if (peer < c.world) {
                 const uint32_t base = r.outgoing[peer * le];
@@ -393,7 +393,7 @@ URMA_ROUTE_INLINE void EmitRoutePack(const Config& c, URMA_ROUTE_UB DeviceRouteI
 {
     for (uint32_t cv = range.first; cv < range.last; ++cv) {
         uint64_t total = 0U;
-        for (uint32_t peer = 0; peer < kWorld; ++peer) {
+        for (uint32_t peer = 0; peer < kMaxWorld; ++peer) {
             Chunk chunk{};
             if (peer < c.world) {
                 const uint32_t base = r.outgoing[peer * c.localExperts],
@@ -449,7 +449,7 @@ URMA_ROUTE_INLINE void SummarizeRouteExperts(const Config& c, URMA_ROUTE_UB Devi
                                              uint32_t end)
 {
     for (uint32_t e = begin; e < end; ++e) {
-        for (uint32_t s = 0; s <= kWorld; ++s) r.sources[e][s] = 0U;
+        for (uint32_t s = 0; s <= kMaxWorld; ++s) r.sources[e][s] = 0U;
         for (uint32_t s = 0; s < c.world; ++s)
             r.sources[e][s + 1U] = r.sources[e][s] + r.incoming[s][e + 1U] - r.incoming[s][e];
         const uint32_t rows = r.sources[e][c.world];

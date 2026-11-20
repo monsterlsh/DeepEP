@@ -26,6 +26,7 @@ using namespace AscendC;
 // Peer-start publication uses scratch above Pack's live buffers.
 constexpr uint32_t kCommunicationSignalOffset = kPackUbBase + kPackUbBytes;
 static_assert(kCommunicationSignalOffset % 32U == 0U);
+static_assert(kCommunicationSignalOffset + kSignalCopyBytes <= kMteScratchOffset);
 
 __aicore__ inline void TraceLocalSync(Timer& timer, uint32_t stage)
 {
@@ -52,8 +53,11 @@ __aicore__ inline void PublishPeerStart(const Arguments& args, uint32_t owner, T
     meta.peer = peer;
     timer.Begin(Phase::Barrier);
     const uint64_t start = timer.TraceBegin();
-    PublishDone(reinterpret_cast<__gm__ uint8_t*>(args.symmetric), PeerPhaseSlot(args, 0U, args.config.rank), peer,
-                args.config.epoch, signal, EVENT_ID0);
+    const uint64_t slot = PeerPhaseSlot(args, 0U, args.config.rank);
+    if (RemoteHost(args, peer))
+        RocePublish(args, slot, peer, kPayloadQp);
+    else
+        PublishDone(reinterpret_cast<__gm__ uint8_t*>(args.symmetric), slot, peer, args.config.epoch, signal, EVENT_ID0);
     timer.TraceEnd(TraceEvent::PublishStart, start, meta);
     timer.End(Phase::Barrier);
 }
@@ -88,7 +92,9 @@ __aicore__ inline void ProcessRouted(Arguments& args)
     // 2. Publish readiness and fill the startup Pack rounds.
     if constexpr (g_coreType == AIV) {
         if (GetSubBlockIdx() == 1U && block < communicationWorkers) {
-            PublishPeerStart(args, block, timer);
+            for (uint32_t owner = block; owner < args.config.world - 1U; owner += communicationWorkers) {
+                PublishPeerStart(args, owner, timer);
+            }
         }
         timer.CoarseBegin(CoarsePhase::Pack);
         const uint32_t worker = LocalWorkerIndex(block, GetSubBlockIdx());
@@ -109,7 +115,7 @@ __aicore__ inline void ProcessRouted(Arguments& args)
         WaitRouteSummary(args, timer);
         RunProfiledCompute(args, block, timer);
     } else {
-        SharedIncoming incoming{args, block};
+        SharedIncoming incoming{args, PeerOwnerForSlot(args.config.world, block, 0U)};
         RunCooperativeAiv1(args, block, timer, incoming);
     }
     if constexpr (g_coreType == AIV) {
@@ -213,7 +219,7 @@ __aicore__ inline void ProcessShared(Arguments& a)
             PackOneRound(a, round, LocalWorkerIndex(block, 1U), kLocalWorkers, pack);
         pack.Close();
         timer.CoarseEnd(CoarsePhase::Pack);
-        SharedIncoming incoming{a, block};
+        SharedIncoming incoming{a, PeerOwnerForSlot(a.config.world, block, 0U)};
         RunCooperativeAiv1(a, block, timer, incoming);
         PipeBarrier<PIPE_ALL>();
         timer.CoarseBegin(CoarsePhase::Reduce);
@@ -221,7 +227,7 @@ __aicore__ inline void ProcessShared(Arguments& a)
         timer.CoarseEnd(CoarsePhase::Reduce);
         if (block < comm) {
             const auto start = timer.TraceBegin();
-            Quiet(PeerForOwner(a.config.rank, block));
+            Quiet(a, PeerForOwner(a.config.rank, block));
             TraceMeta completion;
             completion.peer = PeerForOwner(a.config.rank, block);
             timer.TraceEnd(TraceEvent::CombineSendComplete, start, completion);

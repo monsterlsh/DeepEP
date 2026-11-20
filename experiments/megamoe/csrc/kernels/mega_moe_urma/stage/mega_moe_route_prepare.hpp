@@ -18,7 +18,8 @@ constexpr uint32_t kExpertRouteBatch = 4096U;  // preserve the E<=384 path
 constexpr uint32_t kExpertWideBatch = 3072U;
 constexpr uint32_t kExpertRouteStorageItems = 10U * kExpertWideBatch;
 static_assert(7U * kExpertRouteBatch <= kExpertRouteStorageItems);
-constexpr uint32_t kExpertRoutesPerWorker = (kExperts + kLocalWorkers - 1U) / kLocalWorkers;
+// One count lane per owned expert in a VF invocation. EP32 may need two passes.
+constexpr uint32_t kExpertRouteLanes = 64U;
 
 // A worker owns complete experts. Each output slot can hold the entire input
 // batch, including repeated expert IDs in one token's top-k list. Flat route
@@ -28,7 +29,7 @@ __simd_vf__ inline void CompactOwnedExpertsVF(__ubuf__ int32_t* ids, __ubuf__ in
                                               uint32_t expertCount, uint32_t outputStride)
 {
     constexpr uint32_t lanes = AscendC::GetVecLen() / sizeof(int32_t);
-    static_assert(kExpertRoutesPerWorker <= lanes);
+    static_assert(kExpertRouteLanes <= lanes);
     auto full = AscendC::Reg::CreateMask<int32_t, AscendC::Reg::MaskPattern::ALL>();
     AscendC::Reg::RegTensor<int32_t> idsReg, flat, compact, ones, totals, reduced, broadcast, packed, laneIndex;
     AscendC::Reg::RegTensor<uint32_t> zeroIndex;
@@ -81,10 +82,11 @@ __aicore__ inline void RouteFence()
     SetFlag<E>(EVENT_ID0);
     WaitFlag<E>(EVENT_ID0);
 }
-__aicore__ inline void RouteLoad(uint64_t gm, uint32_t ub, uint32_t bytes)
+__aicore__ inline void RouteLoad(uint64_t gm, uint32_t ub, uint32_t bytes, bool uncached = false)
 {
     GlobalTensor<uint8_t> src;
     src.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(gm));
+    if (uncached) src.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
     LocalTensor<uint8_t> dst(TPosition::VECCALC, ub, bytes);
     DataCopyPad(dst, src, {1U, bytes, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
     RouteFence<HardEvent::MTE2_S>();
@@ -186,9 +188,6 @@ struct RouteDescriptorUb {
     // 3840 is divisible by 32 and every ordinary descriptor size (4/8/24/40).
     // Flushes never split a typed record, and every full DMA is 32B aligned.
     static constexpr uint32_t batchBytes = 3840U;
-    // PackChunk x16 + PackRows = one 648B PackRound. Four complete rounds are
-    // 2592B, divisible by 32; the mixed 40B/8B append stream cannot overflow.
-    static constexpr uint32_t packBatchBytes = 4U * sizeof(PackRound);
     static constexpr uint32_t end = 10U * stride;
 };
 static_assert(RouteDescriptorUb::batchBytes % 32U == 0U);
@@ -197,8 +196,6 @@ static_assert(RouteDescriptorUb::batchBytes % sizeof(RowSegment) == 0U);
 static_assert(RouteDescriptorUb::batchBytes % sizeof(Chunk) == 0U);
 static_assert(RouteDescriptorUb::batchBytes % sizeof(ComputeBatch) == 0U);
 static_assert(RouteDescriptorUb::batchBytes % sizeof(ComputeBatchTask) == 0U);
-static_assert(RouteDescriptorUb::packBatchBytes % 32U == 0U);
-static_assert(RouteDescriptorUb::packBatchBytes <= RouteDescriptorUb::stride);
 static_assert(RouteDescriptorUb::end <= kRouteInfoUb);
 #if MEGAMOE_URMA_ROUTE_REORDER
 static_assert(RouteDescriptorUb::batchBytes % sizeof(PeerReorderSpan) == 0U);
@@ -249,13 +246,8 @@ __aicore__ inline void InvalidateRouteSummary(const Arguments& a)
     RouteFlush(a.routeConfig, sizeof(Config));
 }
 
-__aicore__ inline void RouteOwnedExperts(const Arguments& a, uint32_t worker)
+__aicore__ inline void RouteExpertShard(const Arguments& a, uint32_t first, uint32_t owned)
 {
-    const uint32_t experts = a.config.world * a.config.localExperts;
-    const uint32_t each = experts / kLocalWorkers, extra = experts % kLocalWorkers;
-    const uint32_t first = worker * each + (worker < extra ? worker : extra);
-    const uint32_t owned = each + (worker < extra ? 1U : 0U);
-    if (owned == 0U) return;  // empty owners still participate in the enclosing joins
     const uint32_t total = a.config.bs * a.config.topk;
     const uint32_t batchItems =
         owned <= 7U ? kExpertRouteBatch
@@ -263,7 +255,7 @@ __aicore__ inline void RouteOwnedExperts(const Arguments& a, uint32_t worker)
     LocalTensor<int32_t> ids(TPosition::VECCALC, ExpertRouteUb::ids, kExpertRouteBatch);
     LocalTensor<int32_t> routes(TPosition::VECCALC, ExpertRouteUb::routes, kExpertRouteStorageItems);
     LocalTensor<uint32_t> counts(TPosition::VECCALC, ExpertRouteUb::counts, 64U);
-    LocalTensor<uint32_t> totals(TPosition::VECCALC, ExpertRouteUb::totals, kExpertRoutesPerWorker);
+    LocalTensor<uint32_t> totals(TPosition::VECCALC, ExpertRouteUb::totals, kExpertRouteLanes);
     for (uint32_t e = 0; e < owned; ++e) totals.SetValue(e, 0U);
     for (uint32_t start = 0; start < total; start += batchItems) {
         const uint32_t valid = RouteMin(batchItems, total - start);
@@ -300,13 +292,27 @@ __aicore__ inline void RouteOwnedExperts(const Arguments& a, uint32_t worker)
     RouteSave(a.routeHistogram + uint64_t(first) * 4U, ExpertRouteUb::totals, owned * 4U);
 }
 
+__aicore__ inline void RouteOwnedExperts(const Arguments& a, uint32_t worker)
+{
+    const uint32_t experts = a.config.world * a.config.localExperts;
+    const uint32_t each = experts / kLocalWorkers, extra = experts % kLocalWorkers;
+    const uint32_t begin = worker * each + RouteMin(worker, extra);
+    const uint32_t end = begin + each + (worker < extra ? 1U : 0U);
+    for (uint32_t first = begin; first < end; first += kExpertRouteLanes) {
+        RouteExpertShard(a, first, RouteMin(kExpertRouteLanes, end - first));
+    }
+}
+
 __aicore__ inline void RouteExpertPrefix(const Arguments& a)
 {
+    constexpr uint32_t countsOffset = kExperts * sizeof(uint32_t);
+    constexpr uint32_t prefixOffset = countsOffset + kExperts * sizeof(uint64_t);
+    static_assert(prefixOffset + (kExperts + 1U) * sizeof(uint64_t) <= kRouteInfoUb);
     const uint32_t experts = a.config.world * a.config.localExperts;
     RouteLoad(a.routeHistogram, 0U, experts * 4U);
     LocalTensor<uint32_t> counts(TPosition::VECCALC, 0U, experts);
-    LocalTensor<uint64_t> exportCounts(TPosition::VECCALC, 8192U, experts);
-    LocalTensor<uint64_t> exportOffsets(TPosition::VECCALC, 24576U, experts + 1U);
+    LocalTensor<uint64_t> exportCounts(TPosition::VECCALC, countsOffset, experts);
+    LocalTensor<uint64_t> exportOffsets(TPosition::VECCALC, prefixOffset, experts + 1U);
     auto* r = reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
     uint32_t total = 0U;
     for (uint32_t e = 0; e < experts; ++e) {
@@ -318,9 +324,16 @@ __aicore__ inline void RouteExpertPrefix(const Arguments& a)
     }
     r->outgoing[experts] = total;
     exportOffsets.SetValue(experts, uint64_t(total));
-    RouteSave(a.routeCounts, 8192U, experts * 8U);
-    RouteSave(a.routeOffsets, 24576U, (experts + 1U) * 8U);
+    RouteSave(a.routeCounts, countsOffset, experts * 8U);
+    RouteSave(a.routeOffsets, prefixOffset, (experts + 1U) * 8U);
     RouteSave(a.routeInfo, kRouteInfoUb, (experts + 1U) * 4U);
+    if (a.config.world == 32U) {
+        // Immutable until all senders have drained both QPs and reached the
+        // final local join. The route prefix join publishes this to every AIV.
+        LocalTensor<uint64_t> epoch(TPosition::VECCALC, 0U, 4U);
+        epoch.SetValue(0, a.config.epoch);
+        RouteSave(a.symmetric + a.config.epochSourceOffset, 0U, sizeof(uint64_t));
+    }
 }
 
 __aicore__ inline void RouteExchange(const Arguments& a, uint32_t worker)
@@ -338,14 +351,21 @@ __aicore__ inline void RouteExchange(const Arguments& a, uint32_t worker)
     LocalTensor<uint32_t> counts(TPosition::VECCALC, 8U, le + 1U);
     for (uint32_t e = 0; e <= le; ++e) counts.SetValue(e, static_cast<uint32_t>(prefix.GetValue(e)) - base);
     auto* sym = reinterpret_cast<__gm__ uint8_t*>(a.symmetric);
-    const uint64_t target = reinterpret_cast<uint64_t>(
-        aclshmem_ptr(sym + a.config.routeInboxOffset + uint64_t(a.config.rank) * kRouteMailboxBytes, worker));
-    RouteSave(target, 0U, 8U + (le + 1U) * 4U);
+    const uint64_t inbox = a.config.routeInboxOffset + uint64_t(a.config.rank) * kRouteMailboxBytes;
+    const uint64_t ready = a.config.routeReadyOffset + uint64_t(a.config.rank) * kFlagBytes;
+    const uint32_t bytes = 8U + (le + 1U) * 4U;
+    if (RemoteHost(a, worker)) {
+        const uint64_t outbox = a.symmetric + a.config.routeOutboxOffset + uint64_t(worker) * kRouteMailboxBytes;
+        RouteSave(outbox, 0U, bytes);
+        RocePut(a, inbox, reinterpret_cast<__gm__ uint8_t*>(outbox), bytes, worker, kRouteQp);
+        RocePublish(a, ready, worker, kRouteQp);
+        return;
+    }
+    RouteSave(reinterpret_cast<uint64_t>(aclshmem_ptr(sym + inbox, worker)), 0U, bytes);
     LocalTensor<uint64_t> flag(TPosition::VECCALC, 1024U, 4U);
     // RouteSave has completed the payload MTE before publishing its exact
     // epoch into the single ready slot. Do not use an additive SO flag.
-    PublishDone(sym, a.config.routeReadyOffset + uint64_t(a.config.rank) * kFlagBytes, worker, a.config.epoch, flag,
-                EVENT_ID0);
+    PublishDone(sym, ready, worker, a.config.epoch, flag, EVENT_ID0);
 }
 
 // The small stage order remains explicit to preserve the existing lookahead
@@ -483,10 +503,10 @@ __aicore__ inline void WaitRoutePhase(const Arguments& a, uint32_t index, uint32
 __aicore__ inline void ReadRouteSource(const Arguments& a, uint32_t source)
 {
     if (source >= a.config.world) return;
-    WaitLocalDone(reinterpret_cast<__gm__ uint8_t*>(a.symmetric + a.config.routeReadyOffset + source * kFlagBytes),
-                  a.config.epoch);
+    WaitLocalDone(a, reinterpret_cast<__gm__ uint8_t*>(a.symmetric + a.config.routeReadyOffset + source * kFlagBytes),
+                  source);
     RouteLoad(a.symmetric + a.config.routeInboxOffset + uint64_t(source) * kRouteMailboxBytes, 0U,
-              8U + (a.config.localExperts + 1U) * 4U);
+              8U + (a.config.localExperts + 1U) * 4U, RemoteHost(a, source));
     LocalTensor<uint32_t> inbox(TPosition::VECCALC, 0U, kRouteMailboxBytes / 4U);
     LocalTensor<uint32_t> prefix(TPosition::VECCALC, 2048U, kMaxLocalExperts + 1U);
     LocalTensor<uint64_t> base(TPosition::VECCALC, 4096U, 4U);
@@ -506,23 +526,23 @@ __aicore__ inline void BuildOwnedRouteExperts(const Arguments& a, uint32_t core)
         // Only incoming is needed and it is immutable after SourcesDone.
         // Do not read the per-expert output arrays while other workers write.
         constexpr uint32_t incomingOffset = offsetof(DeviceRouteInfo, incoming);
-        constexpr uint32_t incomingBytes = kWorld * (kMaxLocalExperts + 1U) * sizeof(uint32_t);
+        constexpr uint32_t incomingBytes = kMaxWorld * (kMaxLocalExperts + 1U) * sizeof(uint32_t);
         RouteLoad(a.routeInfo + incomingOffset, kRouteInfoUb + incomingOffset, incomingBytes);
         auto* r = reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
         SummarizeRouteExperts(a.config, *r, begin, end);
         constexpr uint32_t quota = (kMaxLocalExperts + kAic - 1U) / kAic;
-        LocalTensor<uint32_t> sources(TPosition::VECCALC, 0U, quota * (kWorld + 1U));
+        LocalTensor<uint32_t> sources(TPosition::VECCALC, 0U, quota * (kMaxWorld + 1U));
         LocalTensor<uint32_t> groups(TPosition::VECCALC, 4096U, quota);
         LocalTensor<uint32_t> rows(TPosition::VECCALC, 6144U, quota);
         LocalTensor<uint64_t> tiles(TPosition::VECCALC, 8192U, quota);
         for (uint32_t e = begin; e < end; ++e) {
-            for (uint32_t s = 0; s <= kWorld; ++s) sources.SetValue((e - begin) * (kWorld + 1U) + s, r->sources[e][s]);
+            for (uint32_t s = 0; s <= kMaxWorld; ++s) sources.SetValue((e - begin) * (kMaxWorld + 1U) + s, r->sources[e][s]);
             groups.SetValue(e - begin, r->groupBase[e + 1U]);
             rows.SetValue(e - begin, r->compactBase[e + 1U]);
             tiles.SetValue(e - begin, r->gmm1Base[e + 1U]);
         }
-        RouteSave(a.routeInfo + offsetof(DeviceRouteInfo, sources) + uint64_t(begin) * (kWorld + 1U) * 4U, 0U,
-                  (end - begin) * (kWorld + 1U) * 4U);
+        RouteSave(a.routeInfo + offsetof(DeviceRouteInfo, sources) + uint64_t(begin) * (kMaxWorld + 1U) * 4U, 0U,
+                  (end - begin) * (kMaxWorld + 1U) * 4U);
         RouteSave(a.routeInfo + offsetof(DeviceRouteInfo, groupBase) + uint64_t(begin + 1U) * 4U, 4096U,
                   (end - begin) * 4U);
         RouteSave(a.routeInfo + offsetof(DeviceRouteInfo, compactBase) + uint64_t(begin + 1U) * 4U, 6144U,
@@ -561,7 +581,7 @@ __aicore__ inline void RunAiv0RouteSummary(Arguments& a, uint32_t core, Timer& t
 {
     timer.CoarseBegin(CoarsePhase::RouteSummary);
     const uint64_t start = timer.TraceBegin();
-    ReadRouteSource(a, core);
+    for (uint32_t source = core; source < a.config.world; source += kAic) ReadRouteSource(a, source);
     WaitRoutePhase(a, kLocalFlagRouteSourcesDone, a.config.world);
     BuildOwnedRouteExperts(a, core);
     if (core == 0U) {

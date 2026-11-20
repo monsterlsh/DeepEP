@@ -7,27 +7,29 @@
 #include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
 
 namespace MegaMoeUrma {
-// Fixed descriptor/cache capacity. The active communicator is Config::world.
+// Full-batch EP16 defaults. The windowed path has a separate EP32 maximum.
 constexpr uint32_t kWorld = 16;
 constexpr uint32_t kMinWorld = 4;
-constexpr uint32_t kExperts = 2048;  // capacity only; active E = world * localExperts
+constexpr uint32_t kMaxWorld = 32;
 constexpr uint32_t kMaxLocalExperts = 128;
+constexpr uint32_t kExperts = kMaxWorld * kMaxLocalExperts;
 constexpr uint32_t kAic = 28;
 constexpr uint32_t kLocalWorkers = 2U * kAic;
 // EP16 bounds/defaults; active work partitions are derived from Config::world.
 constexpr uint32_t kCommunicationWorkers = kWorld - 1U;
 constexpr uint32_t kActivationWorkers = kAic - kCommunicationWorkers;
-// The full-batch path retains its original limits. The EP8 GELU path issues
+// The full-batch path retains its original limits. The GELU path issues
 // one token window at a time, so its higher TopK fits the same peer scratch.
 constexpr uint32_t kMaxTokensPerRank = 16384U;
-constexpr uint32_t kEp8WindowTokens = 256U;
-constexpr uint32_t kEp8MaxTopk = 32U;
+constexpr uint32_t kWindowTokens = 256U;
+constexpr uint32_t kWindowMaxTopk = 32U;
 constexpr uint32_t kMaxPeerChunks = kMaxTokensPerRank * 8U / 128U;
 // One source contributes at most BS16384 * TopK8 rows; every reorder span
 // contains at least one row. Each peer therefore needs at most 16KiB of bits.
 constexpr uint32_t kMaxPeerReorderSpans = kMaxTokensPerRank * 8U;
-static_assert((kEp8WindowTokens * kEp8MaxTopk + 127U) / 128U <= kMaxPeerChunks);
-static_assert(kEp8WindowTokens * kEp8MaxTopk <= kMaxPeerReorderSpans);
+constexpr uint32_t kWindowPeerChunks = (kWindowTokens * kWindowMaxTopk + 127U) / 128U;
+static_assert(2U * kWindowPeerChunks <= kMaxPeerChunks);
+static_assert(kWindowTokens * kWindowMaxTopk <= kMaxPeerReorderSpans);
 constexpr uint64_t kFlagBytes = 128;
 // Per-invocation counters in localFlags, cleared before the start handshake.
 constexpr uint32_t kLocalFlagDispatchDone = 0U;
@@ -48,7 +50,7 @@ constexpr uint32_t kLocalFlagRouteExpertsDone = 8U;  // committed AIV0 expert sh
 // local GMM2 group that writes its self return rows directly.
 constexpr uint64_t kReduceSelfDependency = uint64_t{1} << 63U;
 constexpr uint32_t kProtocol = 1;
-constexpr uint32_t kDeviceRoutingProtocol = 8;
+constexpr uint32_t kDeviceRoutingProtocol = 9;
 #define MEGAMOE_URMA_ROUTE_REORDER 1
 constexpr uint32_t kTimerCores = kAic * 3U;
 constexpr uint32_t kTimerPhases = 8U;
@@ -210,7 +212,7 @@ struct Chunk {
 // Empty peer streams retain their fixed peer slot with rows=0. The device
 // divides the concatenated virtual row interval equally among Pack workers.
 struct PackRound {
-    Chunk chunks[kWorld];
+    Chunk chunks[kMaxWorld];
     uint64_t rows;
 };
 
@@ -250,6 +252,9 @@ struct Config {
     uint64_t selfRows;
     uint64_t sourceRowCapacity;  // fixed pitch; no receiver offset reply
     uint64_t routeInboxOffset, routeEntryOffset, routeReadyOffset;
+    uint64_t routeOutboxOffset, epochSourceOffset;  // Registered RoCE operands for cross-host windows.
+    uint64_t timeoutCycles = 120000000000ULL;
+    uint32_t windowedTransport = 0U;  // UBX local MTE and optional inter-host RoCE.
     uint32_t routeSegmentCount, routeLinkCount;
 };
 
@@ -302,6 +307,7 @@ struct Arguments {
     uint64_t ffts;
     uint32_t sharedExperts, sharedIntermediate;
     float activationClamp;
+    uint32_t geluLookupWords;      // Zero selects the full-M256 CANN GELU.
     uint64_t sharedWeight1, sharedWeight2, sharedScale1, sharedScale2;
     uint64_t sharedGmm1, sharedActivation, sharedActivationScale, sharedOutput;
     uint64_t sharedGmm1Done, sharedActivationDone;
@@ -311,6 +317,7 @@ struct Arguments {
     uint64_t sharedRoutedOutput;  // S1 FP32 routed sum; round only after adding shared result.
     uint64_t gmmIssued;           // per-AIC monotonic routed output submission count
     uint64_t expertRoutes;        // int32 [384, sourceRowCapacity], one owner per expert
+    uint64_t geluLookup;          // Device address of the Plan's calibrated FP32 factor pages.
 };
 static_assert(sizeof(Fragment) == 40);
 static_assert(sizeof(RowSegment) == 40);
@@ -319,7 +326,7 @@ static_assert(sizeof(PeerReorderRange) == 8);
 static_assert(sizeof(ComputeBatch) == 8);
 static_assert(sizeof(ComputeBatchTask) == 8);
 static_assert(sizeof(Chunk) == 40);
-static_assert(sizeof(PackRound) == kWorld * sizeof(Chunk) + sizeof(uint64_t));
+static_assert(sizeof(PackRound) == kMaxWorld * sizeof(Chunk) + sizeof(uint64_t));
 }  // namespace MegaMoeUrma
 
 extern "C" void mega_moe_urma_kernel_do(uint32_t block_dim, uint32_t ub_bytes, void* stream,

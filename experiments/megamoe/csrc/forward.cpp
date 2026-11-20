@@ -3,6 +3,7 @@
 
 #include "forward.hpp"
 #include "kernel_launch.hpp"
+#include "urma_workspace.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -18,6 +19,7 @@
 #include "tiling/platform/platform_ascendc.h"
 
 #include "check.hpp"
+#include "gelu_lut_setup.hpp"
 #include "kernels/mega_moe_common/common/ascend_timer_v2.hpp"
 #include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
 #include "kernels/mega_moe_common/common/mega_moe_workspace.hpp"
@@ -52,9 +54,8 @@ uint32_t ActivationInputElementsPerByte(const MegaMoeTilingData& t)
 
 uint32_t DispatchCopyBytes(const MegaMoeTilingData& t)
 {
-    const uint32_t token = AlignUp(t.h / ActivationInputElementsPerByte(t), uint32_t{256});
-    const uint32_t scale = AlignUp(CeilDiv(t.h, uint32_t{32}), uint32_t{32});
-    return token + scale + (t.topkWeightsPrefetch ? AlignUp(t.topK * 4U, 32U) : 0U);
+    return static_cast<uint32_t>(MegaMoeImpl::CalcQuantTokenScaleBytes(
+        t.h, ActivationInputElementsPerByte(t), t.topK, t.topkWeightsPrefetch != 0));
 }
 
 MegaMoeDispatchBufferConfig DispatchConfig(const MegaMoeTilingData& t, uint32_t ub)
@@ -169,8 +170,7 @@ void SetSendMaskConfigs(MegaMoeTilingData& t, uint32_t ub)
         static_cast<uint32_t>(CeilDiv(HostFlagElements(t), static_cast<uint64_t>(t.blockAivNum)));
     const uint32_t reset_count = std::min(reset_per_core, static_cast<uint32_t>(DISPATCH_RESET_BATCH));
     const uint32_t reset_bytes = AlignUp(reset_count, uint32_t{MegaMoeImpl::INT32_PER_256B}) * 4U;
-    const uint32_t quant_out =
-        AlignUp(t.h / ActivationInputElementsPerByte(t), 256U) + AlignUp(CeilDiv(t.h, 32U), 32U);
+    const uint32_t quant_out = DispatchCopyBytes(t);
     const uint32_t quant_in = AlignUp(t.h, 128U) * 2U;
     const auto sharedPolicy = MegaMoeImpl::SelectSharedExpertPolicy(
         t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 &&
@@ -313,57 +313,32 @@ void CheckTensor(const torch::Tensor& t, int64_t dims, const char* name)
     TORCH_CHECK(t.dim() == dims, name, " must be ", dims, "D");
 }
 
-using MegaMoeUrma::Config;
-constexpr uint64_t kAlignment = 512;
-uint64_t Align(uint64_t value, uint64_t alignment = kAlignment)
-{
-    return (value + alignment - 1) / alignment * alignment;
-}
-
-Config UrmaLayout(int64_t world, int64_t max_tokens, int64_t topk, int64_t hidden, int64_t cv_rows,
-                  int64_t topk_weights_type, bool windowed)
-{
-    TORCH_CHECK(hidden >= 256 && hidden <= 8192 && hidden % 256 == 0, "URMA requires H256..8192 aligned256");
-    if (windowed) {
-        TORCH_CHECK(world == 8 && max_tokens > 0 && max_tokens <= MegaMoeUrma::kEp8WindowTokens && topk >= 1 &&
-                        topk <= MegaMoeUrma::kEp8MaxTopk,
-                    "Windowed MegaMoE URMA requires EP8, K1..32 and window capacity in [1,256]");
-    } else {
-        TORCH_CHECK((world == 4 || world == 8 || world == 16) && max_tokens > 0 &&
-                        max_tokens <= MegaMoeUrma::kMaxTokensPerRank && topk >= 1 && topk <= 8,
-                    "MegaMoE URMA requires EP4/EP8/EP16, K1..8 and max_tokens in [1,16384]");
-    }
-    Config config{};
-    config.world = static_cast<uint32_t>(world);
-    config.hidden = hidden;
-    config.topk = topk;
-    config.cvRows = cv_rows;
-    config.topkWeightsType = topk_weights_type;
-    config.dispatchScaleStride = topk_weights_type ? AlignUp<uint32_t>(hidden / 32, 32U) + 32U : hidden / 32;
-    config.maxPeerChunks = (max_tokens * topk + cv_rows - 1) / cv_rows;
-    config.sourceRowCapacity = static_cast<uint64_t>(max_tokens) * topk;
-    // Receive indexing reserves a fixed, full source-row stride per peer.
-    const uint64_t max_recv_rows = world * config.sourceRowCapacity;
-    config.receiveXOffset = 0;
-    config.receiveScaleOffset = Align(static_cast<uint64_t>(max_recv_rows) * hidden);
-    config.returnYOffset = Align(config.receiveScaleOffset + static_cast<uint64_t>(max_recv_rows) * config.dispatchScaleStride);
-    config.dispatchReadyOffset = Align(config.returnYOffset + static_cast<uint64_t>(max_tokens) * topk * hidden * 2);
-    config.combineReadyOffset =
-        Align(config.dispatchReadyOffset +
-              static_cast<uint64_t>(world) * ((max_tokens * topk + 127) / 128) * MegaMoeUrma::kFlagBytes);
-    config.barrierOffset =
-        Align(config.combineReadyOffset +
-              static_cast<uint64_t>(world) * ((max_tokens * topk + 127) / 128) * MegaMoeUrma::kFlagBytes);
-    config.routeInboxOffset = Align(config.barrierOffset + 4ULL * world * MegaMoeUrma::kFlagBytes);
-    config.routeEntryOffset = Align(config.routeInboxOffset + world * MegaMoeUrma::kRouteMailboxBytes);
-    config.routeReadyOffset = config.routeEntryOffset + world * MegaMoeUrma::kFlagBytes;
-    config.symmetricBytes = Align(config.routeReadyOffset + world * MegaMoeUrma::kFlagBytes, 2ULL << 20);
-    return config;
-}
-
 uint64_t Address(const torch::Tensor& tensor)
 {
     return reinterpret_cast<uint64_t>(tensor.data_ptr());
+}
+
+std::vector<uint32_t> BuildGeluLookupTable(const torch::Tensor& example, uint32_t blocks)
+{
+    // Calibrate once per plan with the device's BF16 cast and CANN Erf, including nonfinite inputs.
+    constexpr int64_t keys = MegaMoeImpl::MTE_GELU_LUT_KEY_COUNT;
+    auto scratch = torch::empty({keys}, example.options().dtype(torch::kInt32));
+    const auto stream = c10_npu::getCurrentNPUStream();
+    megamoe_init_gelu_factors(stream.stream(), static_cast<uint8_t*>(scratch.data_ptr()), blocks);
+    ASCEND_DEEPEP_CHECK_ACL(aclrtSynchronizeStream(stream.stream()));
+    std::vector<uint32_t> factors(keys);
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(factors.data(), factors.size() * sizeof(uint32_t), scratch.data_ptr(),
+                                        scratch.nbytes(), ACL_MEMCPY_DEVICE_TO_HOST));
+    return PackGeluLookupTable(factors);
+}
+
+int64_t MteWorkspaceAllocationBytes(const MegaMoeTilingData& tiling, const PlatformInfo& platform)
+{
+    const MegaMoeImpl::WorkspaceInfo layout(nullptr, &tiling);
+    const int64_t overhead = static_cast<int64_t>(platform.system_workspace) + kReservedWorkspaceBytes;
+    TORCH_CHECK(layout.workspaceSize >= 0 && layout.workspaceSize <= std::numeric_limits<int64_t>::max() - overhead,
+                "MegaMoE workspace size overflow");
+    return layout.workspaceSize + overhead;
 }
 
 constexpr int64_t kTraceRowElements = MegaMoeUrma::kTimerCores * MegaMoeUrma::kTraceRecordElements;
@@ -387,33 +362,21 @@ int64_t ValidateTimer(const torch::Tensor& timer, bool urma)
     return trace_elements;
 }
 
-uint32_t SelectCv(int64_t world, int64_t bs)
-{
-    return world == 16 && bs <= 2560 ? 128U : 256U;
-}
-
 }  // namespace
 
 struct UrmaWorkspace {
     MegaMoeUrma::Arguments args_{};
-    torch::Tensor expanded_x_, expanded_scale_, gmm1_, activation_, activation_scale_, gmm2_;
-    torch::Tensor gathered_input_scale_, input_scale_done_, gathered_route_weights_;
-    torch::Tensor gmm_issued_, gmm2_contiguous_, peer_reorder_ranges_, peer_reorder_spans_;
-    torch::Tensor fragments_, send_chunks_, recv_chunks_, gmm1_done_, activation_done_, gmm2_done_, local_flags_;
-    torch::Tensor segments_, compute_batches_, compute_tasks_, chunk_group_indices_;
-    torch::Tensor pack_rounds_, pack_ready_;
-    torch::Tensor reduce_dependencies_, order_, inverse_, route_counts_, route_offsets_;
-    torch::Tensor route_histogram_, route_info_, route_config_, expert_routes_;
-    torch::Tensor system_workspace_;
-    torch::Tensor shared_gmm1_, shared_activation_, shared_scale_, shared_output_, shared_routed_output_, shared_done1_,
-        shared_done_act_;
+    std::vector<torch::Tensor> buffers_;
 
     UrmaWorkspace(torch::Tensor example, int64_t world, int64_t intermediate, int64_t topk, int64_t cv_rows,
                   int64_t max_tokens, int64_t rank, uint64_t ffts, uint64_t symmetric_address, int64_t shared_experts,
                   int64_t shared_intermediate, int64_t num_experts, const PlatformInfo& platform, int64_t topk_weights_type,
-                  const std::string& activation, bool windowed)
+                  const std::string& activation, bool windowed, int64_t timeoutSeconds)
     {
-        args_.config = UrmaLayout(world, max_tokens, topk, example.size(1), cv_rows, topk_weights_type, windowed);
+        const auto layout = MakeUrmaSymmetricLayout(world, max_tokens, topk, example.size(1), cv_rows, topk_weights_type, windowed);
+        args_.config = layout.config;
+        args_.config.timeoutCycles = uint64_t(timeoutSeconds) * 1000000000ULL;
+        args_.config.windowedTransport = windowed ? 1U : 0U;
         auto& config = args_.config;
         config.activationMode = activation == "gelu"
                                     ? static_cast<uint32_t>(DEEPEP_MEGAMOE_IMPL_NAMESPACE::MegaMoeActMode::GELU)
@@ -428,160 +391,33 @@ struct UrmaWorkspace {
         args_.symmetric = symmetric_address;
         args_.ffts = ffts;
         const auto options = example.options().dtype(torch::kUInt8);
-        const uint64_t expanded_rows = config.sourceRowCapacity;
-        const uint64_t max_recv_rows = world * expanded_rows;
-        const uint64_t groups = MegaMoeUrma::RouteGroupCapacity(max_recv_rows, config.localExperts);
-        const uint64_t chunks = uint64_t(world) * config.maxPeerChunks;
-        auto allocate = [&](uint64_t bytes) {
-            return torch::empty({static_cast<int64_t>(std::max<uint64_t>(bytes, 512))}, options);
-        };
-        if (args_.sharedExperts) {
-            const uint64_t si = args_.sharedIntermediate, groups = (max_tokens + 255U) / 256U;
-            shared_gmm1_ = allocate(max_tokens * si * (activation == "gelu" ? 2 : 4));
-            shared_activation_ = allocate(max_tokens * si);
-            shared_scale_ = allocate(max_tokens * (si / 32));
-            shared_output_ = allocate(uint64_t(max_tokens) * config.hidden * 2);
-            shared_routed_output_ = allocate(uint64_t(max_tokens) * config.hidden * 4);
-            args_.sharedRoutedOutput = Address(shared_routed_output_);
-            shared_done1_ = allocate(groups * (si / 256) * MegaMoeUrma::kFlagBytes);
-            shared_done_act_ = allocate(groups * MegaMoeUrma::kFlagBytes);
-            args_.sharedGmm1 = Address(shared_gmm1_);
-            args_.sharedActivation = Address(shared_activation_);
-            args_.sharedActivationScale = Address(shared_scale_);
-            args_.sharedOutput = Address(shared_output_);
-            args_.sharedGmm1Done = Address(shared_done1_);
-            args_.sharedActivationDone = Address(shared_done_act_);
+        BindUrmaScratch(args_, layout, max_tokens, platform.system_workspace, [&](uint64_t bytes) {
+            buffers_.push_back(torch::empty({static_cast<int64_t>(bytes)}, options));
+            return Address(buffers_.back());
+        });
+        if (args_.geluLookup && activation == "gelu") {
+            const auto factors = BuildGeluLookupTable(example, platform.aic);
+            if (!factors.empty() && factors.size() <= MegaMoeUrma::WindowGeluUb::tableWords) {
+                const auto bytes = factors.size() * sizeof(uint32_t);
+                ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(reinterpret_cast<void*>(args_.geluLookup),
+                    MegaMoeUrma::WindowGeluUb::tableBytes, factors.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE));
+                args_.geluLookupWords = static_cast<uint32_t>(factors.size());
+            }
         }
-        expanded_x_ = allocate(expanded_rows * config.hidden);
-        expanded_scale_ = allocate(expanded_rows * config.dispatchScaleStride);
-        gathered_input_scale_ = allocate(max_recv_rows * (config.hidden / 32));
-        gathered_route_weights_ = allocate(topk_weights_type ? max_recv_rows * 32U : 0U);
-        gmm1_ = allocate(0);  // routed fused GMM1 writes to paired UB
-        activation_ = allocate(max_recv_rows * intermediate);
-        activation_scale_ = allocate(max_recv_rows * (intermediate / 32));
-        gmm2_ = allocate(max_recv_rows * config.hidden * 2);
-        fragments_ = allocate(0);  // lazy descriptor; placeholder for lifetime bookkeeping
-        segments_ = allocate(0);   // lazy descriptor; placeholder for lifetime bookkeeping
-        compute_batches_ = allocate(groups * sizeof(MegaMoeUrma::ComputeBatch));
-        compute_tasks_ = allocate(2 * groups * sizeof(MegaMoeUrma::ComputeBatchTask));
-        chunk_group_indices_ = allocate(0);  // lazy descriptor; placeholder for lifetime bookkeeping
-        send_chunks_ = allocate(0);          // lazy descriptor; placeholder for lifetime bookkeeping
-        recv_chunks_ = allocate(0);          // lazy descriptor; placeholder for lifetime bookkeeping
-        pack_rounds_ = allocate(0);          // lazy descriptor; placeholder for lifetime bookkeeping
-        pack_ready_ = allocate(chunks * MegaMoeUrma::kFlagBytes);
-        gmm1_done_ = allocate(0);  // FIFO hardware completion replaces per-tile GM flags
-        input_scale_done_ = allocate(groups * MegaMoeUrma::kFlagBytes);
-        activation_done_ = allocate(groups * MegaMoeUrma::kFlagBytes);
-        gmm2_done_ = allocate(groups * MegaMoeUrma::kFlagBytes);
-        order_ = allocate(0);  // compact order exists only in explicit post-run diagnostics
-        inverse_ = torch::empty({int64_t(expanded_rows)}, example.options().dtype(torch::kInt64));
-        reduce_dependencies_ = allocate(0);  // Reduce constructs its own UB dependency cache
-        expert_routes_ = torch::empty({num_experts, int64_t(expanded_rows)}, example.options().dtype(torch::kInt32));
-        route_counts_ = torch::empty({num_experts}, example.options().dtype(torch::kInt64));
-        route_offsets_ = torch::empty({num_experts + 1}, example.options().dtype(torch::kInt64));
-        route_histogram_ = allocate(num_experts * sizeof(uint32_t));
-        route_info_ = allocate(Align(sizeof(MegaMoeUrma::DeviceRouteInfo)));
-        route_config_ = allocate(Align(sizeof(Config)));
-        args_.order = Address(order_);
-        args_.reduceIndex = Address(inverse_);
-        args_.expertRoutes = Address(expert_routes_);
-        args_.reduceDependencies = Address(reduce_dependencies_);
-        args_.routeCounts = Address(route_counts_);
-        args_.routeOffsets = Address(route_offsets_);
-        args_.routeHistogram = Address(route_histogram_);
-        args_.routeInfo = Address(route_info_);
-        args_.routeConfig = Address(route_config_);
-        gmm2_contiguous_ = allocate(0);      // routed GMM2 writes directly to paired UB
-        peer_reorder_ranges_ = allocate(0);  // lazy descriptor; placeholder for lifetime bookkeeping
-        peer_reorder_spans_ = allocate(0);   // lazy descriptor; placeholder for lifetime bookkeeping
-        local_flags_ = allocate((shared_experts ? MegaMoeUrma::kSharedLocalFlagCount : 16U) * MegaMoeUrma::kFlagBytes);
-        gmm_issued_ = allocate(MegaMoeUrma::kAic * MegaMoeUrma::kFlagBytes);
-        args_.gmmIssued = Address(gmm_issued_);
-        system_workspace_ = allocate(platform.system_workspace + (2ULL << 20));
-
-        args_.expandedX = Address(expanded_x_);
-        args_.expandedScale = Address(expanded_scale_);
-        args_.gatheredInputScale = Address(gathered_input_scale_);
-        args_.gatheredRouteWeights = Address(gathered_route_weights_);
-        args_.gmm1Output = Address(gmm1_);
-        args_.activation = Address(activation_);
-        args_.activationScale = Address(activation_scale_);
-        args_.gmm2Output = Address(gmm2_);
-        args_.gmm2Contiguous = Address(gmm2_contiguous_);
-        args_.fragments = Address(fragments_);
-        args_.segments = Address(segments_);
-        args_.computeBatches = Address(compute_batches_);
-        args_.computeTasks = Address(compute_tasks_);
-        args_.chunkGroupIndices = Address(chunk_group_indices_);
-        args_.peerReorderRanges = Address(peer_reorder_ranges_);
-        args_.peerReorderSpans = Address(peer_reorder_spans_);
-        args_.sendChunks = Address(send_chunks_);
-        args_.recvChunks = Address(recv_chunks_);
-        args_.packRounds = Address(pack_rounds_);
-        args_.packReady = Address(pack_ready_);
-        args_.gmm1Done = Address(gmm1_done_);
-        args_.inputScaleDone = Address(input_scale_done_);
-        args_.activationDone = Address(activation_done_);
-        args_.gmm2Done = Address(gmm2_done_);
-        args_.gmm2MatmulDone = 0;  // reserved ABI slot; direct same-core completion -> Reorder
-        args_.localFlags = Address(local_flags_);
-        args_.systemWorkspace = Address(system_workspace_);
     }
 
     template <class Visitor>
     void for_each_tensor(Visitor&& visit) const
     {
-        for (const auto* tensor : {&expanded_x_,
-                                   &expanded_scale_,
-                                   &gathered_input_scale_,
-                                   &gathered_route_weights_,
-                                   &gmm1_,
-                                   &activation_,
-                                   &activation_scale_,
-                                   &gmm2_,
-                                   &gmm2_contiguous_,
-                                   &gmm_issued_,
-                                   &fragments_,
-                                   &segments_,
-                                   &compute_batches_,
-                                   &compute_tasks_,
-                                   &chunk_group_indices_,
-                                   &peer_reorder_ranges_,
-                                   &peer_reorder_spans_,
-                                   &order_,
-                                   &inverse_,
-                                   &route_counts_,
-                                   &route_offsets_,
-                                   &route_histogram_,
-                                   &route_info_,
-                                   &route_config_,
-                                   &expert_routes_,
-                                   &reduce_dependencies_,
-                                   &send_chunks_,
-                                   &recv_chunks_,
-                                   &pack_rounds_,
-                                   &pack_ready_,
-                                   &gmm1_done_,
-                                   &input_scale_done_,
-                                   &activation_done_,
-                                   &gmm2_done_,
-                                   &local_flags_,
-                                   &system_workspace_,
-                                   &shared_gmm1_,
-                                   &shared_activation_,
-                                   &shared_scale_,
-                                   &shared_output_,
-                                   &shared_routed_output_,
-                                   &shared_done1_,
-                                   &shared_done_act_})
-            visit(*tensor);
+        for (const auto& buffer : buffers_) visit(buffer);
     }
 };
 
 Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world,
            int64_t max_tokens, bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts,
            uint64_t symmetric_address, int64_t symmetric_bytes, const std::string& backend, int64_t topk_weights_type,
-           const std::string& activation, const std::string& mma_type, bool windowed)
+           const std::string& activation, const std::string& mma_type, bool windowed,
+           int64_t timeout_seconds)
     : backend_(backend == "mte" ? Backend::Mte : Backend::Urma),
       topk_weights_type_(activation == "gelu" ? 1 : topk_weights_type),
       ffts_(ffts),
@@ -595,6 +431,7 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
       is_a8w4_(is_a8w4),
       is_a4w4_(mma_type == "fp4xfp4"),
       windowed_(windowed),
+      timeout_seconds_(timeout_seconds),
       activation_(activation),
       symmetric_address_(symmetric_address),
       symmetric_bytes_(symmetric_bytes)
@@ -616,8 +453,9 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     TORCH_CHECK(!windowed_ ||
                     (urma && activation_ == "gelu" && shared_experts == 0 && is_a8w4_ && topk_weights_type == 1),
                 "Windowed MegaMoE requires URMA, GELU, S0, FP8xFP4 and topk_weights_type=1");
-    TORCH_CHECK(!windowed_ || ranks_per_node == 0 || ranks_per_node == world,
-                "Windowed MegaMoE requires one host");
+    TORCH_CHECK(timeout_seconds_ > 0 && timeout_seconds_ <= 3600, "Plan timeout_seconds must be in [1,3600]");
+    TORCH_CHECK(!windowed_ || (world == 32 ? ranks_per_node == 16 : (ranks_per_node == 0 || ranks_per_node == world)),
+                "Windowed MegaMoE requires one host for EP8/16 or two contiguous 16-rank hosts for EP32");
     if (urma) {
         TORCH_CHECK(is_a8w4_ && !is_a4w4_ && intermediate >= 256 && intermediate <= 16384 && intermediate % 256 == 0,
                     "URMA supports FP8xFP4 with I256..16384 aligned256");
@@ -654,6 +492,7 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     context.epRankId = static_cast<uint32_t>(rank);
     context.rankSizePerServer = static_cast<uint32_t>(world);
     for (int64_t peer = 0; peer < world; ++peer) {
+        if (urma && world == 32 && rank / 16 != peer / 16) continue;  // RDMA peers have no MTE mapping.
         void* address = aclshmem_ptr(reinterpret_cast<void*>(symmetric_address), static_cast<int32_t>(peer));
         TORCH_CHECK(address != nullptr, "rank=", rank, " prepare: cannot resolve peer=", peer);
         context.epHcclBuffer_[peer] = reinterpret_cast<uint64_t>(address);
@@ -664,19 +503,26 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
                              topk_weights_type_, activation_);
         tiling_.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
         static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
-        const MegaMoeImpl::WorkspaceInfo info(nullptr, &tiling_);
-        const int64_t bytes =
-            info.workspaceSize + static_cast<int64_t>(platform_.system_workspace) + kReservedWorkspaceBytes;
-        TORCH_CHECK(bytes > info.workspaceSize, "MegaMoE workspace size overflow");
+        std::vector<uint32_t> calibratedTable;
+        if (MegaMoeImpl::MteGeluLutFits(tiling_, platform_.ub)) {
+            calibratedTable = BuildGeluLookupTable(example, platform_.aic);
+            tiling_.geluLutWords = static_cast<uint16_t>(calibratedTable.size());
+        }
+        const int64_t bytes = MteWorkspaceAllocationBytes(tiling_, platform_);
+        const size_t lutBytes = tiling_.geluLutWords * sizeof(uint32_t);
         workspace_ = torch::empty({bytes}, example.options().dtype(torch::kUInt8));
+        if (lutBytes) {
+            ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(workspace_.data_ptr(),
+                                                lutBytes, calibratedTable.data(), lutBytes, ACL_MEMCPY_HOST_TO_DEVICE));
+        }
         context_ = torch::empty({static_cast<int64_t>(sizeof(context))}, workspace_.options());
         ASCEND_DEEPEP_CHECK_ACL(
             aclrtMemcpy(context_.data_ptr(), sizeof(context), &context, sizeof(context), ACL_MEMCPY_HOST_TO_DEVICE));
     } else if (windowed_) {
         // S0 fixes all workspace dimensions at prepare, before any peer enters the wave.
-        urma_ = std::make_unique<UrmaWorkspace>(example_, world_, intermediate_, topk_, SelectCv(world_, max_tokens_),
+        urma_ = std::make_unique<UrmaWorkspace>(example_, world_, intermediate_, topk_, UrmaCvRows(world_, max_tokens_),
                                                max_tokens_, rank, ffts_, symmetric_address_, shared_experts_, 0,
-                                               world_ * experts_, platform_, topk_weights_type_, activation_, windowed_);
+                                               world_ * experts_, platform_, topk_weights_type_, activation_, windowed_, timeout_seconds_);
     }
     // Other URMA plans still need the shared tensor dimensions from forward.
 }
@@ -812,10 +658,10 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         if (!urma_ || shared_intermediate_ != shared_i) {
             if (urma_) ASCEND_DEEPEP_CHECK_ACL(aclrtSynchronizeStream(stream.stream()));
             urma_.reset();
-            urma_ = std::make_unique<UrmaWorkspace>(example_, world_, intermediate_, topk_, SelectCv(world_, bs),
+            urma_ = std::make_unique<UrmaWorkspace>(example_, world_, intermediate_, topk_, UrmaCvRows(world_, bs),
                                                     max_tokens_, aclshmem_my_pe(), ffts_, symmetric_address_,
                                                     shared_experts_, shared_i, world_ * experts_, platform_, topk_weights_type_,
-                                                    activation_, windowed_);
+                                                    activation_, windowed_, timeout_seconds_);
             shared_intermediate_ = shared_i;
         }
         urma_->args_.config.bs = bs;
@@ -925,6 +771,53 @@ void validate_timer(const torch::Tensor& timer, const std::string& backend)
     ValidateTimer(timer, backend == "urma");
 }
 
+std::tuple<int64_t, int64_t> urma_window_bytes(int64_t world, int64_t experts, int64_t tokens, int64_t topk,
+                                                int64_t hidden, int64_t intermediate)
+{
+    const auto layout = MakeUrmaSymmetricLayout(world, tokens, topk, hidden, UrmaCvRows(world, tokens), 1, true);
+    TORCH_CHECK(experts >= 1 && experts <= 128 && topk <= world * experts, "Invalid URMA local expert count");
+    TORCH_CHECK(intermediate >= 256 && intermediate <= 16384 && intermediate % 256 == 0,
+                "Invalid URMA intermediate width");
+    MegaMoeUrma::Arguments args{};
+    args.config = layout.config;
+    args.config.localExperts = experts;
+    args.config.windowedTransport = 1U;
+    args.config.intermediate = intermediate;
+    uint64_t scratch = 0;
+    BindUrmaScratch(args, layout, tokens, GetPlatformInfo().system_workspace, [&](uint64_t bytes) {
+        scratch += bytes;
+        return uint64_t{0};
+    });
+    return {layout.config.symmetricBytes, scratch};
+}
+
+int64_t mte_plan_bytes(int64_t world, int64_t experts, int64_t tokens, int64_t capacity, int64_t topk,
+                       int64_t hidden, int64_t intermediate, const std::string& activation, const std::string& mma_type,
+                       int64_t shared_experts, int64_t topk_weights_type)
+{
+    TORCH_CHECK(tokens > 0 && tokens <= capacity, "MTE plan token count outside capacity");
+    TORCH_CHECK(intermediate >= 256 && intermediate <= 4096 && intermediate % 128 == 0,
+                "Plan intermediate_hidden must be divisible by 128, in [256,4096]");
+    TORCH_CHECK(activation == "gelu" || activation == "swiglu", "activation must be 'swiglu' or 'gelu'");
+    TORCH_CHECK(topk_weights_type == 0 || topk_weights_type == 1, "topk_weights_type must be 0 or 1");
+    const bool gelu = activation == "gelu";
+    const bool w4 = mma_type == "fp8xfp4";
+    const int64_t weight_mode = gelu ? 1 : topk_weights_type;
+    TORCH_CHECK(shared_experts >= 0 && shared_experts <= 8 && (w4 || shared_experts == 0),
+                "Plan shared experts require W4A8, with count in [0,8]");
+    // Validate routed dimensions and MMA mode through the same entry point as Plan.
+    buffer_size(world, experts, capacity, topk, hidden, "mte", weight_mode, mma_type, false);
+    const auto platform = GetPlatformInfo();
+    auto tiling = MakeTiling(tokens, hidden, intermediate * (gelu ? 1 : 2), topk, experts, world, capacity,
+                             0, w4, false, shared_experts, platform, weight_mode, activation);
+    if (gelu && w4 && shared_experts == 0) {
+        // A different tail can pass the UB guard even when the current shape misses it.
+        // Budget the largest calibrated table for any tail at this capacity.
+        tiling.geluLutWords = static_cast<uint16_t>(MegaMoeImpl::MTE_GELU_LUT_WORD_CAPACITY);
+    }
+    return MteWorkspaceAllocationBytes(tiling, platform) + sizeof(Mc2Aclnn::Mc2MoeContext);
+}
+
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden,
                     const std::string& backend, int64_t topk_weights_type, const std::string& mma_type, bool windowed)
 {
@@ -938,9 +831,9 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
     TORCH_CHECK(resolved_mma_type != "fp4xfp4", "A4W4 (mma_type=fp4xfp4) is not enabled");
     if (backend == "urma") {
         TORCH_CHECK(resolved_mma_type == "fp8xfp4", "URMA requires routed FP8xFP4");
-        const auto layout = UrmaLayout(world, tokens, topk, hidden, 128, topk_weights_type, windowed);
+        const auto layout = MakeUrmaSymmetricLayout(world, tokens, topk, hidden, 128, topk_weights_type, windowed);
         TORCH_CHECK(experts >= 1 && experts <= 128 && topk <= world * experts, "Invalid URMA expert count");
-        return layout.symmetricBytes;
+        return layout.config.symmetricBytes;
     }
     TORCH_CHECK(world >= 2 && world <= 128 && experts >= 1 && experts <= 128 && tokens >= 1 && tokens <= 65536 &&
                     topk >= 1 && topk <= 32 && topk <= world * experts && hidden >= 1024 && hidden <= 8192 &&

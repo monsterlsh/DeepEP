@@ -9,6 +9,7 @@ from deep_ep._runtime import Runtime
 class _MegaRuntime(Runtime):
     _megamoe = True
 
-    def __init__(self, group, capacity, timeout=120, *, backend="mte"):
+    def __init__(self, group, capacity, timeout=120, *, backend="mte", windowed=False):
         self._megamoe_backend = backend
+        self._megamoe_windowed = windowed
         super().__init__(group, capacity, timeout)

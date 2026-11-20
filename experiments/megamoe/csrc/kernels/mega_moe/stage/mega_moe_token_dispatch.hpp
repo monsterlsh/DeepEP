@@ -50,6 +50,7 @@ struct TokenDispatchScratch {
     LocalTensor<int32_t> cumsumInfoTensor;
     // Contiguous runtime-sized ring. A slot view is built from this UB base on demand.
     uint32_t copyTmpBaseAddr;
+    uint32_t ubEndBytes = 0U;
     LocalTensor<int32_t> metaInfoTensor;
     LocalTensor<int32_t> expertTokenNumsOutTensor;
     int64_t revTokenElemCnt;

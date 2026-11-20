@@ -105,14 +105,16 @@ def unified_runtime_environment(monkeypatch):
             events.append("peer_access_error")
             return state.local_error
 
-        def close(self):
-            events.append("close")
+        def close(self, host_coordinated=False):
+            events.append("host-close" if host_coordinated else "close")
 
         def barrier(self):
             pytest.fail("No device barrier before peer-access agreement")
 
-    def create(rank, size, capacity, address, timeout, backend="mte"):
+    def create(rank, size, capacity, address, timeout, backend="mte", windowed=False):
         calls.append((rank, size, capacity, address, timeout, backend))
+        if windowed:
+            events.append("windowed")
         events.append("create")
         return NativeSession()
 
@@ -129,6 +131,7 @@ def unified_runtime_environment(monkeypatch):
         "npu_api",
         lambda: SimpleNamespace(
             current_device=lambda: 0,
+            synchronize=lambda device: events.append("device-sync"),
             Stream=lambda **kwargs: SimpleNamespace(synchronize=lambda: events.append("stream-sync")),
         ),
     )
@@ -222,3 +225,34 @@ def test_backend_specific_capacity_limits(unified_runtime_environment):
     runtime = _MegaRuntime(env.group, 2 << 30, backend="urma")
     assert env.calls[0][2] == 2 << 30
     runtime.close()
+
+
+@pytest.mark.parametrize("interleaved", [True, False])
+def test_ubx_ep32_requires_contiguous_hosts_before_shmem(unified_runtime_environment, monkeypatch, interleaved):
+    env = unified_runtime_environment
+    group = StoreGroup(None, 0, 32, prefix="ep32-runtime")
+    monkeypatch.setenv("DEEPEP_LL_BACKEND", "rdma")
+
+    def gather(value, stage):
+        if stage == "runtime configuration":
+            rows = [list(value) for _ in range(32)]
+            for rank, row in enumerate(rows):
+                row[4] += rank // 16
+                row[6] = rank % 16
+            return rows
+        if stage == "ndr topology":
+            if interleaved:
+                return [(f"host{r % 2}", (), r // 2) for r in range(32)]
+            return [(f"host{r // 16}", (), r % 16) for r in range(32)]
+        return [value] * 32
+
+    monkeypatch.setattr(group, "all_gather", gather)
+    if interleaved:
+        with pytest.raises(ValueError, match="16 contiguous ranks"):
+            _MegaRuntime(group, 2 << 20, backend="urma", windowed=True)
+        assert not env.calls
+        return
+    rt = _MegaRuntime(group, 2 << 20, backend="urma", windowed=True)
+    assert rt.host_coordinated and "windowed" in env.events
+    rt.close()
+    assert env.events[-2:] == ["device-sync", "host-close"]

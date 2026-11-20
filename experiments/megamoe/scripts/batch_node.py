@@ -65,7 +65,7 @@ def benchmark_command(plan, run_dir, rank, bs):
         "--nnodes",
         str(len(plan["hosts"])),
         "--nproc-per-node",
-        "8",
+        str(plan.get("ranks_per_node", 8)),
         "--node-rank",
         str(rank),
         "--master-addr",
@@ -90,13 +90,14 @@ def benchmark_command(plan, run_dir, rank, bs):
         str(run_dir / f"bs_{bs}"),
     ]
     if plan["mode"] == "accuracy":
-        command += ["--check-tokens", "0", "--golden-dir", str(Path(plan["root"]) / "benchmark-golden")]
+        command += ["--check-tokens", str(plan.get("check_tokens", 0)), "--golden-dir", str(Path(plan["root"]) / "benchmark-golden")]
     if plan["timer"]:
         command += ["--timer", "--timer-ranks", "0-7"]
     return command
 
 
 def golden_command(plan, run_dir, rank, bs):
+    ranks_per_node = plan.get("ranks_per_node", 8)
     return [
         sys.executable,
         "-I",
@@ -107,9 +108,11 @@ def golden_command(plan, run_dir, rank, bs):
         "--bs-values",
         str(bs),
         "--ep-size",
-        str(len(plan["hosts"]) * 8),
+        str(len(plan["hosts"]) * ranks_per_node),
         "--ranks",
-        f"{rank * 8}-{rank * 8 + 7}",
+        f"{rank * ranks_per_node}-{(rank + 1) * ranks_per_node - 1}",
+        "--check-tokens",
+        str(plan.get("check_tokens", 0)),
         "--input",
         plan["input"],
         "--routing",
@@ -163,10 +166,11 @@ with open(sys.argv[1], "w") as f:
 
     interfaces = json.loads(run(["ip", "-j", "-4", "addr", "show", "up"], capture=True))
     interface = interface_for(plan["hosts"][rank], interfaces)
+    ranks_per_node = plan.get("ranks_per_node", 8)
     os.environ.update(
         OMP_NUM_THREADS="1",
         PYTHONUNBUFFERED="1",
-        ASCEND_RT_VISIBLE_DEVICES="0,1,2,3,4,5,6,7",
+        ASCEND_RT_VISIBLE_DEVICES=",".join(map(str, range(ranks_per_node))),
         DEEPEP_SHMEM_ENDPOINT=f"tcp://{plan['hosts'][0]}:{plan['shmem_port']}",
     )
     if args.stage == "preflight":
@@ -179,7 +183,7 @@ with open(sys.argv[1], "w") as f:
                 "-c",
                 "import numpy, torch, torch_npu; "
                 "print(torch.__version__, torch_npu.__version__); "
-                "assert torch.npu.device_count() >= 8, 'Need eight visible NPU devices'",
+                f"assert torch.npu.device_count() >= {ranks_per_node}, 'Need {ranks_per_node} visible NPU devices'",
             ]
         )
         run(["npu-smi", "info"])
@@ -246,6 +250,10 @@ with open(sys.argv[1], "w") as f:
         if rank != 0:
             raise ValueError("Only the master parses the selected timer ranks")
         for bs in plan["config"]["bs_values"]:
+            manifest = read_json(run_dir / f"bs_{bs}/rank_0/manifest.json")
+            if manifest["backend"] == "urma":
+                # URMA decodes the selected per-rank binary traces in the benchmark.
+                continue
             run(
                 [
                     sys.executable,

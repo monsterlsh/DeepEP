@@ -66,7 +66,7 @@ PYBIND11_MODULE(_C, module)
 #ifdef DEEPEP_BUILD_MEGAMOE
     module.def("create_megamoe_runtime", &deepep::megamoe::create_runtime, py::arg("rank"), py::arg("size"),
                py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"), py::arg("backend") = "mte",
-               py::call_guard<py::gil_scoped_release>());
+               py::arg("windowed") = false, py::call_guard<py::gil_scoped_release>());
     module.def("megamoe_workspace_address", &deepep::Session::workspace_address);
 #endif
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED

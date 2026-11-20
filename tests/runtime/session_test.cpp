@@ -8,15 +8,24 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef DEEPEP_BUILD_MEGAMOE
+#include "runtime/megamoe_session.hpp"
+#include "host_device/shmem_common_types.h"
+#include "host/shmem_host_def.h"
+#include <cstring>
+#endif
 
 namespace {
 int initialized = 0, allocations = 0, frees = 0, finalized = 0, barriers = 0, memsets = 0;
 int init_status = 0, memset_status = 0, finalize_status = 0;
 bool allocation_failure = false;
 int qp_count = 0;
+bool window_transport = false;
+unsigned roce_qps = 0;
 int expected_world = 2;
 uint64_t expected_bytes = 2 << 20;
-int storage = 0, context_token = 0, another_context = 0;
+alignas(512) int storage = 0;
+int context_token = 0, another_context = 0;
 void* current_context = &context_token;
 void* source_address = reinterpret_cast<void*>(0x100000000ULL);
 void* symmetric_address = reinterpret_cast<void*>(0x200000000ULL);
@@ -161,7 +170,9 @@ int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
     check_init_attributes(attr);
     assert(attr->n_pes == expected_world && attr->local_mem_size == expected_bytes);
     assert(attr->runtime_config.udma_shared_jetty == (qp_count ? ACLSHMEM_CONFIG_ENABLED : ACLSHMEM_CONFIG_DEFAULT));
-    assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | (qp_count ? ACLSHMEM_DATA_OP_UDMA : 0)));
+    const int engines = ACLSHMEM_DATA_OP_MTE | (qp_count ? ACLSHMEM_DATA_OP_UDMA : 0)
+                        | (window_transport && expected_world == 32 ? ACLSHMEM_DATA_OP_ROCE : 0);
+    assert(attr->option_attr.data_op_engine_type == engines);
     if (init_status == 0) {
         initialized = 2;
     }
@@ -169,6 +180,11 @@ int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
 }
 int aclshmemx_set_qp_num(data_op_engine_type_t engine, uint32_t count)
 {
+    if (window_transport) {
+        assert(engine == ACLSHMEM_DATA_OP_ROCE && expected_world == 32 && count == 2 && initialized == 0);
+        roce_qps = count;
+        return 0;
+    }
     assert(engine == ACLSHMEM_DATA_OP_UDMA && count == 32 && initialized == 0);
     qp_count = count;
     return 0;
@@ -209,12 +225,50 @@ int aclrtDestroyStream(aclrtStream) { --barrier_streams; return 0; }
 void aclshmemx_barrier_all_on_stream(void*) { ++barriers; }
 extern "C" void deepep_ndr_host_barrier_launch_v2(void*, uint64_t, uint32_t) { ++barriers; }
 
+#ifdef DEEPEP_BUILD_MEGAMOE
+aclshmem_device_host_state_t window_topology{};
+void* test_dlsym(void*, const char* name) {
+    return std::strcmp(name, "g_state") == 0 ? &window_topology : nullptr;
+}
+#endif
+
 int main(int argc, char** argv)
 {
     assert(argc == 2);
     // These SDK doubles intentionally exercise the explicit dense compatibility path.
     setenv("DEEPEP_SHMEM_DENSE_QPS", "1", 1);
     const std::string mode = argv[1];
+#ifdef DEEPEP_BUILD_MEGAMOE
+    if (mode.rfind("window-", 0) == 0) {
+        window_transport = true;
+        expected_world = std::stoi(mode.substr(7));
+        const int rank = expected_world - 1;
+        window_topology.mype = rank;
+        window_topology.npes = expected_world;
+        for (int p = 0; p < expected_world; ++p)
+            window_topology.topo_list[p] = p / 16 == rank / 16 ? ACLSHMEM_TRANSPORT_MTE : ACLSHMEM_TRANSPORT_ROCE;
+        const bool missing = mode.find("missing") != std::string::npos;
+        if (missing) window_topology.topo_list[0] = 0;
+        setenv("DEEPEP_LL_BACKEND", "rdma", 1);
+        auto session = deepep::megamoe::create_runtime(rank, expected_world, expected_bytes, "tcp://127.0.0.1:19091",
+                                                       30, "urma", true);
+        assert(session->peer_access_error().empty() == !missing);
+        assert(roce_qps == (expected_world == 32 ? 2U : 0U));
+        if (expected_world == 32) {
+            fails([&] { session->barrier(); });
+            fails([&] { session->close(); });
+            session->barrier(true);
+            session->close(true);
+            assert(barriers == 0);
+        } else {
+            session->barrier();
+            session->close();
+            assert(barriers == 2);
+        }
+        assert(session->closed() && finalized == 1 && frees == 1);
+        return 0;
+    }
+#endif
     auto create = []() { return deepep::Session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30); };
     if (mode.rfind("huge-", 0) == 0) {
         fault = mode.substr(5);

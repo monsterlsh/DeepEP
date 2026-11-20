@@ -23,7 +23,7 @@ def check_routing(indices, weights, num_experts, num_topk):
 
 
 def check_window_routes(indices, weights, num_experts):
-    """Check the entire logical batch before any EP8 window starts exchanging payloads."""
+    """Check the entire logical batch before any window starts exchanging payloads."""
     import torch
 
     ordered = indices.sort(dim=1).values
@@ -39,14 +39,18 @@ def check_window_routes(indices, weights, num_experts):
             raise ValueError(reason)
 
 
-def collective_check(group, stage, error, signature=None):
+def gather_control(group, stage, value):
     if isinstance(group, StoreGroup):
-        peers = group.all_gather((error, signature), f"check:{stage}")
-    else:
-        import torch.distributed as dist
+        return group.all_gather(value, stage)
+    import torch.distributed as dist
 
-        peers = [None] * dist.get_world_size(group)
-        dist.all_gather_object(peers, (error, signature), group=group)
+    peers = [None] * dist.get_world_size(group)
+    dist.all_gather_object(peers, value, group=group)
+    return peers
+
+
+def collective_check(group, stage, error, signature=None):
+    peers = gather_control(group, f"check:{stage}", (error, signature))
     failures = [f"rank={rank}: {value[0]}" for rank, value in enumerate(peers) if value[0]]
     if failures:
         raise ValueError(f"MegaMoE {stage} failed: " + "; ".join(failures))

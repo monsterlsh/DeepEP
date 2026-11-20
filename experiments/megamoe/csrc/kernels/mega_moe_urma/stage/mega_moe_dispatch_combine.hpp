@@ -73,14 +73,16 @@ __aicore__ inline TraceMeta CooperativeChunkMeta(const Chunk& c, uint32_t offset
 // per turn. No blocking PeerStart/PackReady wait and no per-CV quiet.
 class CooperativePeer {
 public:
-    __aicore__ CooperativePeer(Arguments& a, uint32_t core, Timer& timer, DispatchReceiveObserver& observer)
+    __aicore__ CooperativePeer(Arguments& a, uint32_t owner, uint32_t slot, Timer& timer, DispatchReceiveObserver& observer)
         : a_(a),
-          core_(core),
+          owner_(owner),
           timer_(timer),
           dispatchObserver_(observer),
-          active_(core < CommunicationWorkers(a.config.world)),
-          peer_(active_ ? PeerForOwner(a.config.rank, core) : 0U),
-          submitted_(TPosition::VECCALC, CooperativeUb::submitted, kMaxPeerChunks),
+          active_(owner < a.config.world - 1U),
+          peer_(active_ ? PeerForOwner(a.config.rank, owner) : 0U),
+          selfFinished_(slot != 0U),
+          submitted_(TPosition::VECCALC, CooperativeUb::submitted + slot * kWindowPeerChunks * sizeof(uint32_t),
+                     a.config.world == kMaxWorld || slot != 0U ? kWindowPeerChunks : kMaxPeerChunks),
           selfCounts_(TPosition::VECCALC, CooperativeUb::selfCounts, kMaxPeerChunks)
     {
         dispatchCount_ = active_ ? RuntimeSendCvCount(a, peer_) : 0U;
@@ -101,7 +103,6 @@ public:
     __aicore__ inline bool TryDispatch(PackBatch& pack, bool packDone)
     {
         if (!active_ || !TryStart() || DispatchDone()) return false;
-        auto* symmetric = reinterpret_cast<__gm__ uint8_t*>(a_.symmetric);
         if (a_.sharedExperts && a_.config.bs < 4096U && !sharedHeadReady_) {
             sharedHeadReady_ =
                 ReadGmByPassDCache(LocalCompletionFlag(a_, kLocalFlagSharedGmm1Done)) == static_cast<int32_t>(kAic);
@@ -111,6 +112,9 @@ public:
         const Chunk c = RuntimeSendChunk(a_, peer_, nextDispatch_);
         pack.FlushReady();
         if (ReadGmByPassDCache(PackReadyFlag(a_, peer_, c.cv)) < static_cast<int32_t>(c.rows)) return false;
+        // The window transports borrow event 7. Pack can still own that event
+        // for an inverse-index DMA even after a peer's CV is available.
+        if (a_.config.windowedTransport) pack.Close();
         // Retain S1's 1/1/2/4/8 ramp and merged-batch startup limit. Bound a
         // cooperative turn to eight CVs so FIX consumption gets a fair chance.
         const bool unrestricted = packDone && (sharedHeadReady_ || a_.config.bs >= 4096U);
@@ -132,14 +136,14 @@ public:
         auto m = CooperativeChunkMeta(c, 0U, rows);
         m.bytes = uint64_t(rows) * a_.config.hidden;
         auto start = timer_.TraceBegin();
-        Put(symmetric, a_.config.receiveXOffset + c.remoteRow * a_.config.hidden,
+        Put(a_, a_.config.receiveXOffset + c.remoteRow * a_.config.hidden,
             reinterpret_cast<__gm__ uint8_t*>(a_.expandedX + c.localRow * a_.config.hidden),
             static_cast<uint32_t>(m.bytes), peer_);
         timer_.TraceEnd(TraceEvent::DispatchPutX, start, m);
         const uint32_t scales = a_.config.dispatchScaleStride;
         m.bytes = uint64_t(rows) * scales;
         start = timer_.TraceBegin();
-        Put(symmetric, a_.config.receiveScaleOffset + c.remoteRow * scales,
+        Put(a_, a_.config.receiveScaleOffset + c.remoteRow * scales,
             reinterpret_cast<__gm__ uint8_t*>(a_.expandedScale + c.localRow * scales), static_cast<uint32_t>(m.bytes),
             peer_);
         timer_.TraceEnd(TraceEvent::DispatchPutScale, start, m);
@@ -147,7 +151,7 @@ public:
         start = timer_.TraceBegin();
         for (uint32_t cv = c.cv; cv < c.cv + count; ++cv)
             PublishOrdered(
-                symmetric,
+                a_,
                 a_.config.dispatchReadyOffset + (uint64_t(a_.config.rank) * a_.config.maxPeerChunks + cv) * kFlagBytes,
                 peer_, a_.config.epoch);
         timer_.TraceEnd(TraceEvent::DispatchPublish, start, m);
@@ -168,7 +172,7 @@ public:
         progress = TrySelf() || progress;
         if (remaining_ == 0U && !finished_) {
             const uint64_t start = timer_.TraceBegin();
-            PublishOrdered(reinterpret_cast<__gm__ uint8_t*>(a_.symmetric), PeerPhaseSlot(a_, 1U, a_.config.rank),
+            PublishOrdered(a_, PeerPhaseSlot(a_, 1U, a_.config.rank),
                            peer_, a_.config.epoch);
             TraceMeta m;
             m.peer = peer_;
@@ -185,18 +189,21 @@ public:
         return progress;
     }
 
-    __aicore__ inline void FinishRouted(SharedIncoming& incoming)
+    __aicore__ inline void DrainOutgoing(SharedIncoming& incoming)
     {
         if (!active_) return;
         const uint64_t start = timer_.TraceBegin();
-        Quiet(peer_);
+        Quiet(a_, peer_);
         incoming.dispatch.Poll();  // Final nonblocking receive observation; quiet is not receive evidence.
         TraceMeta m;
         m.peer = peer_;
         timer_.TraceEnd(TraceEvent::CombineSendComplete, start, m);
         timer_.CoarseEnd(CoarsePhase::Combine);
         if (receives_) timer_.MarkSendComplete(Phase::Combine);
-        FinishCombinePeer(a_, core_, incoming.peer, incoming.self);
+    }
+    __aicore__ inline void WaitIncoming(SharedIncoming& incoming)
+    {
+        if (active_) FinishCombinePeer(a_, owner_, incoming.peer, incoming.self);
     }
 
 private:
@@ -213,14 +220,20 @@ private:
         begin_ = r->recvCvBase[peer_];
         receives_ = r->recvCvBase[peer_ + 1U] - begin_;
         dispatchObserver_.Arm(a_, peer_, r->incoming[peer_][a_.config.localExperts]);
-        selfBegin_ = r->recvCvBase[a_.config.rank];
-        selfCount_ = r->recvCvBase[a_.config.rank + 1U] - selfBegin_;
+
         remaining_ = receives_;
         selfRemaining_ = 0U;
-        nextSelf_ = core_;
         for (uint32_t i = 0; i < receives_; ++i) submitted_.SetValue(i, 0U);
-        for (uint32_t i = 0; i < selfCount_; ++i) selfCounts_.SetValue(i, 0U);
-        for (uint32_t i = core_; i < selfCount_; i += CommunicationWorkers(a_.config.world)) ++selfRemaining_;
+        // Only the first logical peer on a core services that core's self-CV partition.
+        if (!selfFinished_) {
+            selfBegin_ = r->recvCvBase[a_.config.rank];
+            selfCount_ = r->recvCvBase[a_.config.rank + 1U] - selfBegin_;
+            nextSelf_ = owner_;
+            for (uint32_t i = owner_; i < selfCount_; i += CommunicationWorkers(a_.config.world)) {
+                selfCounts_.SetValue(i, 0U);
+                ++selfRemaining_;
+            }
+        }
         initialized_ = true;
     }
     __aicore__ inline bool TryRemote()
@@ -240,7 +253,7 @@ private:
             auto m = CooperativeChunkMeta(c, sent, n);
             m.bytes = uint64_t(n) * a_.config.hidden * 2U;
             auto start = timer_.TraceBegin();
-            Put(reinterpret_cast<__gm__ uint8_t*>(a_.symmetric),
+            Put(a_,
                 a_.config.returnYOffset + (c.remoteRow + sent) * a_.config.hidden * 2U,
                 reinterpret_cast<__gm__ uint8_t*>(a_.gmm2Output + (c.localRow + sent) * a_.config.hidden * 2U),
                 static_cast<uint32_t>(m.bytes), peer_);
@@ -251,7 +264,7 @@ private:
             if (sent == c.rows) {
                 start = timer_.TraceBegin();
                 m.bytes = 0U;
-                PublishOrdered(reinterpret_cast<__gm__ uint8_t*>(a_.symmetric),
+                PublishOrdered(a_,
                                a_.config.combineReadyOffset +
                                    (uint64_t(a_.config.rank) * a_.config.maxPeerChunks + c.cv) * kFlagBytes,
                                peer_, a_.config.epoch);
@@ -267,11 +280,11 @@ private:
     {
         if (!selfRemaining_) return false;
         const uint32_t workers = CommunicationWorkers(a_.config.world);
-        const uint32_t owned = (selfCount_ - 1U - core_) / workers + 1U;
+        const uint32_t owned = (selfCount_ - 1U - owner_) / workers + 1U;
         for (uint32_t skipped = 0; skipped < owned; ++skipped) {
             const uint32_t j = nextSelf_;
             nextSelf_ += workers;
-            if (nextSelf_ >= selfCount_) nextSelf_ = core_;
+            if (nextSelf_ >= selfCount_) nextSelf_ = owner_;
             const uint32_t before = selfCounts_.GetValue(j);
             if (before == kReorderCvSubmitted) continue;
             const Chunk c = RuntimeReceiveChunkByIndex(a_, selfBegin_ + j);
@@ -287,7 +300,7 @@ private:
         return false;
     }
     Arguments& a_;
-    uint32_t core_;
+    uint32_t owner_;
     Timer& timer_;
     DispatchReceiveObserver& dispatchObserver_;
     bool active_;
@@ -299,13 +312,17 @@ private:
     LocalTensor<uint32_t> submitted_, selfCounts_;
 };
 
-__aicore__ inline void RunCooperativeAiv1(Arguments& a, uint32_t core, Timer& timer, SharedIncoming& incoming)
+template <bool MultiPeer>
+__aicore__ inline void RunCooperativePeers(Arguments& a, uint32_t core, Timer& timer, SharedIncoming& incoming)
 {
     incoming.dispatch.Init(timer);
     RoutedCompletionConsumer completion(a, core);
     completion.Init();  // even zero-task AICs need the single credit
     PackBatch pack(a, timer);
-    CooperativePeer peer(a, core, timer, incoming.dispatch);
+    CooperativePeer peer(a, incoming.owner, 0U, timer, incoming.dispatch);
+    SharedIncoming secondIncoming{a, MultiPeer ? PeerOwnerForSlot(a.config.world, core, 1U) : a.config.world - 1U};
+    CooperativePeer second(a, secondIncoming.owner, 1U, timer, secondIncoming.dispatch);
+    if constexpr (MultiPeer) secondIncoming.dispatch.Init(timer);
     SharedActivationState shared(a, core, timer);
     if (!peer.Active()) timer.CoarseBegin(CoarsePhase::Activation);
     UbRoutedActivation activation;
@@ -315,6 +332,7 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a, uint32_t core, Timer& ti
     uint32_t nextGather = peer.Active() ? UINT32_MAX : core - comm;
     bool ready = false, packDone = false;
     DirectReorderWork directReorder{a, pack, core, activation};
+    uint64_t lastProgress = MultiPeer ? GetSystemCycle() : 0U;
     while (true) {
         bool progress = false;
         // A bounded Pack quantum each turn, never a Pack-until-empty loop.
@@ -344,19 +362,31 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a, uint32_t core, Timer& ti
                 progress = true;
             }
         }
+        if constexpr (MultiPeer) progress = second.TryDispatch(pack, packDone) || progress;
         // The single RX mailbox must be consumed in exact producer order.
         // Never wait for a later GMM1 while an earlier GMM2 owns the mailbox.
         if (ready) progress = (ConsumeIssuedReorders(completion, directReorder, timer) != 0U) || progress;
         if (ready && packDone) progress = peer.TryCombine(true) || progress;
         incoming.Poll();
+        if constexpr (MultiPeer) {
+            if (ready && packDone) progress = second.TryCombine(true) || progress;
+            secondIncoming.Poll();
+        }
         if (ready && !progress && !shared.Done()) {
             pack.Close();
             CooperativeNoWait before;
             progress = shared.TryOne(before);
         }
-        if (ready && packDone && peer.Done() && completion.Done() && nextGather >= a.config.fragmentCount &&
-            shared.Done())
+        if (ready && packDone && peer.Done() && (!MultiPeer || second.Done()) && completion.Done() &&
+            nextGather >= a.config.fragmentCount && shared.Done())
             break;
+        if constexpr (MultiPeer) {
+            if (progress) lastProgress = GetSystemCycle();
+            else if (peer.Active()) {
+                const uint32_t waiting = second.Active() && peer.Done() ? secondIncoming.owner : incoming.owner;
+                CheckPeerDeadline(a, lastProgress, PeerForOwner(a.config.rank, waiting), kWaitPeerProgress);
+            }
+        }
         if (!progress) {
             const uint64_t tick = GetSystemCycle();
             while (GetSystemCycle() - tick < 64U) {
@@ -364,8 +394,21 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a, uint32_t core, Timer& ti
         }
     }
     pack.Close();
-    if (!a.sharedExperts) peer.FinishRouted(incoming);
+    if (!a.sharedExperts) {
+        // Retire both outgoing queues before waiting for a slower inbound peer.
+        peer.DrainOutgoing(incoming);
+        if constexpr (MultiPeer) second.DrainOutgoing(secondIncoming);
+        peer.WaitIncoming(incoming);
+        if constexpr (MultiPeer) second.WaitIncoming(secondIncoming);
+    }
     if (!peer.Active()) timer.CoarseEnd(CoarsePhase::Activation);
     // S1 preserves the outer Reduce -> final quiet/finished-observe ordering.
+}
+__aicore__ inline void RunCooperativeAiv1(Arguments& a, uint32_t core, Timer& timer, SharedIncoming& incoming)
+{
+    if (a.config.world == kMaxWorld)
+        RunCooperativePeers<true>(a, core, timer, incoming);
+    else
+        RunCooperativePeers<false>(a, core, timer, incoming);
 }
 }  // namespace MegaMoeUrma

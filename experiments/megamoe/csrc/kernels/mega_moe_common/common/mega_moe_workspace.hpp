@@ -16,7 +16,7 @@
 
 namespace DEEPEP_MEGAMOE_IMPL_NAMESPACE {
 
-HOST_DEVICE inline uint32_t MteWorkspaceWindowSlots(const MegaMoeTilingData& tilingData)
+HOST_DEVICE uint32_t MteWorkspaceWindowSlots(const MegaMoeTilingData& tilingData)
 {
     const bool unsupported = tilingData.topoType != TOPO_TYPE_MTE || tilingData.combineQuantMode != COMBINE_NO_QUANT ||
                              tilingData.groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
@@ -24,18 +24,18 @@ HOST_DEVICE inline uint32_t MteWorkspaceWindowSlots(const MegaMoeTilingData& til
     return WaveWindowSlotCount(!unsupported, tilingData.groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4);
 }
 
-HOST_DEVICE inline uint64_t MteWorkspaceRowCapacity(const MegaMoeTilingData& tilingData)
+HOST_DEVICE uint64_t MteWorkspaceRowCapacity(const MegaMoeTilingData& tilingData)
 {
     return WaveWindowRowCapacity(tilingData.maxOutputSize, tilingData.mGroupsPerWave,
                                  MteWorkspaceWindowSlots(tilingData));
 }
 
-HOST_DEVICE inline bool MteWorkspaceWindowed(const MegaMoeTilingData& tilingData)
+HOST_DEVICE bool MteWorkspaceWindowed(const MegaMoeTilingData& tilingData)
 {
     return MteWorkspaceRowCapacity(tilingData) < tilingData.maxOutputSize;
 }
 
-HOST_DEVICE inline WaveRowMapping MteWaveRowMapping(const MegaMoeTilingData& tilingData, uint64_t waveId,
+HOST_DEVICE WaveRowMapping MteWaveRowMapping(const MegaMoeTilingData& tilingData, uint64_t waveId,
                                                     uint64_t logicalStart)
 {
     return MakeWaveRowMapping(tilingData.maxOutputSize, MteWorkspaceRowCapacity(tilingData),
@@ -47,7 +47,29 @@ constexpr int64_t SIZE_INT_8 = 1U;
 constexpr int64_t SIZE_INT_32 = 4U;
 constexpr int64_t SIZE_BF_16 = 2U;
 
+// The table is loaded after quant/route/reset, and expires before Unpermute. Only the
+// Dispatch rings, no-quant Combine and the M128 GELU epilogue reuse AIV1 UB in its lifetime.
+HOST_DEVICE bool MteGeluLutFits(const MegaMoeTilingData& t, uint32_t ubBytes)
+{
+    if (t.topoType != TOPO_TYPE_MTE || t.groupedMatmulMode != GROUPED_MATMUL_MODE_A8W4 ||
+        t.combineQuantMode != COMBINE_NO_QUANT || t.sharedExpertNum != 0 || t.topkWeightsPrefetch != 1 ||
+        t.actMode != static_cast<uint8_t>(MegaMoeActMode::GELU)) return false;
+    const auto& d = t.dispatchBufferConfig;
+    const uint64_t prefix = Ops::Base::CeilAlign(uint64_t{t.epWorldSize} * t.moeExpertPerRank * 4, uint64_t{32});
+    const uint64_t indices = Ops::Base::CeilAlign(static_cast<uint64_t>(d.routeItemsPerBatch) * 4, uint64_t{32});
+    const uint64_t counts = Ops::Base::CeilAlign(uint64_t{t.moeExpertPerRank} * 4, uint64_t{32});
+    const uint64_t dispatchEnd = prefix + indices + counts + static_cast<uint64_t>(d.bufferCount) *
+        (static_cast<uint64_t>(d.copyBufferBytes) + INT32_PER_256B * sizeof(int32_t));
+    const uint32_t slots = t.bs <= W4A8_SMALL_BATCH_MAX_TOKENS ? WAVE_COMBINE_MAX_ROW_BUFFER_COUNT :
+                                                                WAVE_COMBINE_PREFILL_ROW_BUFFER_COUNT;
+    const uint64_t combineEnd = WAVE_COMBINE_UB_BASE + slots * Ops::Base::CeilAlign(uint64_t{t.h} * 2, uint64_t{32});
+    constexpr uint64_t metadataEnd = META_INFO_TENSOR_ADDR + WAVE_COMBINE_META_INFO_TOKEN_CAPACITY *
+                                      META_INFO_SIZE * sizeof(int32_t);
+    return dispatchEnd <= MTE_GELU_LUT_UB_BEGIN && combineEnd <= MTE_GELU_LUT_UB_BEGIN && metadataEnd <= ubBytes;
+}
+
 struct WorkspaceInfo {
+    GM_ADDR geluLutPtr{nullptr};
     GM_ADDR dispatchRevDataPtr;
     GM_ADDR dispatchRevScalePtr;
     GM_ADDR dispatchRevWeightsPtr{nullptr};
@@ -99,7 +121,8 @@ struct WorkspaceInfo {
 private:
     HOST_DEVICE void InitializeWorkspaceLayout(GM_ADDR base, const MegaMoeTilingData* tilingData, uint32_t serverNum)
     {
-        workspaceSize = 0;
+        geluLutPtr = tilingData->geluLutWords ? base : nullptr;
+        workspaceSize = Ops::Base::CeilAlign(static_cast<int64_t>(tilingData->geluLutWords) * SIZE_INT_32, ALIGN_512);
         const int64_t rowCapacity = static_cast<int64_t>(MteWorkspaceRowCapacity(*tilingData));
         const int64_t dispatchElementsPerByte = tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
                                                         tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ
@@ -108,7 +131,7 @@ private:
         // 混合 A4W4 的 ActivationQuant 提升为 FP8；仅泛型 A4W4_NZ 保持 FP4 激活输出。
         const int64_t activationElementsPerByte =
             tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ ? 2 : 1;
-        dispatchRevDataPtr = base;
+        dispatchRevDataPtr = base + workspaceSize;
         workspaceSize += Ops::Base::CeilAlign(
             SIZE_INT_8 * rowCapacity * tilingData->h / dispatchElementsPerByte, ALIGN_512);
         dispatchRevScalePtr = base + workspaceSize;

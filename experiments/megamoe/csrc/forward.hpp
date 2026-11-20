@@ -30,7 +30,8 @@ public:
     Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world, int64_t max_tokens,
          bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts, uint64_t symmetric_address,
          int64_t symmetric_bytes, const std::string& backend = "mte", int64_t topk_weights_type = 0,
-         const std::string& activation = "swiglu", const std::string& mma_type = "", bool windowed = false);
+         const std::string& activation = "swiglu", const std::string& mma_type = "", bool windowed = false,
+         int64_t timeout_seconds = 120);
     ~Plan();
 
     std::tuple<torch::Tensor, torch::Tensor> forward(
@@ -57,6 +58,7 @@ private:
     bool is_a8w4_;
     bool is_a4w4_ = false;
     bool windowed_;
+    int64_t timeout_seconds_;
     std::string activation_;
     uint64_t symmetric_address_;
     int64_t symmetric_bytes_;
@@ -67,6 +69,12 @@ private:
 torch::Tensor allocate_timer(torch::Tensor example, const std::string& backend = "mte");
 void validate_timer(const torch::Tensor& timer, const std::string& backend);
 
+std::tuple<int64_t, int64_t> urma_window_bytes(int64_t world, int64_t experts, int64_t tokens, int64_t topk,
+                                                int64_t hidden, int64_t intermediate);
+
+int64_t mte_plan_bytes(int64_t world, int64_t experts, int64_t tokens, int64_t capacity, int64_t topk,
+                       int64_t hidden, int64_t intermediate, const std::string& activation, const std::string& mma_type,
+                       int64_t shared_experts, int64_t topk_weights_type);
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden,
                     const std::string& backend = "mte", int64_t topk_weights_type = 0,
                     const std::string& mma_type = "", bool windowed = false);

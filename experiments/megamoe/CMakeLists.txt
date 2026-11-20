@@ -20,7 +20,7 @@ set(beta_include
     "${CMAKE_CURRENT_SOURCE_DIR}/csrc"
     "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/mega_moe"
     "${CATLASS_ROOT}/include" "${CATLASS_ROOT}/examples/common"
-    "${SHMEM_ROOT}/include" "${SHMEM_ROOT}/src" "${SHMEM_ROOT}/src/device"
+    "${SHMEM_ROOT}/include" "${SHMEM_ROOT}/src" "${SHMEM_ROOT}/src/device" "${SHMEM_ROOT}/src/device_simt"
     "${ASCEND_HOME_PATH}/include" "${ASCEND_HOME_PATH}/pkg_inc"
     "${ASCEND_HOME_PATH}/include/experiment/runtime"
     "${ASCEND_HOME_PATH}/pkg_inc/runtime"
@@ -63,7 +63,9 @@ add_custom_command(OUTPUT "${kernel_library}"
 set(urma_kernel_library "${CMAKE_CURRENT_BINARY_DIR}/libmegamoe_urma_kernel.so")
 set(urma_kernel_flags ${kernel_flags})
 list(PREPEND urma_kernel_flags "-I${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/mega_moe_urma")
-list(APPEND urma_kernel_flags -fvisibility=hidden -DDEEPEP_MEGAMOE_URMA=1)
+list(APPEND urma_kernel_flags -fvisibility=hidden -DDEEPEP_MEGAMOE_URMA=1
+    -DACLSHMEMI_RDMA_K_BACKEND_HNS_1825=1
+    -DACLSHMEMI_HNS_1825_PI_ON_CHIP=${DEEPEP_SHMEM_HNS_1825_PI_ON_CHIP})
 list(REMOVE_ITEM urma_kernel_flags -Wl,-soname,libmegamoe_kernel.so)
 list(APPEND urma_kernel_flags -Wl,-soname,libmegamoe_urma_kernel.so)
 add_custom_command(OUTPUT "${urma_kernel_library}"

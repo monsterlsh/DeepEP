@@ -8,7 +8,9 @@ Modified by Joyce_An 2026
 公开入口：`deep_ep_experimental.megamoe`。W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度。
 构建和多机测试入口位于本目录的 `scripts/`；机器地址及环境配置由使用者提供。
 
-## UBX 工作清单
+## GELU / TopK32 工作清单
+
+手动编译、准备 Golden、单机及多机精度和性能命令见[从构建到实机验收](../../docs/megamoe-gelu-validation.md)。非 UBX 950 沿用 MTE 后端，UBX 窗口内的同机流量走 MTE，跨机流量走 RoCE。
 
 阶段 A 使用同一台 UBX 上的 8 个 rank、URMA、预量化 FP8 输入、FP4 路由专家和零共享专家。构造 `SymmBuffer`、准备 W1 和调用 `fp8_fp4_mega_moe` 时均传 `activation="gelu"`。各 rank 的实际 B 相同。
 
@@ -16,19 +18,19 @@ Modified by Joyce_An 2026
 | --- | --- | --- |
 | [x] | A · 计算 | 复用分支已有的单投影 W1。GMM1 输出按 BF16 舍入，FP32 计算 GELU 并乘当前 slot 的 `topk_weights`，再舍入、MXFP8 量化并进入 GMM2。源 rank 按原 slot 顺序用 FP32 累加，最后写 BF16。GELU 自动选择提前加权，阶段 A 显式传 0 会集体报错。 |
 | [x] | A · 路由 | 支持 `1 ≤ K ≤ min(32,E)`。K1–8 保留专用归约，K9–32 复用原有六槽流水，按实际 K 遍历。进入首个窗口前，全组核对 B、代号、张量形状和路由。拒绝越界 ID、同 token 重复专家和非有限权重，允许有限的零值及负权重。 |
-| [x] | A · 容量 | 对外 B 最大 65,536。Plan 按 `W=min(256, num_max_tokens_per_rank)` 分配工作区。源 rank 至多展开 W×K 行，目的 rank 为 8 个源预留 8×W×K 行。两个公开入口都复用同一个 Plan，尾窗按实际行数写入原输出，每次成功调用按专家汇总各窗计数。B=39,280 时为 153 个满窗和 112 行尾窗。 |
+| [x] | A · 容量 | 对外 B 最大 65,536。所有 rank 协商 W，源 rank 至多展开 W×K 行，目的 rank 为全部源预留 EP×W×K 行。两个公开入口的尾窗都按实际行数写入原输出，每次调用按专家汇总各窗计数。W=256、B=39,280 时为 153 个满窗和 112 行尾窗。 |
 | [x] | A · 本地回归 | Host C++ 执行设备侧路由与归约代码，覆盖 K1–32、空 peer、热点和非顺序回传行。CPU Golden 检查 GELU 与提前加权。API 测试覆盖满窗、尾窗、重复调用、跨 rank 拒绝非法输入和计划分配失败后的重试。 |
-| [ ] | A · 8 卡实机 | 用匹配 CANN 编译协议 12 的完整 wheel。在 EP8 上跑 K1/8/9/25/32 × B255/256/257，对比全量 BF16 输出与逐专家计数，覆盖均衡、热点和慢 rank。记录峰值 HBM、SHMEM 和端到端耗时。 |
-| [ ] | B · 16 卡机内 | 按可用 HBM 协商 256/128/64 窗口，扩展 EP16 的大 K 路径，验证 E800 下的热点、空接收 rank、跨窗复用及显存预算。 |
-| [ ] | C · 32 卡跨机 | 接入跨机数据与控制通路，验证远端完成、超时和窗口回收。最终按 EP32、每卡 B39280、E800、K25、H4096、I1536 全量比对，并以 K32 复验。 |
+| [x] | B · 16 卡机内开发 | EP16 GELU 支持 K1–32。各 rank 按相同的原生分配布局估算 HBM，集体选择能放入所有卡的最大 W256/128/64。 |
+| [x] | C · 32 卡跨机开发 | UBX 两个连续 16-rank 节点，跨机路由与数据分别使用 RoCE QP，完成数据写入后发布代号；带超时的等待及回收保护跨窗口复用。 |
+| [x] | 非 UBX 950 开发 | 支持原 MTE 拓扑；GELU 大批次超过 1 GiB 对称区时分窗，尾窗使用对应行数的 MTE Plan。容量为 B39280 的路由与最终输出仍按原顺序对外提供。 |
+| [x] | 非 UBX EP8 性能验收 | E800、H4096、I1536、K25 在 B257 和 B39280 的均衡和热点路由上通过。两侧共享输入、路由、GMM2 权重，与原 SwiGLU Finalize 加权配对。各场景均以 8 对最慢 rank 同步端到端时延的比值中位数 ≤ 1 验收。命令与窗口规则见[配对测试](scripts/paired_benchmark.md)。 |
+| [ ] | UBX 实机验收 | 协议 13 wheel；EP8 的 K1/8/9/25/32 × B255/256/257、EP16 热点与空 rank、EP32 全量 B39280 E800 H4096 I1536 K25/K32。记录精度、专家计数、HBM、跨机与性能结果。 |
 
 本地回归可从仓库根目录执行：
 
 ```shell
 python -m pytest -q experiments/megamoe/tests/test_public_api.py experiments/megamoe/tests/test_urma_ep8_routing.py experiments/megamoe/tests/test_urma_ep8_reduce.py experiments/megamoe/tests/test_reference.py experiments/megamoe/tests/test_golden.py experiments/megamoe/tests/test_performance.py
 ```
-
-本轮 Windows 本地回归中，上述 194 项全部通过。MegaMoE 全套 257 项通过、10 项失败。10 项涉及 Linux 启动脚本或 Ascend SDK 打包环境，均在未修改的基线 `0647bd8` 上复现。设备编译、8 卡精度和性能仍待验收。
 
 已准备[单机 8 卡冒烟配置](python/deep_ep_experimental/megamoe/configs/stage_a_ep8_gelu_k25.json)，使用 E800、K25、H256、I256 和 B17/257。后续在设备上先生成 CPU Golden，再运行同配置的精度验证：
 
@@ -213,7 +215,7 @@ wheel 位于 `dist/build-*/`；运行前按构建输出设置 SHMEM 的 `LD_LIBR
 
 ### 配置与启动
 
-所有节点需要相同绝对路径的共享 checkout、匹配的 Conda/CANN 环境、SSH 访问和每机8张空闲 NPU。
+批量启动器需要各节点相同绝对路径的共享 checkout、匹配的 Conda/CANN 环境和 SSH 访问。确认参与节点 CPU 和 NPU 均空闲，并按实际节点指定每机 8 或 16 个 rank。
 在仓库外创建机器配置，通过 `--hosts-file` 显式传入。以下地址仅用于文档示例，需替换为已分配的节点：
 
 ```json
@@ -223,8 +225,7 @@ wheel 位于 `dist/build-*/`；运行前按构建输出设置 SHMEM 的 `LD_LIBR
 }
 ```
 
-EP32/64/128 分别需要4/8/16个不同节点。`master` 可省略，默认使用列表首节点。
-主节点排在 rank0～7，其余节点保持列表顺序。仓库不提供实际机器池。
+节点数为 EP 除以每机 rank 数。例如 EP32 在八卡 950 上用 4 个节点，在十六卡 UBX 上用 2 个节点。`master` 默认为列表首节点。主节点分配第一组连续 rank，其余节点按列表顺序分配。
 在一台控制机设置远端环境后启动：
 
 ```bash
@@ -253,7 +254,9 @@ python experiments/megamoe/scripts/batch_launch.py --hosts-file "$HOSTS_FILE" --
 | `--routing balanced\|random\|skewed` | 默认 balanced；random/skewed 用于精度压力测试 |
 | `--no-timer` | 关闭打点和解析；默认自动保存、解析主节点 rank0～7 |
 | `--no-parse-timer` | 跳过自动流水解析，保留原始 timer 和耗时拆分 |
-| `--ep-size 32\|64\|128` | 默认64；分别为4/8/16台八卡机器 |
+| `--ep-size 8\|16\|32\|64\|128` | 默认为 64。UBX GELU 窗口模式支持 8、16 和 32。 |
+| `--ranks-per-node 8\|16` | 默认为 8。十六卡 UBX 的 EP16/32 传 16。 |
+| `--check-tokens N` | 精度模式每 rank 的抽样数，默认 0 表示全量。 |
 | `--hosts-file 路径 / --master-ip IP` | 必填机器列表 JSON / 覆盖列表内的主节点 |
 | `--master-port / --shmem-port` | 默认29654 / 26733，必须不同且未占用 |
 | `--skip-build / --wheel 路径` | 复用已安装身份匹配的唯一 wheel / 指定共享 wheel；不再编译，但仍向各机安装 |

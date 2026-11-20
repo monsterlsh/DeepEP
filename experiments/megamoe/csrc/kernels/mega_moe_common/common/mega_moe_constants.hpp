@@ -107,6 +107,21 @@ MEGAMOE_CONSTANTS_INLINE constexpr uint32_t ActivationFactor(uint8_t actMode)
 constexpr uint32_t GMM1_FUSED_TILE_N = L1_TILE_N / ACTIVATION_N_HALF;
 // W4A8 的 host wave 预算和 device Dispatch 共用同一实际每卡 BS 边界。
 constexpr uint32_t W4A8_SMALL_BATCH_MAX_TOKENS = 256U;
+
+// MTE AIV1 local storage shared by token Combine and the M128 routed epilogue.
+constexpr uint32_t META_INFO_TENSOR_ADDR = 200U * 1024U;
+constexpr uint32_t WAVE_COMBINE_MAX_ROW_BUFFER_COUNT = 6U;
+constexpr uint32_t WAVE_COMBINE_UB_BASE = 64U * 1024U;
+constexpr uint32_t WAVE_COMBINE_UB_LIMIT = 184U * 1024U;
+constexpr uint32_t WAVE_COMBINE_META_INFO_TOKEN_CAPACITY = 1536U;
+constexpr uint32_t WAVE_COMBINE_PREFILL_ROW_BUFFER_COUNT = 2U;
+constexpr uint32_t MTE_GELU_LUT_UB_BEGIN = 136U * 1024U;
+constexpr uint32_t MTE_GELU_LUT_WORD_CAPACITY = 8192U;
+constexpr uint32_t MTE_GELU_LUT_KEY_COUNT = 1U << 16U;
+constexpr uint32_t MTE_GELU_LUT_PAGE_SHIFT = 7U;
+constexpr uint32_t MTE_GELU_LUT_PAGE_SIZE = 1U << MTE_GELU_LUT_PAGE_SHIFT;
+static_assert(MTE_GELU_LUT_UB_BEGIN + MTE_GELU_LUT_WORD_CAPACITY * sizeof(uint32_t) <= WAVE_COMBINE_UB_LIMIT);
+static_assert(WAVE_COMBINE_UB_LIMIT <= META_INFO_TENSOR_ADDR);
 }  // namespace DEEPEP_MEGAMOE_IMPL_NAMESPACE
 
 #undef MEGAMOE_CONSTANTS_INLINE

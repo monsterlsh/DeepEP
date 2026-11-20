@@ -10,6 +10,7 @@ import re
 import math
 from pathlib import Path
 import statistics
+from time import perf_counter_ns
 
 
 # 用于对齐各 rank 测试排队的默认前置计算，不在算子/计时区间内。
@@ -40,8 +41,10 @@ def enqueue_batch(call, torch, prefix, alignment, iterations, timer=None):
         call(timer if iteration + 1 == iterations else None)
 
 
-def read_kernel_samples(directory, iterations):
+def read_kernel_samples(directory, iterations, windows_per_forward=1):
     """Read only this rank/case's fresh profiler export; never subtract device clocks."""
+    if type(windows_per_forward) is not int or windows_per_forward < 1:
+        raise ValueError("windows_per_forward must be a positive integer")
     samples = []
     paths = sorted(Path(directory).rglob("kernel_details*.csv"))
     for path in paths:
@@ -73,12 +76,51 @@ def read_kernel_samples(directory, iterations):
     keys = [(s["device_id"], s["stream_id"], s["start_us"]) for s in samples]
     if len(keys) != len(set(keys)):
         raise ValueError(f"Duplicate MegaMoE kernel samples under {directory}; refuse misaligned rounds")
-    if len(samples) != iterations:
+    expected = iterations * windows_per_forward
+    if len(samples) != expected:
         raise ValueError(
-            f"{directory}: expected {iterations} MegaMoE kernels, found {len(samples)} "
+            f"{directory}: expected {expected} MegaMoE kernels ({iterations} forwards x {windows_per_forward} windows), "
+            f"found {len(samples)} "
             f"in {len(paths)} kernel_details CSV files; inspect the raw profiler export"
         )
+    for index, sample in enumerate(samples):
+        sample["iteration"], sample["window"] = divmod(index, windows_per_forward)
+        sample["phase"] = "formal"
     return samples
+
+
+def forward_durations(samples, windows_per_forward):
+    """Sum native kernel durations for each completed public forward on a single rank."""
+    if windows_per_forward < 1 or len(samples) % windows_per_forward:
+        raise ValueError("Incomplete window group in profiler export")
+    return [
+        math.fsum(sample["duration_us"] for sample in samples[begin : begin + windows_per_forward])
+        for begin in range(0, len(samples), windows_per_forward)
+    ]
+
+
+def measure_synchronized_forward(call, group, torch, iterations, bs):
+    """Measure host invocation through device completion in a separate, unprofiled batch."""
+    durations = []
+    for index in range(iterations):
+        flush_l2_before_call()
+        torch.npu.synchronize()
+        group.barrier(f"host timing BS={bs} iteration={index}")
+        started = perf_counter_ns()
+        call()
+        torch.npu.synchronize()
+        durations.append((perf_counter_ns() - started) / 1000.0)
+    per_rank = group.all_gather(durations, f"host timings BS={bs}")
+    slowest = [max(values) for values in zip(*per_rank)]
+    rank_max_mean = statistics.mean(slowest)
+    return dict(
+        scope="public_forward_through_device_synchronize",
+        timer_pass=False,
+        rank_max_mean_us=rank_max_mean,
+        global_input_tokens_per_second=bs * len(per_rank) * 1e6 / rank_max_mean,
+        rank_max_rounds_us=slowest,
+        per_rank_rounds_us=per_rank,
+    )
 
 
 def summarize_rounds(per_rank, ranks_per_node=None):
@@ -126,7 +168,7 @@ def summarize_rounds(per_rank, ranks_per_node=None):
     return report
 
 
-def collect_profile(call, group, torch, config, prefix, directory, bs):
+def collect_profile(call, group, torch, config, prefix, directory, bs, windows_per_forward=1):
     import torch_npu
 
     profiler = torch_npu.profiler
@@ -154,7 +196,7 @@ def collect_profile(call, group, torch, config, prefix, directory, bs):
         torch.npu.synchronize()
         print(f"[PROFILE] BS={bs} batch complete; exporting {directory}", flush=True)
         prof.step()
-    return read_kernel_samples(directory, config["iters"])
+    return read_kernel_samples(directory, config["iters"], windows_per_forward)
 
 
 class UrmaLaunchGuard:
@@ -397,10 +439,8 @@ def measure_profiled_forward(forward, *, warmup, iters, guard, directory, fine_f
         sample["iteration"] = iteration
         sample["window"] = window
         sample["phase"] = "warmup" if iteration < warmup else "formal" if iteration < formal_end else "fine"
-    durations = [
-        math.fsum(sample["duration_us"] for sample in samples[begin : begin + windows_per_forward])
-        for begin in range(warmup * windows_per_forward, formal_end * windows_per_forward, windows_per_forward)
-    ]
+    formal_samples = samples[warmup * windows_per_forward : formal_end * windows_per_forward]
+    durations = forward_durations(formal_samples, windows_per_forward)
     # The public forward attaches the diagnostic timer only to window zero.
     diagnostic = samples[formal_end * windows_per_forward] if has_fine else None
     return dict(

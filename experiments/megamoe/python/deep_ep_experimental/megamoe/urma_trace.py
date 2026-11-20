@@ -223,8 +223,8 @@ def decode_trace(raw, *, rank, clock_mhz):
     """
     import numpy as np
 
-    if type(rank) is not int or not 0 <= rank < 16:
-        raise ValueError("rank must be an integer in [0,16)")
+    if type(rank) is not int or not 0 <= rank < 32:
+        raise ValueError("rank must be an integer in [0,32)")
     if isinstance(clock_mhz, bool) or not math.isfinite(clock_mhz) or clock_mhz <= 0:
         raise ValueError("clock_mhz must be positive and finite")
     if isinstance(raw, (bytes, bytearray, memoryview)):
@@ -266,7 +266,7 @@ def decode_trace(raw, *, rank, clock_mhz):
 
     records = []
     for engine, (data, count) in enumerate(zip(slices, counts)):
-        previous_end = None
+        previous_end = previous_start = previous_event = None
         for ordinal in range(count):
             offset = HEADER_WORDS + ordinal * RECORD_WORDS
             row = tuple(map(int, data[offset : offset + RECORD_WORDS]))
@@ -277,13 +277,20 @@ def decode_trace(raw, *, rank, clock_mhz):
                 raise ValueError(f"engine={engine} record={ordinal}: invalid ticks start={start} end={end}")
             observation_point = event_id in (43, 65) and start == end
             if not observation_point:
-                if previous_end is not None and start < previous_end:
+                # EP32 alternates two peers on one AIV1. Its coarse Dispatch
+                # and Combine envelopes can overlap even when each individual
+                # PUT/retire scope on that engine is strictly sequential.
+                overlapping_envelopes = (
+                    {previous_event, event_id} == {49, 53} and engine % 3 == 2 and start >= previous_start
+                )
+                if previous_end is not None and start < previous_end and not overlapping_envelopes:
                     raise ValueError(f"engine={engine} record={ordinal}: overlapping or out-of-order event ticks")
-                previous_end = end
+                previous_end = max(previous_end or 0, end)
+                previous_start, previous_event = start, event_id
             if any(row[13:]):
                 raise ValueError(f"engine={engine} record={ordinal}: nonzero reserved record fields")
-            if row[3] != UNKNOWN and row[3] >= 16:
-                raise ValueError(f"engine={engine} record={ordinal}: peer must be in [0,16) or unknown")
+            if row[3] != UNKNOWN and row[3] >= 32:
+                raise ValueError(f"engine={engine} record={ordinal}: peer must be in [0,32) or unknown")
             records.append((start, end, engine, ordinal, row))
     if not records:
         raise ValueError("trace has no recorded events")
@@ -561,8 +568,8 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
     """
     import numpy as np
 
-    if world not in (4, 8, 16) or not 0 <= rank < world:
-        raise ValueError("world must be 4, 8 or 16 and rank must be in [0,world)")
+    if world not in (4, 8, 16, 32) or not 0 <= rank < world:
+        raise ValueError("world must be 4, 8, 16 or 32 and rank must be in [0,world)")
     if type(group_size) is not int or group_size <= 0 or world % group_size:
         raise ValueError("group_size must be positive and divide world")
     if clock_mhz is not None and (not math.isfinite(clock_mhz) or clock_mhz <= 0):
@@ -574,7 +581,17 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
     receive_markers = values[..., 5] == DISPATCH_SEND_TO_RECEIVE
     if np.any(receive_markers[:, :, :1]) or np.any(receive_markers[:, :, 2:]):
         raise ValueError("receive timing semantics are valid only for Dispatch")
-    receive_mode = bool(np.any(values[: world - 1, 2, 1, 5] == DISPATCH_SEND_TO_RECEIVE))
+    # EP32 shares each owner's timer across up to two peers. The per-event
+    # trace retains peer IDs; its aggregate cannot split INTRA/CROSS bytes.
+    workers = 16 if world == 32 else world - 1
+    lanes = []
+    for owner in range(workers + (world != 32)):
+        if world == 32:
+            lanes.append((owner, None, "ALL_PEERS"))
+        else:
+            peer = _remote_peer_for_worker(rank, owner, world) if owner < workers else rank
+            lanes.append((owner, peer, "INTRA" if peer // group_size == rank // group_size else "CROSS"))
+    receive_mode = bool(np.any(values[:workers, 2, 1, 5] == DISPATCH_SEND_TO_RECEIVE))
     active = (values[..., 4] > 0) | receive_markers
     if np.any(values[..., 6][active] != TIMER_SCHEMA):
         raise ValueError("URMA timer schema is missing or incompatible")
@@ -600,11 +617,9 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
     )
     for phase in ("Dispatch", "Combine"):
         phase_idx = PHASES.index(phase)
-        for kind in ("INTRA", "CROSS"):
+        for kind in (("ALL_PEERS",) if world == 32 else ("INTRA", "CROSS")):
             selected = []
-            for owner in range(world):
-                peer = _remote_peer_for_worker(rank, owner, world) if owner < world - 1 else rank
-                owner_kind = "INTRA" if peer // group_size == rank // group_size else "CROSS"
+            for owner, peer, owner_kind in lanes:
                 record = values[owner, 2, phase_idx]
                 if owner_kind == kind and record[3] > 0:
                     if record[4] <= 0 or record[6] != TIMER_SCHEMA:
@@ -613,9 +628,7 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
             rx_records = []
             use_receive = phase == "Dispatch" and receive_mode
             if use_receive:
-                for owner in range(world - 1):
-                    peer = _remote_peer_for_worker(rank, owner, world)
-                    owner_kind = "INTRA" if peer // group_size == rank // group_size else "CROSS"
+                for owner, peer, owner_kind in lanes[:workers]:
                     if owner_kind == kind:
                         rx_records.append((owner, peer, values[owner, 2, phase_idx]))
                 if any(int(row[8]) < 0 or int(row[9]) < 0 for _, _, row in rx_records):
@@ -690,20 +703,20 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
                         [
                             peer
                             for _, peer, row in rx_records
-                            if row[5] != DISPATCH_SEND_TO_RECEIVE or (row[8] > 0 and row[7] == 0)
+                            if peer is not None and (row[5] != DISPATCH_SEND_TO_RECEIVE or (row[8] > 0 and row[7] == 0))
                         ]
                         if use_receive
-                        else [peer for _, peer, record in selected if record[5] == SUBMISSION_ONLY and record[7] == 0]
+                        else [peer for _, peer, record in selected if peer is not None and record[5] == SUBMISSION_ONLY and record[7] == 0]
                     ),
                     endpoint_semantics="outgoing_first_to_incoming_last" if use_receive else "outbound_completion",
                     received_payload_bytes=sum(int(row[8]) for _, _, row in rx_nonempty) if use_receive else None,
-                    receive_peers=[peer for _, peer, _ in rx_nonempty] if use_receive else [],
+                    receive_peers=[peer for _, peer, _ in rx_nonempty if peer is not None] if use_receive else [],
                     submission_first_tick=first if submission_only else None,
                     submission_last_tick=recorded_last if submission_only else None,
                     submission_envelope_ticks=recorded_last - first if submission_only else None,
                     submission_sum_ticks=sum(int(record[2]) for _, _, record in selected) if submission_only else None,
                     workers=[owner for owner, _, _ in selected],
-                    peers=[peer for _, peer, _ in selected],
+                    peers=[peer for _, peer, _ in selected if peer is not None],
                     includes_self_copy=includes_self_copy,
                 )
             )
@@ -714,14 +727,14 @@ def summarize_bandwidth(records):
     """Average already-local bandwidths, without mixing clocks across ranks."""
     world = len(records)
     if (
-        world not in (4, 8, 16)
+        world not in (4, 8, 16, 32)
         or {row["rank"] for row in records} != set(range(world))
         or any(row.get("world", world) != world for row in records)
     ):
-        raise ValueError("bandwidth summary requires exactly one report for every EP4/EP8/EP16 rank")
+        raise ValueError("bandwidth summary requires exactly one report for every EP4/EP8/EP16/EP32 rank")
     result = []
     for phase in ("Dispatch", "Combine"):
-        for kind in ("INTRA", "CROSS"):
+        for kind in (("ALL_PEERS",) if world == 32 else ("INTRA", "CROSS")):
             rows = [
                 next(row for row in record["classes"] if (row["phase"], row["communication_class"]) == (phase, kind))
                 for record in records

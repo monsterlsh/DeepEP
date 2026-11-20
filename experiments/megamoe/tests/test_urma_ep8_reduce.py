@@ -8,19 +8,19 @@ import sys
 import pytest
 
 
-def test_ep8_reduce_preserves_original_slot_order(tmp_path):
+def test_window_reduce_preserves_original_slot_order(tmp_path):
     compiler = next((path for name in ("c++", "g++", "clang++") if (path := shutil.which(name))), None)
     if compiler is None:
         pytest.skip("A C++17 compiler is required for the host reducer test")
     csrc = Path(__file__).resolve().parents[1] / "csrc"
     kernel = csrc / "kernels/mega_moe_urma/stage/mega_moe_reduce.hpp"
-    first_definition = "template <typename Element>\n__aicore__ inline void AccumulateReturnRow"
+    first_definition = "__aicore__ inline void BuildReduceDependencies"
     reducer = "namespace MegaMoeUrma {\n" + first_definition + kernel.read_text(encoding="utf-8").split(
         first_definition, 1
     )[1]
     source = tmp_path / "reduce.cpp"
     source.write_text(
-        r'''#include "kernels/mega_moe_urma/common/mega_moe_compute_contract.hpp"
+        r'''#include "kernels/mega_moe_urma/common/mega_moe_route_plan.hpp"
 #include <array>
 #include <cassert>
 #include <cstddef>
@@ -75,6 +75,7 @@ template <typename T> struct Tensor {
     void SetGlobalBuffer(T* address) { ptr = address; }
     void SetL2CacheHint(CacheMode) {}
     Tensor operator[](uint64_t offset) const { return Tensor(ptr + offset); }
+    template <typename D> Tensor<D> ReinterpretCast() const { return Tensor<D>(reinterpret_cast<D*>(ptr)); }
     T GetValue(uint32_t index) const { return ptr[index]; }
     void SetValue(uint32_t index, T value) { ptr[index] = value; }
 };
@@ -109,22 +110,25 @@ struct TestTimer {
 };
 void aclshmemi_kernel_abort(const char*) { std::abort(); }
 void WaitPackInverseReady(const Arguments&) {}
-void BuildReduceDependencies(const Arguments&, uint64_t firstRoute, uint32_t count,
-                             AscendC::Tensor<int64_t>&, AscendC::Tensor<uint64_t>& dependencies) {
-    for (uint32_t i = 0U; i < count; ++i) dependencies.SetValue(i, (firstRoute + i) % 2U);
+const DeviceRouteInfo* RouteInfo(const Arguments& args) {
+    return reinterpret_cast<const DeviceRouteInfo*>(args.routeInfo);
 }
 }  // namespace MegaMoeUrma
 '''
         + reducer
         + r'''
 template <bool KeepFp32>
-void Run(uint32_t tokens, uint32_t topk, uint32_t hidden, bool weighted) {
+void Run(uint32_t tokens, uint32_t topk, uint32_t hidden, bool weighted, uint32_t world = 8U) {
     using namespace MegaMoeUrma;
     using AscendC::bfloat16_t;
     using Output = std::conditional_t<KeepFp32, float, bfloat16_t>;
     Arguments args{};
-    args.config.world = 8U;
+    args.config.world = world;
     args.config.bs = tokens;
+    args.config.rank = world - 1U;
+    args.config.localExperts = 25U;
+    args.config.cvRows = 128U;
+    args.topkIdBytes = sizeof(int32_t);
     args.config.topk = topk;
     args.config.hidden = hidden;
     args.config.topkWeightsType = weighted ? 0U : 1U;
@@ -133,13 +137,26 @@ void Run(uint32_t tokens, uint32_t topk, uint32_t hidden, bool weighted) {
     const uint32_t routes = tokens * topk;
     const size_t elements = size_t(routes) * hidden;
     args.config.combineReadyOffset = elements * sizeof(bfloat16_t);
-    std::vector<uint64_t> symmetric(elements / 4U + 2U * kFlagBytes / sizeof(uint64_t));
+    const uint32_t flagCount = world * args.config.maxPeerChunks;
+    std::vector<uint64_t> symmetric(elements / 4U + flagCount * kFlagBytes / sizeof(uint64_t));
     auto* returned = reinterpret_cast<bfloat16_t*>(symmetric.data());
     symmetric[elements / 4U] = args.config.epoch;
-    symmetric[elements / 4U + kFlagBytes / sizeof(uint64_t)] = args.config.epoch;
+    for (uint32_t cv = 0; cv < args.config.maxPeerChunks; ++cv) {
+        const uint32_t idx = (world - 1U) * args.config.maxPeerChunks + cv;
+        symmetric[elements / 4U + idx * kFlagBytes / sizeof(uint64_t)] = args.config.epoch;
+    }
     alignas(64) std::array<int32_t, 4U * kFlagBytes / sizeof(int32_t)> flags{};
     // Force per-route readiness probes, with visible payload in both dependencies.
-    flags[kLocalFlagIncomingDone * kFlagBytes / sizeof(int32_t)] = 7;
+    flags[kLocalFlagIncomingDone * kFlagBytes / sizeof(int32_t)] = world - 1U;
+    // One row is routed to PE0. The remainder use the last PE, which owns
+    // the highest readiness index and includes the rank's direct self return.
+    DeviceRouteInfo info{};
+    for (uint32_t id = 1U; id <= world * args.config.localExperts; ++id) info.outgoing[id] = 1U;
+    info.outgoing[world * args.config.localExperts] = routes;
+    std::vector<int32_t> ids(routes, world * args.config.localExperts - 1U);
+    ids[routes - 1U] = 0;
+    args.routeInfo = reinterpret_cast<uint64_t>(&info);
+    args.topkIds = reinterpret_cast<uint64_t>(ids.data());
     std::vector<int64_t> inverse(routes);
     std::vector<float> weights(routes);
     std::vector<Output> output(size_t(tokens) * hidden, static_cast<Output>(1234.5F));
@@ -189,11 +206,15 @@ void Run(uint32_t tokens, uint32_t topk, uint32_t hidden, bool weighted) {
 }
 
 int main() {
-    for (uint32_t width = 1U; width <= MegaMoeUrma::kEp8MaxTopk; ++width) {
+    for (uint32_t width = 1U; width <= MegaMoeUrma::kWindowMaxTopk; ++width) {
         Run<false>(17U, width, 2304U, false);
         Run<true>(17U, width, 256U, true);
     }
-    Run<false>(MegaMoeUrma::kEp8WindowTokens, MegaMoeUrma::kEp8MaxTopk, 256U, true);
+    for (uint32_t world : {8U, 16U, 32U}) {
+        Run<false>(MegaMoeUrma::kWindowTokens, MegaMoeUrma::kWindowMaxTopk, 256U, true, world);
+        Run<false>(112U, 25U, 4096U, false, world);
+        Run<false>(255U, 32U, 256U, false, world);
+    }
     Run<false>(17U, 8U, 3584U, false);
     Run<false>(17U, 8U, 3584U, true);
 }

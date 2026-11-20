@@ -15,7 +15,15 @@ from pathlib import Path
 
 from .timer.__main__ import parse_ranks
 from .numerics import prequant_route_weight
-from .performance import alignment_config, collect_profile, enqueue_batch, flush_l2_before_call, summarize_rounds
+from .performance import (
+    alignment_config,
+    collect_profile,
+    enqueue_batch,
+    flush_l2_before_call,
+    forward_durations,
+    measure_synchronized_forward,
+    summarize_rounds,
+)
 
 
 def load_config(name, bs_values=None):
@@ -136,7 +144,10 @@ def inputs(config, rank, bs, routing="balanced", *, world):
     if not 0 <= rank < world or bs <= 0 or not 0 < model["num_topk"] <= model["num_experts"]:
         raise ValueError("Invalid rank, BS or top-k for input generation")
     rng = np.random.default_rng(config["seed"] + rank * 1009 + bs)
-    x = bf16(rng.normal(0, 0.2, (bs, model["hidden"])).astype(np.float32))
+    x = np.empty((bs, model["hidden"]), dtype=np.float32)
+    for begin in range(0, bs, 256):
+        rows = x[begin : begin + 256]
+        rows[:] = bf16(rng.normal(0, 0.2, rows.shape).astype(np.float32))
     if routing == "balanced":
         # Enumerate destinations rank-first, then advance the local expert. Each source
         # takes its own slice of the global [token, top-k] route stream.
@@ -329,7 +340,6 @@ def run(args, config, group):
             wait_events=False,
             device_routing_in_kernel=True,
         )
-    (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     model = config["model"]
     if (
         not urma
@@ -344,14 +354,16 @@ def run(args, config, group):
         ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
         **{k: v for k, v in model.items() if k not in ("shared_intermediate_hidden", "shared_output_rounding", "activation_clamp")},
     )
-    if urma:
-        windows_by_bs = {bs: buffer.num_forward_windows(bs) for bs in config["bs_values"]}
-        manifest.update(
-            windows_per_forward_by_bs=windows_by_bs,
-            kernel_duration_scope="sum_of_window_kernels_per_forward",
-            timer_scope="first_window_only" if args.timer else "disabled",
-        )
-        (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    windows_by_bs = {bs: buffer.num_forward_windows(bs) for bs in config["bs_values"]}
+    if buffer._urma_windowed:
+        manifest["device_communication"] = "shmem_mte_roce" if world == 32 else "shmem_mte"
+    manifest.update(
+        windows_per_forward_by_bs=windows_by_bs,
+        window_tokens=buffer.window_tokens,
+        kernel_duration_scope="sum_of_window_kernels_per_forward",
+        timer_scope="first_window_only" if args.timer else "disabled",
+    )
+    (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     def device_pair(pair):
         data, scale = pair
@@ -410,14 +422,17 @@ def run(args, config, group):
     for bs in config["bs_values"]:
         case = rank_dir / f"bs_{bs}"
         case.mkdir()
+        torch.npu.reset_peak_memory_stats()
         x, ids, weights = inputs(config, rank, bs, args.routing, world=world)
         if args.input == "bf16":
             activation = torch.from_numpy(x).to(device="npu", dtype=torch.bfloat16)
         else:
-            data, scale = quantize_activation(x, mma_type)
-            codes = torch.from_numpy(data).npu()
-            buffer.x[:bs].copy_(codes if mma_type == "fp4xfp4" else codes.view(torch.float8_e4m3fn))
-            buffer.x_sf[:bs].copy_(torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
+            for begin in range(0, bs, 256):
+                rows = slice(begin, min(bs, begin + 256))
+                data, scale = quantize_activation(x[rows], mma_type)
+                codes = torch.from_numpy(data).npu()
+                buffer.x[rows].copy_(codes if mma_type == "fp4xfp4" else codes.view(torch.float8_e4m3fn))
+                buffer.x_sf[rows].copy_(torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
             activation = None
         buffer.topk_idx[:bs].copy_(torch.from_numpy(ids))
         buffer.topk_weights[:bs].copy_(torch.from_numpy(weights))
@@ -451,8 +466,12 @@ def run(args, config, group):
             symmetric_buffer_bytes=buffer.symmetric_buffer_bytes,
             prepared_bs=bs,
             max_tokens=buffer.num_max_tokens_per_rank,
+            windows_per_forward=windows_by_bs[bs],
+            window_tokens=buffer.window_tokens,
+            timer_token_range_half_open=[0, min(bs, buffer.window_tokens)] if args.timer and rank in timer_ranks else None,
         )
-        (case / "resources.json").write_text(json.dumps(resources, indent=2), encoding="utf-8")
+        resources_path = case / "resources.json"
+        resources_path.write_text(json.dumps(resources, indent=2), encoding="utf-8")
         timer, error = None, None
         if args.timer:
             try:
@@ -557,23 +576,30 @@ def run(args, config, group):
                 windows_per_forward=windows_by_bs[bs],
                 kernel_duration_scope=manifest["kernel_duration_scope"],
             )
-            (case / "performance.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+            performance_path = case / "performance.json"
         else:
-            samples = collect_profile(call, group, torch, config, prefix, case / "profiler", bs)
+            samples = collect_profile(call, group, torch, config, prefix, case / "profiler", bs, windows_by_bs[bs])
             (case / "kernel_samples.json").write_text(json.dumps(samples, indent=2), encoding="utf-8")
-            timings = [sample["duration_us"] for sample in samples]
+            timings = forward_durations(samples, windows_by_bs[bs])
             per_rank = group.all_gather(timings, f"profiling BS={bs}")
             report = summarize_rounds(per_rank, int(os.environ["LOCAL_WORLD_SIZE"]))
-            report["alignment"] = config["alignment"]
-            (case / "profiling.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+            report.update(
+                alignment=config["alignment"],
+                windows_per_forward=windows_by_bs[bs],
+                kernel_duration_scope=manifest["kernel_duration_scope"],
+            )
+            performance_path = case / "profiling.json"
             if rank == 0:
                 print(
-                    f"[PERF] BS={bs} MegaMoe E2E={report['mean_us']:.3f}us "
+                    f"[PERF] BS={bs} MegaMoe kernel sum={report['mean_us']:.3f}us windows={windows_by_bs[bs]} "
                     f"rank-max-mean={report['rank_max_mean_us']:.3f}us "
                     f"rounds={report['rounds']}/{report['recorded_rounds']} "
                     f"(last ceil(iters/2); kernel Duration; rank-min mean; timer off)",
                     flush=True,
                 )
+        if args.mode == "perf":
+            report["host_e2e"] = measure_synchronized_forward(call, group, torch, config["iters"], bs)
+            performance_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         if args.timer:
             uninstrumented = result.float().cpu().numpy() if args.mode == "accuracy" else None
             if urma:
@@ -604,6 +630,14 @@ def run(args, config, group):
                 _export_mte_timer(args.output_dir, bs, rank, group, timer)
             del timer
         del prefix
+        device_free, device_total = torch.npu.mem_get_info(torch.npu.current_device())
+        resources.update(
+            torch_peak_allocated_bytes=torch.npu.max_memory_allocated(),
+            torch_peak_reserved_bytes=torch.npu.max_memory_reserved(),
+            device_total_bytes=device_total,
+            device_free_after_case_bytes=device_free,
+        )
+        resources_path.write_text(json.dumps(resources, indent=2), encoding="utf-8")
         group.barrier(f"case complete BS={bs}")
     group.barrier("before SHMEM teardown")
     buffer.destroy()

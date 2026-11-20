@@ -140,13 +140,16 @@ def backend(monkeypatch):
         wait_stream=lambda _: events.append("wait"), synchronize=lambda: events.append("synchronize")
     )
     npu = SimpleNamespace(
-        current_device=lambda: 0, current_stream=lambda _: stream, stream=lambda _: contextlib.nullcontext()
+        current_device=lambda: 0, current_stream=lambda _: stream, stream=lambda _: contextlib.nullcontext(),
+        mem_get_info=lambda _: (96 << 30, 96 << 30),
     )
     monkeypatch.setattr(api, "npu_api", lambda: npu)
+    monkeypatch.setattr(api, "check_window_routes",
+                        lambda ids, weights, e: check_routing(ids.tolist(), weights.tolist(), e, ids.shape[1]))
     monkeypatch.setattr(api, "require_native", lambda _: SimpleNamespace(megamoe_workspace_address=lambda _: 4096))
 
     class Runtime:
-        def __init__(self, group, capacity, timeout, *, backend="mte"):
+        def __init__(self, group, capacity, timeout, *, backend="mte", windowed=False):
             self.device, self.stream, self.native = 0, stream, SimpleNamespace(capacity=capacity)
             self.backend = backend
             self.closed = False
@@ -181,6 +184,7 @@ def backend(monkeypatch):
             activation="swiglu",
             mma_type="fp8xfp4",
             windowed=False,
+            timeout_seconds=120,
         ):
             self.bs, self.workspace_bytes = example.shape[0], 4096
             self.max_tokens = max_tokens
@@ -237,6 +241,7 @@ def backend(monkeypatch):
                 output.data[:] = x.data[:, :1]
                 counts = np.bincount(ids.data.ravel(), minlength=self.local_experts)[: self.local_experts]
             else:
+                assert self.bs == x.shape[0]
                 output.data.fill(3)
                 counts = np.arange(self.local_experts) + 2
             if self.backend == "urma" and timer is not None:
@@ -254,6 +259,7 @@ def backend(monkeypatch):
 
     ext = SimpleNamespace(
         buffer_size=buffer_size,
+        urma_window_bytes=lambda world, experts, tokens, topk, hidden, intermediate: (2 << 20, tokens << 20),
         Plan=Plan,
         ffts_config=lambda: 123,
         timer_enabled=True,
@@ -1046,7 +1052,7 @@ def test_windowed_urma_failed_launch_poisoning_and_stats(backend, monkeypatch):
     [
         (33, {}, "num_topk"),
         (32, {"topk_weights_type": 0}, "topk_weights_type=1"),
-        (32, {"ranks_per_node": 4}, "requires one host"),
+        (32, {"ranks_per_node": 4}, "requires 8 ranks per host"),
     ],
 )
 def test_windowed_urma_invalid_configuration_rejected(backend, monkeypatch, topk, options, match):
@@ -1076,7 +1082,9 @@ def test_windowed_urma_rejects_different_hosts_even_with_ranks_per_node_8(backen
     assert sum(event[0] == "buffer_size" for event in backend.events if isinstance(event, tuple)) == 1
 
 
-def test_windowed_urma_target_prepares_256_rows_for_39280_token_capacity(backend, monkeypatch):
+@pytest.mark.parametrize("world", [8, 16, 32])
+@pytest.mark.parametrize("k", [25, 32])
+def test_windowed_urma_target_prepares_256_rows_for_39280_token_capacity(backend, monkeypatch, world, k):
     from deep_ep_experimental.megamoe import backend as selector
 
     monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
@@ -1088,15 +1096,64 @@ def test_windowed_urma_target_prepares_256_rows_for_39280_token_capacity(backend
 
     monkeypatch.setattr(torch, "empty", shape_only)
     monkeypatch.setattr(torch, "empty_like", lambda t, dtype: shape_only(t.shape, dtype, t.device))
-    b = api.SymmBuffer(backend.group_type(8), 800, 39280, 25, 4096, 1536, activation="gelu", ranks_per_node=8)
+    b = api.SymmBuffer(backend.group_type(world), 800, 39280, k, 4096, 1536, activation="gelu")
     try:
-        assert b.x.shape == (39280, 4096) and b.topk_idx.shape == (39280, 25)
+        assert b.x.shape == (39280, 4096) and b.topk_idx.shape == (39280, k)
         assert b.num_forward_windows(39280) == 154
-        assert ("buffer_size", (8, 100, 256, 25, 4096), "urma", True) in backend.events
+        assert b.ranks_per_node == min(world, 16)
+        assert ("buffer_size", (world, 800 // world, 256, k, 4096), "urma", True) in backend.events
         b.prepare(39280)
         assert b._plan.windowed and b._plan.bs == b._plan.max_tokens == 256
-        assert b._plan.local_experts == 100 and b._plan.topk_weights_type == 1
+        assert b._plan.local_experts == 800 // world and b._plan.topk_weights_type == 1
         assert not native_launches(backend)
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize("local_limit,peer_limit,expected", [(130, 256, 128), (270, 64, 64), (1, 256, None)])
+def test_collective_window_memory_budget(backend, monkeypatch, local_limit, peer_limit, expected):
+    from deep_ep._store import StoreGroup
+    from deep_ep_experimental.megamoe import backend as selector
+
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
+    monkeypatch.setattr(api.npu_api(), "mem_get_info", lambda _: (local_limit << 20, 300 << 20))
+    monkeypatch.setattr(backend.ext, "urma_window_bytes", lambda w, e, t, k, h, i: (t << 20, 0))
+    group = StoreGroup(None, 0, 32, prefix="budget")
+    group.all_gather = lambda value, stage: [value] * 31 + [
+        (None, peer_limit) if stage == "window HBM budget" else value
+    ]
+    if expected is None:
+        with pytest.raises(ValueError, match="rank=0.*insufficient free HBM"):
+            api.SymmBuffer(group, 64, 257, 25, 256, 256, activation="gelu")
+        return
+    b = api.SymmBuffer(group, 64, 257, 25, 256, 256, activation="gelu")
+    try:
+        assert b.window_tokens == expected
+        assert b.num_forward_windows(257) == 1 + 256 // expected
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize("bf16", [True, False])
+def test_mte_full_heap_overflow_launches_exact_window_and_tail_plans(backend, monkeypatch, bf16):
+    monkeypatch.setattr(backend.ext, "buffer_size", lambda world, e, t, k, h, **kwargs: (2 << 30) if t > 256 else 2 << 20)
+    b = api.SymmBuffer(backend.group_type(8), 32, 513, 25, 1024, 256, activation="gelu", ranks_per_node=8)
+    local = 4
+    raw = (
+        (Tensor(np.zeros((local, 256, 512)), "uint8"), Tensor(np.full((local, 256, 16, 2), 127), "float8_e8m0fnu")),
+        (Tensor(np.zeros((local, 1024, 128)), "uint8"), Tensor(np.full((local, 1024, 4, 2), 127), "float8_e8m0fnu")),
+    )
+    weights = api.transform_weights_for_mega_moe(*raw, activation="gelu")
+    b.topk_idx.data[:] = np.arange(25)
+    b.topk_weights.data[:] = 1
+    try:
+        y = Tensor(np.zeros((513, 1024)), "bfloat16")
+        b.prepare(513)
+        assert b._plan.bs == 256 and b._tail_plan.bs == 1 and b.workspace_bytes == 8192
+        assert not b._plan.windowed and not b._tail_plan.windowed
+        api.fp8_fp4_mega_moe(y, *weights, b, activation="gelu", x=Tensor(y.data.copy(), "bfloat16") if bf16 else None)
+        assert [x[0].shape[0] for x in native_launches(backend)] == [256, 256, 1]
+        assert all((x[1] is None) == bf16 for x in native_launches(backend))
     finally:
         b.destroy()
 

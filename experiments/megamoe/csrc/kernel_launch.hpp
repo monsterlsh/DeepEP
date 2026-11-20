@@ -13,6 +13,8 @@ extern "C" void mega_moe_kernel_do(uint32_t block_dim, uint32_t ub_bytes, void* 
                                    uint8_t* shared_weight_scales2, uint8_t* y, uint8_t* expert_token_nums,
                                    uint8_t* workspace, uint8_t* timer, const uint8_t* tiling_host, uint64_t ffts_addr);
 
+extern "C" void megamoe_init_gelu_factors(void* stream, uint8_t* output, uint32_t blocks);
+
 namespace MegaMoeUrma {
 struct Arguments;
 }

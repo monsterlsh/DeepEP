@@ -18,6 +18,7 @@
 #define MEGA_MOE_ARCH35_ACTIVATION_COMMON_H
 
 #if defined(__DAV_C310__)
+#include "adv_api/math/erf.h"
 #if ASC_DEVKIT_MAJOR >= 9
 #include "kernels/mega_moe_common/implementation_namespace.hpp"
 #include "basic_api/kernel_basic_intf.h"
@@ -76,55 +77,67 @@ struct GatedActivationTileContext {
     uint32_t additionalPaddingStoreMaskElementCount;
 };
 
-// Abramowitz-Stegun 7.1.26 evaluates erf itself to |error| <= 1.5e-7.
-// This is not the tanh GELU approximation; all arithmetic and route weighting stay FP32 until the BF16 cast.
-#define MEGA_MOE_GELU_EVALUATE(outputReg, inputReg, weightReg, mask)                                               \
-    do {                                                                                                          \
-        AscendC::Reg::Muls(zReg, inputReg, inverseSqrtTwo, mask);                                                  \
-        AscendC::Reg::Abs(absReg, zReg, mask);                                                                     \
-        AscendC::Reg::Muls(tReg, absReg, erfP, mask);                                                              \
-        AscendC::Reg::Adds(tReg, tReg, scalarOne, mask);                                                           \
-        AscendC::Reg::Div(tReg, oneReg, tReg, mask);                                                               \
-        AscendC::Reg::Mul(squareReg, absReg, absReg, mask);                                                        \
-        AscendC::Reg::Muls(squareReg, squareReg, negScalarOne, mask);                                              \
-        AscendC::Reg::Exp(expReg, squareReg, mask);                                                                \
-        AscendC::Reg::Duplicate(polyReg, erfA5, mask);                                                             \
-        AscendC::Reg::Mul(polyReg, polyReg, tReg, mask);                                                           \
-        AscendC::Reg::Adds(polyReg, polyReg, erfA4, mask);                                                         \
-        AscendC::Reg::Mul(polyReg, polyReg, tReg, mask);                                                           \
-        AscendC::Reg::Adds(polyReg, polyReg, erfA3, mask);                                                         \
-        AscendC::Reg::Mul(polyReg, polyReg, tReg, mask);                                                           \
-        AscendC::Reg::Adds(polyReg, polyReg, erfA2, mask);                                                         \
-        AscendC::Reg::Mul(polyReg, polyReg, tReg, mask);                                                           \
-        AscendC::Reg::Adds(polyReg, polyReg, erfA1, mask);                                                         \
-        AscendC::Reg::Mul(polyReg, polyReg, tReg, mask);                                                           \
-        AscendC::Reg::Mul(polyReg, polyReg, expReg, mask);                                                         \
-        AscendC::Reg::Muls(erfAbsReg, polyReg, negScalarOne, mask);                                                \
-        AscendC::Reg::Adds(erfAbsReg, erfAbsReg, scalarOne, mask);                                                 \
-        AscendC::Reg::Muls(negativeErfReg, erfAbsReg, negScalarOne, mask);                                         \
-        AscendC::Reg::CompareScalar<float, AscendC::CMPMODE::GE>(positiveMask, zReg, 0.0F, mask);                  \
-        AscendC::Reg::Select(erfReg, erfAbsReg, negativeErfReg, positiveMask);                                     \
-        AscendC::Reg::Adds(erfReg, erfReg, scalarOne, mask);                                                       \
-        AscendC::Reg::Mul(outputReg, inputReg, erfReg, mask);                                                      \
-        AscendC::Reg::Muls(outputReg, outputReg, scalarHalf, mask);                                                \
-        if constexpr (FuseTopkWeight) {                                                                            \
-            AscendC::Reg::Mul(outputReg, outputReg, weightReg, mask);                                              \
-        }                                                                                                          \
-    } while (0)
-
-template <typename InputType, bool FuseTopkWeight>
-__aicore__ inline void RunGELU(const GatedActivationTileContext<InputType>& context)
+// The pinned CANN 9.2 arch35 aclnnErf uses this register implementation of
+// SUBSECTION_POLYNOMIAL_APPROXIMATION. Keep the weighted result in FP32 until
+// the BF16 conversion ahead of MX quantization.
+__simd_callee__ inline void ComputeGeluFactor(AscendC::Reg::RegTensor<float>& factor,
+                                              AscendC::Reg::RegTensor<float>& input, AscendC::Reg::MaskReg& mask)
 {
-    const float inverseSqrtTwo = 0.7071067811865475244F;
-    const float erfP = 0.3275911F;
-    const float erfA1 = 0.254829592F;
-    const float erfA2 = -0.284496736F;
-    const float erfA3 = 1.421413741F;
-    const float erfA4 = -1.453152027F;
-    const float erfA5 = 1.061405429F;
-    const float scalarOne = 1.0F;
-    const float negScalarOne = -1.0F;
-    const float scalarHalf = 0.5F;
+    AscendC::Reg::RegTensor<float> scaled;
+    // CANN aclnnDivs uses the rounded reciprocal for contiguous FP32 scalar division.
+    AscendC::Reg::Muls(scaled, input, 0.7071067811865475244F, mask);
+    AscendC::ErfAPI::ErfSubsectionCompute(factor, scaled, mask);
+    AscendC::Reg::Adds(factor, factor, 1.0F, mask);
+}
+
+template <bool FuseTopkWeight>
+__simd_callee__ inline void ApplyGeluFactor(AscendC::Reg::RegTensor<float>& output, AscendC::Reg::RegTensor<float>& input,
+                                            AscendC::Reg::RegTensor<float>& factor, AscendC::Reg::RegTensor<float>& weight,
+                                            AscendC::Reg::MaskReg& mask)
+{
+    AscendC::Reg::Muls(output, input, 0.5F, mask);
+    AscendC::Reg::Mul(output, output, factor, mask);
+    if constexpr (FuseTopkWeight) {
+        AscendC::Reg::Mul(output, output, weight, mask);
+    }
+}
+
+template <bool FuseTopkWeight>
+__simd_callee__ inline void WeightedGelu(AscendC::Reg::RegTensor<float>& output, AscendC::Reg::RegTensor<float>& input,
+                                        AscendC::Reg::RegTensor<float>& weight, AscendC::Reg::MaskReg& mask)
+{
+    AscendC::Reg::RegTensor<float> factor;
+    ComputeGeluFactor(factor, input, mask);
+    ApplyGeluFactor<FuseTopkWeight>(output, input, factor, weight, mask);
+}
+
+template <typename InputType, bool FuseTopkWeight, bool UseTable>
+__simd_callee__ inline void WeightedGeluVector(AscendC::Reg::RegTensor<float>& output,
+                                               AscendC::Reg::RegTensor<float>& input,
+                                               AscendC::Reg::RegTensor<InputType>& raw,
+                                               AscendC::Reg::RegTensor<float>& weight, __ubuf__ uint32_t* table,
+                                               AscendC::Reg::MaskReg& mask)
+{
+    if constexpr (UseTable) {
+        // DIST_UNPACK_B16 places each raw BF16 in the low half of one 32-bit lane.
+        auto& bits = reinterpret_cast<AscendC::Reg::RegTensor<uint32_t>&>(raw);
+        AscendC::Reg::RegTensor<uint32_t> page, base, lane, laneMask, pos;
+        AscendC::Reg::RegTensor<float> factor;
+        AscendC::Reg::Duplicate(laneMask, MTE_GELU_LUT_PAGE_SIZE - 1U, mask);
+        AscendC::Reg::ShiftRights(page, bits, int16_t{MTE_GELU_LUT_PAGE_SHIFT}, mask);
+        AscendC::Reg::And(lane, bits, laneMask, mask);
+        AscendC::Reg::Gather(base, table, page, mask);
+        AscendC::Reg::Add(pos, base, lane, mask);
+        AscendC::Reg::Gather(factor, reinterpret_cast<__ubuf__ float*>(table), pos, mask);
+        ApplyGeluFactor<FuseTopkWeight>(output, input, factor, weight, mask);
+    } else {
+        WeightedGelu<FuseTopkWeight>(output, input, weight, mask);
+    }
+}
+
+template <typename InputType, bool FuseTopkWeight, bool UseTable = false>
+__aicore__ inline void RunGELU(const GatedActivationTileContext<InputType>& context, __ubuf__ uint32_t* table = nullptr)
+{
     bfloat16_t zeroValue = 0;
     const uint16_t rowLoopCount = context.rowLoopCount;
     const uint16_t fullVectorLoopCount = context.fullVectorLoopCount;
@@ -137,16 +150,13 @@ __aicore__ inline void RunGELU(const GatedActivationTileContext<InputType>& cont
     __VEC_SCOPE__
     {
         AscendC::Reg::RegTensor<InputType> inputStorageReg;
-        AscendC::Reg::RegTensor<float> inputReg, zReg, absReg, tReg, squareReg, expReg, polyReg;
-        AscendC::Reg::RegTensor<float> erfAbsReg, negativeErfReg, erfReg, outputReg, weightReg, oneReg;
+        AscendC::Reg::RegTensor<float> inputReg, outputReg, weightReg;
         AscendC::Reg::RegTensor<bfloat16_t> outputBf16Reg, zeroReg;
-        AscendC::Reg::MaskReg positiveMask;
         AscendC::Reg::MaskReg fullMask = AscendC::Reg::CreateMask<float, AscendC::Reg::MaskPattern::ALL>();
         AscendC::Reg::MaskReg tailComputeMask = AscendC::Reg::UpdateMask<float>(tailComputeMaskElementCount);
         AscendC::Reg::MaskReg tailStoreMask = AscendC::Reg::UpdateMask<float>(tailStoreMaskElementCount);
         AscendC::Reg::MaskReg additionalPaddingStoreMask =
             AscendC::Reg::UpdateMask<bfloat16_t>(additionalPaddingStoreMaskElementCount);
-        AscendC::Reg::Duplicate(oneReg, scalarOne);
 
         for (uint16_t rowIndex = 0; rowIndex < rowLoopCount; ++rowIndex) {
             if constexpr (FuseTopkWeight) {
@@ -159,7 +169,8 @@ __aicore__ inline void RunGELU(const GatedActivationTileContext<InputType>& cont
                 AscendC::Reg::DataCopy<InputType, AscendC::Reg::LoadDist::DIST_UNPACK_B16>(inputStorageReg, context.gate,
                                                                                            inputOffset);
                 AscendC::Reg::Cast<float, InputType, CAST_INPUT_TO_FP32>(inputReg, inputStorageReg, fullMask);
-                MEGA_MOE_GELU_EVALUATE(outputReg, inputReg, weightReg, fullMask);
+                WeightedGeluVector<InputType, FuseTopkWeight, UseTable>(
+                    outputReg, inputReg, inputStorageReg, weightReg, table, fullMask);
                 AscendC::Reg::Cast<bfloat16_t, float, CAST_FP32_TO_BF16>(outputBf16Reg, outputReg, fullMask);
                 AscendC::Reg::AddrReg outputOffset = AscendC::Reg::CreateAddrReg<bfloat16_t>(
                     rowIndex, context.outputRowStrideElements, vectorIndex, VECTOR_LENGTH_FP32);
@@ -175,7 +186,8 @@ __aicore__ inline void RunGELU(const GatedActivationTileContext<InputType>& cont
                                                                                            context.gateTail,
                                                                                            tailInputOffset);
                 AscendC::Reg::Cast<float, InputType, CAST_INPUT_TO_FP32>(inputReg, inputStorageReg, tailComputeMask);
-                MEGA_MOE_GELU_EVALUATE(outputReg, inputReg, weightReg, tailComputeMask);
+                WeightedGeluVector<InputType, FuseTopkWeight, UseTable>(
+                    outputReg, inputReg, inputStorageReg, weightReg, table, tailComputeMask);
                 AscendC::Reg::Cast<bfloat16_t, float, CAST_FP32_TO_BF16>(outputBf16Reg, outputReg, tailComputeMask);
                 AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::StoreDist::DIST_PACK_B32>(
                     context.outputTail, outputBf16Reg, tailOutputOffset, tailStoreMask);
@@ -188,8 +200,6 @@ __aicore__ inline void RunGELU(const GatedActivationTileContext<InputType>& cont
         }
     }
 }
-
-#undef MEGA_MOE_GELU_EVALUATE
 
 }  // namespace Activation
 }  // namespace DEEPEP_MEGAMOE_IMPL_NAMESPACE

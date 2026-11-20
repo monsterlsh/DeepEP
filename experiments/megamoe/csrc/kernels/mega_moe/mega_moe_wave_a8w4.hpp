@@ -71,6 +71,29 @@ private:
     using MegaMoeBase::sharedExpertNum_;
     using MegaMoeBase::TryRunSharedExpertActivation;
 
+    bool reuseWaveSlots_ = false;
+    __aicore__ inline void SelectWaveStorage()
+    {
+        const auto& tiling = *params_.tilingData;
+        reuseWaveSlots_ = MteWorkspaceWindowed(tiling);
+        if constexpr (TopkWeightsPrefetch && !FuseGateUp && CombineQuantMode == COMBINE_NO_QUANT) {
+            if (reuseWaveSlots_ && sharedExpertNum_ == 0U && commonConfig_.activationFactor == ACTIVATION_N_SINGLE) {
+                // AIV1 publishes the complete inclusive prefix before the count-ready flag.
+                // All roles use block zero's snapshot because their local SyncAll paths must agree.
+                const BlockWorkspaceContext firstBlock{0U, countWorkspace_.blockNum};
+                WaitForMoeExpertTokenCountReady(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr, firstBlock, 0U);
+                const auto entries = commonConfig_.worldSize * commonConfig_.moeExpertPerRank;
+                auto prefix = reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.cumsumInfoPtr);
+                const auto rows = static_cast<uint32_t>(AscendC::ReadGmByPassDCache(prefix + entries - 1U));
+                reuseWaveSlots_ = rows > MteWorkspaceRowCapacity(tiling);
+            }
+        }
+    }
+    __aicore__ inline WaveRowMapping WaveStorage(uint64_t waveId, uint64_t logicalStart) const
+    {
+        return reuseWaveSlots_ ? MteWaveRowMapping(*params_.tilingData, waveId, logicalStart) : WaveRowMapping{};
+    }
+
     // 各任务流保留一个待办项，不分配随 BS 增长的任务队列。
     struct AivTaskCursor {
         ExpertTokenPosition position{};
@@ -171,11 +194,11 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
         if (commonConfig_.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS) {
             DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch>(
                 tokenDispatchConfig_, commonConfig_, dispatchJob, syncWorkspaceLayout_, params_, g_winRankAddr_,
-                tokenDispatchScratch_, range, MteWaveRowMapping(*params_.tilingData, waveId, waveLogicalStart));
+                tokenDispatchScratch_, range, WaveStorage(waveId, waveLogicalStart));
         } else {
             DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch, true>(
                 tokenDispatchConfig_, commonConfig_, dispatchJob, syncWorkspaceLayout_, params_, g_winRankAddr_,
-                tokenDispatchScratch_, range, MteWaveRowMapping(*params_.tilingData, waveId, waveLogicalStart));
+                tokenDispatchScratch_, range, WaveStorage(waveId, waveLogicalStart));
         }
         timer_.EndSpan(AscendTimer::AIV_DISPATCH);
     }
@@ -418,8 +441,14 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     uint64_t gmm2Count = 0U;
     DispatchBuffInit();
     PrepareMoeExpertTokenCountTable<true>(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
+    if constexpr (g_coreType == AIV && TopkWeightsPrefetch && !FuseGateUp) {
+        if (GetSubBlockIdx() == 1U && tokenDispatchScratch_.ubEndBytes <= MTE_GELU_LUT_UB_BEGIN) {
+            epilogueOp_.LoadGeluTable(params_.workspaceInfo.geluLutPtr, params_.tilingData->geluLutWords);
+        }
+    }
+    SelectWaveStorage();
     if constexpr (g_coreType == AIV && CombineQuantMode == COMBINE_NO_QUANT) {
-        if (GetSubBlockIdx() == 1U && !MteWorkspaceWindowed(*params_.tilingData)) {
+        if (GetSubBlockIdx() == 1U && !reuseWaveSlots_) {
             ProcessAiv1PriorityStages(gmm1TileReadySequence);
             return;
         }
@@ -473,7 +502,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
             DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch>(
                 tokenDispatchConfig_, commonConfig_, gmmExecutionConfig_.blockJob, syncWorkspaceLayout_, params_,
                 g_winRankAddr_, tokenDispatchScratch_, firstDispatchRange,
-                MteWaveRowMapping(*params_.tilingData, 0U, 0U));
+                WaveStorage(0U, 0U));
             timer_.EndSpan(AscendTimer::AIV_DISPATCH);
             // 首 WAVE 的全部数据和 ready flag 发布完成后，再提交 Dispatch 进度。
             dispatchPosition = plannedDispatchPosition;
@@ -487,7 +516,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         uint32_t currentWaveMGroupCount = 0U;
         uint32_t waveLastActiveExpertIdx = commonConfig_.moeExpertPerRank;
         bool currentWaveNeedsGmm1 = true;
-        gmm1State.waveMapping = MteWaveRowMapping(*params_.tilingData, gmm1Count, waveBeginPosition.globalTokenIndex);
+        gmm1State.waveMapping = WaveStorage(gmm1Count, waveBeginPosition.globalTokenIndex);
 
         uint32_t nextDispatchWaveMGroupCount = 0U;
         const uint64_t nextDispatchWaveStart = dispatchPosition.globalTokenIndex;
@@ -551,7 +580,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
                                        gmm1TileReadySequence);
             UpdateGmmLoopCount(gmmLoopCount_, LoopCountIndex::GMM2, ++gmm2Count);
         }
-        if (MteWorkspaceWindowed(*params_.tilingData)) {
+        if (reuseWaveSlots_) {
             if constexpr (g_coreType == AIV) {
                 PipeBarrier<PIPE_ALL>();
             }

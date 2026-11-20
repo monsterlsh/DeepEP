@@ -366,6 +366,22 @@ class CascadeReference:
             raise TypeError("Cascade requires int32 expert IDs and FP32 route weights")
         ids = ids.to(device=data.device).contiguous()
         weights = weights.to(device=data.device).contiguous()
+        # Official routing may materialize every global token/slot. Bound the
+        # reference allocation even when the fused operator handles 39k tokens.
+        rows = max(1, 65536 // (self.world * self.topk))
+        if bs <= rows:
+            return self._forward_rows(data, scale, ids, weights)
+        output = torch.empty((bs, self.hidden), device=data.device, dtype=torch.bfloat16)
+        counts = torch.zeros(self.local_experts, device=data.device, dtype=torch.int64)
+        for start in range(0, bs, rows):
+            part = slice(start, min(start + rows, bs))
+            local_output, local_counts = self._forward_rows(data[part], scale[part], ids[part], weights[part])
+            output[part].copy_(local_output)
+            counts.add_(local_counts)
+        return output, counts
+
+    def _forward_rows(self, data, scale, ids, weights):
+        torch, bs = self.torch, data.shape[0]
         with torch.no_grad():
             global_data = self._all_gather(data, codes=True)
             global_scale = self._all_gather(scale, codes=True)

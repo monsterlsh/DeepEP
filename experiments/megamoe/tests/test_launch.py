@@ -58,6 +58,50 @@ def test_invalid_hosts_fail_before_launch(hosts):
         launcher.select_hosts({"hosts": hosts}, 32)
 
 
+@pytest.mark.parametrize("ep,local", [(8, 8), (16, 8), (16, 16), (32, 8), (32, 16)])
+def test_acceptance_launch_and_golden_use_same_rank_mapping(configuration, tmp_path, ep, local):
+    spec = importlib.util.spec_from_file_location("megamoe_batch_node", SCRIPTS / "batch_node.py")
+    worker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(worker)
+    hosts = [f"192.0.2.{i + 1}" for i in range(ep // local)]
+    host_file = tmp_path / "acceptance.json"
+    host_file.write_text(json.dumps(dict(hosts=hosts)))
+    args = launcher.parse_args([
+        "--hosts-file", str(host_file), "--ep-size", str(ep), "--ranks-per-node", str(local),
+        "--config", "target_gelu_k32", "--mode", "accuracy", "--check-tokens", "12",
+    ])
+    plan = launcher.make_plan(args)
+    assert plan["ep_size"] == ep and plan["ranks_per_node"] == local
+    node = len(hosts) - 1
+    bench = worker.benchmark_command(plan, tmp_path, node, 39280)
+    golden = worker.golden_command(plan, tmp_path, node, 39280)
+    assert bench[bench.index("--nproc-per-node") + 1] == str(local)
+    assert golden[golden.index("--ep-size") + 1] == str(ep)
+    assert golden[golden.index("--ranks") + 1] == f"{ep-local}-{ep-1}"
+    assert all(cmd[cmd.index("--check-tokens") + 1] == "12" for cmd in (bench, golden))
+    assert all(cmd[cmd.index("--bs-values") + 1] == "39280" for cmd in (bench, golden))
+
+
+@pytest.mark.parametrize("backend", ["mte", "urma"])
+def test_launcher_summarizes_logical_forward_and_host_e2e(backend, tmp_path):
+    from deep_ep_experimental.megamoe.performance import summarize_profile_rounds, summarize_rounds
+
+    rows = [[1, 2, 3], [5, 6, 7]]
+    if backend == "mte":
+        report = summarize_rounds(rows, 1)
+        filename = "profiling.json"
+    else:
+        report = summarize_profile_rounds(rows, 1)
+        filename = "performance.json"
+    report.update(windows_per_forward=154, host_e2e={"rank_max_mean_us": 123.0})
+    path = tmp_path / "bs_39280/rank_0/bs_39280" / filename
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(report))
+    launcher.summarize(tmp_path, [39280], 2)
+    summary = (tmp_path / "summary.txt").read_text()
+    assert "windows=154" in summary and "rank-max-mean=123.000us" in summary
+
+
 def test_missing_environment_is_explicit(configuration, monkeypatch):
     monkeypatch.delenv("ASCEND_ENV")
     with pytest.raises(ValueError, match="ASCEND_ENV"):

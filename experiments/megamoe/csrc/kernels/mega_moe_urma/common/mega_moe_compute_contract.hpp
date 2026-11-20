@@ -10,7 +10,7 @@ namespace MegaMoeUrma {
 // Pure host/device scheduling arithmetic. Compute groups contain at most M256
 // rows of one expert, independently of the peer/CV communication boundaries.
 constexpr uint32_t kComputeCores = kAic;
-// Minimum reducer count, used only to size UB for the largest per-core quota.
+// Full-batch EP16 reducer count. The small EP32 windows have a separate UB bound.
 constexpr uint32_t kReduceWorkers = kLocalWorkers - kCommunicationWorkers;
 constexpr uint32_t kComputeTileM = 256U;
 constexpr uint32_t kComputeTileN = 256U;
@@ -50,6 +50,22 @@ static_assert(ActivationUbContract::inputEnd <= kRequiredUbBytes &&
               ActivationUbContract::scratchEnd <= kRequiredUbBytes);
 static_assert(kInputScaleUbBytes == 32768U && kInputScaleUbBytes <= ActivationUbContract::inputEnd);
 
+// AIV1 retains the lookup table across cooperative Pack, ScaleGather, Activation and Reorder.
+struct WindowGeluUb {
+    static constexpr uint32_t rows = kActivationTileM;
+    static constexpr uint32_t epilogueBase = 64U * 1024U;
+    static constexpr uint32_t weightOffset = 176U * 1024U;
+    static constexpr uint32_t gatherWeightOffset = 168U * 1024U;
+    static constexpr uint32_t tableOffset = 192U * 1024U;
+    static constexpr uint32_t tableBytes = 32U * 1024U;
+    static constexpr uint32_t tableWords = tableBytes / sizeof(uint32_t);
+};
+static_assert(WindowGeluUb::epilogueBase + ActivationUbContract::quantOffset == ActivationUbContract::inputEnd);
+static_assert(WindowGeluUb::epilogueBase + ActivationUbContract::scratchEnd <= WindowGeluUb::weightOffset);
+static_assert(WindowGeluUb::weightOffset + WindowGeluUb::rows * 32U <= WindowGeluUb::tableOffset);
+static_assert(ActivationUbContract::inputEnd + kComputeTileM * (4096U / 32U) <= WindowGeluUb::gatherWeightOffset);
+static_assert(WindowGeluUb::gatherWeightOffset + kComputeTileM * 32U <= WindowGeluUb::tableOffset);
+
 struct ActivationRowSlice {
     uint32_t rowBegin;
     uint32_t rows;
@@ -74,7 +90,16 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm1LogicalTileN(const Config& c)
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t CommunicationWorkers(uint32_t world)
 {
-    return world - 1U;
+    // EP32 assigns two independently progressed QPs to each of 15 AIV1s,
+    // one QP to the sixteenth, and leaves twelve AIV1s for scale gather.
+    return world == kMaxWorld ? kMaxWorld / 2U : world - 1U;
+}
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t PeerOwnerForSlot(uint32_t world, uint32_t core, uint32_t slot)
+{
+    const uint32_t workers = CommunicationWorkers(world);
+    const uint32_t owner = core + slot * workers;
+    return core < workers && owner < world - 1U ? owner : world - 1U;
 }
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ActivationWorkers(uint32_t world)

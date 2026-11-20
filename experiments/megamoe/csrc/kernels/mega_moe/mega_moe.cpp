@@ -14,6 +14,8 @@
 #include "mega_moe_wave_a8w4.hpp"
 #endif
 
+#include "gelu_lut_init.hpp"
+
 using namespace AscendC;
 
 // Explicit types replace asc_opc dtype/format/tiling-key specialisation.

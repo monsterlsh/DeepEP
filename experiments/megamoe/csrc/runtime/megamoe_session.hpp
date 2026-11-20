@@ -13,6 +13,6 @@ namespace deepep::megamoe {
 // stable public Session ABI used by Python; generic, Elastic and LL callers do
 // not need to know about MegaMoE's QP policy.
 std::unique_ptr<Session> create_runtime(int rank, int size, uint64_t bytes, const std::string& endpoint,
-                                        unsigned timeout, const std::string& backend = "mte");
+                                        unsigned timeout, const std::string& backend = "mte", bool windowed = false);
 
 }  // namespace deepep::megamoe

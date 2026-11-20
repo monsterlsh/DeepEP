@@ -17,6 +17,7 @@ constexpr uint32_t kReorderColumns = 256U;
 constexpr uint32_t kReorderSlots = 2U;
 constexpr uint32_t kReorderSlotBytes = kReorderRows * kReorderColumns * sizeof(uint16_t);
 constexpr uint32_t kReorderUbBytes = kReorderSlots * kReorderSlotBytes;
+static_assert(kReorderUbBytes <= WindowGeluUb::tableOffset);
 
 struct ReorderSpan {
     bool self;

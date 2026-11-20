@@ -226,7 +226,6 @@ __aicore__ inline void CombineTokenGroup(uint32_t tokenStart, uint32_t tokenCoun
 
 }  // namespace CombineImpl
 
-constexpr uint32_t META_INFO_TENSOR_ADDR = 200U * 1024U;
 constexpr int32_t MAX_AICORE_NUM = 36;
 
 struct QuantTokenBufferConfig {
@@ -251,12 +250,6 @@ struct WaveCombineScratch {
 
 constexpr uint32_t WAVE_COMBINE_MIN_ROW_BUFFER_COUNT = 2U;
 constexpr uint32_t WAVE_COMBINE_STEADY_ROW_BUFFER_COUNT = 1U;
-constexpr uint32_t WAVE_COMBINE_MAX_ROW_BUFFER_COUNT = 6U;
-constexpr uint32_t WAVE_COMBINE_UB_BASE = 64U * 1024U;
-// [64 KiB, 184 KiB) is dedicated to the Combine row ring and quant scratch.
-// The ready scan starts at 184 KiB, so adaptive row buffers must stay below it.
-constexpr uint32_t WAVE_COMBINE_UB_LIMIT = 184U * 1024U;
-constexpr uint32_t WAVE_COMBINE_META_INFO_TOKEN_CAPACITY = 1536U;
 
 // 非 layered 路径统一使用的 Combine 行环。常规 Wave 只有 AIV1 建立并使用这些 UB 视图；
 // 最后一轮不再与 GMM1/SwiGLU 并行时，调用方才为 AIV0 补充初始化。
@@ -1206,7 +1199,7 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
     // AIV1 任务不抢占；Dispatch/Combine 均排空后才交还 UB 和事件 0..5。
     auto buffers = common.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS
                        ? InitWaveCombineBuffers<COMBINE_NO_QUANT>(common, scratch)
-                       : InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 2U>(common, scratch);
+                       : InitWaveCombineBuffers<COMBINE_NO_QUANT, false, WAVE_COMBINE_PREFILL_ROW_BUFFER_COUNT>(common, scratch);
     GM_ADDR sliceOutput =
         params.workspaceInfo.gmm2MmadResPtr + storageRowStart * common.tokenHiddenDim * sizeof(bfloat16_t);
     uint32_t rowSequence = 0U;

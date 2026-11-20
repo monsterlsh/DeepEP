@@ -10,11 +10,11 @@ import importlib
 import threading
 from typing import TYPE_CHECKING
 
-from deep_ep._runtime import _host_boot_id, integer, warn_unclosed
+from deep_ep._runtime import _MEGAMOE_PROFILES, _host_boot_id, integer, warn_unclosed
 from ._runtime import _MegaRuntime
 from deep_ep._native import npu_api, require_native
 from deep_ep._store import StoreGroup
-from .validation import check_routing, check_window_routes, collective_check
+from .validation import check_routing, check_window_routes, collective_check, gather_control
 from .numerics import normalize_clamp
 
 if TYPE_CHECKING:
@@ -33,7 +33,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 12:
+    if getattr(extension, "api_protocol", None) != 13:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -42,6 +42,94 @@ def _pair(value, name):
     if not isinstance(value, tuple) or len(value) != 2:
         raise TypeError(f"{name} must be (quantized_data, E8M0_scales)")
     return value
+
+
+def _urma_window_capacity(group, ext, world, local_experts, tokens, topk, hidden, intermediate):
+    error, selected = None, 0
+    try:
+        free, _ = npu_api().mem_get_info(npu_api().current_device())
+        # Public FP8 input/scales, routing IDs/weights, BF16 output and both
+        # packed FP4 weights with one E8M0 byte per 32 elements.
+        resident = tokens * (3 * hidden + hidden // 32 + 8 * topk)
+        resident += local_experts * hidden * intermediate * 17 // 16
+        # sort() produces int32 values and int64 indices during route preflight.
+        resident += tokens * topk * 12
+        for candidate in dict.fromkeys(min(tokens, n) for n in (256, 128, 64)):
+            heap, scratch = ext.urma_window_bytes(world, local_experts, candidate, topk, hidden, intermediate)
+            if resident + heap + scratch <= free and heap <= _MEGAMOE_PROFILES["urma"].maximum_capacity:
+                selected = candidate
+                break
+        if not selected:
+            raise ValueError(f"insufficient free HBM for the smallest window ({free} bytes available)")
+    except Exception as exc:
+        error = str(exc) or type(exc).__name__
+    peers = gather_control(group, "window HBM budget", (error, selected))
+    failures = [f"rank={rank}: {message}" for rank, (message, _) in enumerate(peers) if message]
+    if failures:
+        raise ValueError("MegaMoE window HBM budget failed: " + "; ".join(failures))
+    return min(capacity for _, capacity in peers)
+
+
+# A build-time performance choice. Smaller candidates preserve the MTE SHMEM
+# layout and permit individual ranks to accommodate their available memory.
+_MTE_MAX_WINDOW_TOKENS = 2048
+
+
+def _mte_window_capacity(group, ext, world, local_experts, tokens, topk, hidden, intermediate, mma_type):
+    """Agree before inputs, plans and SHMEM are allocated on a public GELU S0 buffer."""
+    eligible, error = [], None
+    try:
+        limit = _MEGAMOE_PROFILES["mte"].maximum_capacity
+        query = getattr(ext, "mte_plan_bytes", None)
+        # Protocol 13 wheels prior to the additive sizing query retain their original W256.
+        candidates = (2048, 1024, 512, 256) if query is not None else (256,)
+        # Buffered FP8 input/scale, BF16 output, route IDs and weights. The full-batch
+        # route preflight sorts int32 keys and materializes their int64 permutation.
+        logical = tokens * (3 * hidden + hidden // 32 + (8 + 12) * topk)
+        # Both local single-projection GELU weights have shape H*I per expert.
+        # Each matrix also holds one E8M0 scale per group of 32 weights.
+        elements = 2 * local_experts * hidden * intermediate
+        weights = (elements // 2 if mma_type == "fp8xfp4" else elements) + elements // 32
+        # A windowed forward can hold the first counts, previous window counts and
+        # newly returned counts simultaneously during the assignment.
+        counts = 3 * local_experts * 4
+        free = npu_api().mem_get_info(npu_api().current_device())[0] if query is not None else None
+        for width in dict.fromkeys(min(tokens, n) for n in candidates if n <= _MTE_MAX_WINDOW_TOKENS):
+            heap = ext.buffer_size(world, local_experts, width, topk, hidden, backend="mte",
+                                   topk_weights_type=1, mma_type=mma_type, windowed=False)
+            if heap > limit:
+                continue
+            # At W256 the allocator remains authoritative. We cannot tell if the caller's
+            # weights/output were already charged against free, and allocator-cached HBM
+            # can be reusable. This heuristic must only opt in a larger window.
+            if query is not None and width > min(tokens, 256):
+                def scratch(rows):
+                    return query(world, local_experts, rows, width, topk, hidden, intermediate, "gelu", mma_type)
+                plan = scratch(width)
+                if tokens > width and width > 1:
+                    # Single public buffers also support calls shorter than their configured
+                    # logical maximum. A divisible maximum can still have a tail on a later call.
+                    tail = tokens % width or min(tokens - width, width - 1)
+                    plan += scratch(tail)
+                required = logical + weights + counts + heap + plan
+                if required > free:
+                    continue
+            eligible.append(width)
+        if not eligible:
+            raise ValueError(f"no candidate fits the MTE symmetric heap limit ({limit} bytes) and available HBM")
+    except Exception as exc:
+        error = str(exc) or type(exc).__name__
+    # Full and short tail plans may have different footprints between candidate widths.
+    # Exchanging all admissible widths also accommodates ranks on an older protocol-13 build.
+    peers = gather_control(group, "MTE window HBM budget", (error, tuple(eligible)))
+    failures = [f"rank={rank}: {message}" for rank, (message, _) in enumerate(peers) if message]
+    if failures:
+        raise ValueError("MegaMoE MTE window HBM budget failed: " + "; ".join(failures))
+    common = set(eligible).intersection(*(widths for _, widths in peers))
+    if not common:
+        raise ValueError(f"MegaMoE ranks have no common MTE window capacity: {peers}")
+    return max(common)
+
 
 
 def _check_fp4_weight_format(weight, name):
@@ -91,9 +179,10 @@ class SymmBuffer:
 
         self._backend_name = select_backend(group)
         urma = self._backend_name == "urma"
-        self._windowed = (
-            urma and size == 8 and activation == "gelu" and mma_type == "fp8xfp4" and num_shared_experts == 0
+        self._urma_windowed = (
+            urma and size in (8, 16, 32) and activation == "gelu" and mma_type == "fp8xfp4" and num_shared_experts == 0
         )
+        self._windowed = self._urma_windowed
         if topk_weights_type is None:
             topk_weights_type = int(activation == "gelu")
         effective_topk_weights_type = 1 if activation == "gelu" else topk_weights_type
@@ -110,8 +199,11 @@ class SymmBuffer:
             integer("ranks_per_node", ranks_per_node, 0, size)
             integer("timeout", timeout, 1, 300)
             integer("topk_weights_type", topk_weights_type, 0, 1)
-            if self._windowed and (ranks_per_node not in (0, 8) or topk_weights_type != 1):
-                raise ValueError("Windowed EP8 GELU requires one host and topk_weights_type=1")
+            if self._urma_windowed:
+                local_ranks = min(size, 16)
+                if ranks_per_node not in (0, local_ranks) or topk_weights_type != 1:
+                    raise ValueError(f"Windowed EP{size} GELU requires {local_ranks} ranks per host and topk_weights_type=1")
+                ranks_per_node = local_ranks
             h_align, i_align = (256, 256) if urma else (64, 128)
             if hidden % h_align or intermediate_hidden % i_align:
                 raise ValueError(f"hidden must be divisible by {h_align}; intermediate_hidden by {i_align}")
@@ -121,8 +213,10 @@ class SymmBuffer:
                 raise ValueError("A4W4 (mma_type='fp4xfp4') is not enabled")
             if mma_type not in {"fp8xfp4", "fp8xfp8"}:
                 raise ValueError("mma_type must be fp8xfp4 or fp8xfp8")
-            if urma and (size not in (4, 8, 16) or mma_type != "fp8xfp4"):
-                raise ValueError("URMA supports EP4/EP8/EP16 and routed FP8xFP4")
+            if urma and (size not in (4, 8, 16, 32) or mma_type != "fp8xfp4"):
+                raise ValueError("URMA supports EP4/EP8/EP16/EP32 and routed FP8xFP4")
+            if urma and size == 32 and not self._urma_windowed:
+                raise ValueError("URMA EP32 requires routed GELU FP8xFP4 with zero shared experts")
             if mma_type != "fp8xfp4" and num_shared_experts:
                 raise ValueError("Shared experts currently require FP8xFP4 weights")
             if num_experts % size or num_experts // size > 128:
@@ -144,29 +238,40 @@ class SymmBuffer:
             ranks_per_node,
             timeout,
             effective_topk_weights_type,
-            _host_boot_id() if self._windowed else None,
+            _host_boot_id() if self._urma_windowed and size <= 16 else None,
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
-        self._native_capacity = (
-            min(num_max_tokens_per_rank, ext.urma_ep8_window_tokens) if self._windowed else num_max_tokens_per_rank
-        )
-        capacity = int(
-            ext.buffer_size(
+        def heap_bytes(tokens):
+            return int(ext.buffer_size(
                 size,
                 num_experts // size,
-                self._native_capacity,
+                tokens,
                 num_topk,
                 hidden,
                 backend=self._backend_name,
                 topk_weights_type=effective_topk_weights_type,
                 mma_type=mma_type,
-                windowed=self._windowed,
+                windowed=self._urma_windowed,
+            ))
+
+        self._native_capacity = num_max_tokens_per_rank
+        if self._urma_windowed:
+            self._native_capacity = _urma_window_capacity(
+                group, ext, size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden
             )
-        )
+        capacity = heap_bytes(self._native_capacity)
+        if not urma and activation == "gelu" and not num_shared_experts and capacity > _MEGAMOE_PROFILES["mte"].maximum_capacity:
+            self._windowed = True
+            self._native_capacity = _mte_window_capacity(
+                group, ext, size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, mma_type
+            )
+            capacity = heap_bytes(self._native_capacity)
         self._lock = threading.Lock()
         self._device = torch.device(f"npu:{npu_api().current_device()}")
         self._plan = self._plan_bs = None
+        self._tail_plan = self._tail_bs = None
+        self._timeout = timeout
         self._generation = 0
         self._failure = None
         self._world_size = size
@@ -185,7 +290,7 @@ class SymmBuffer:
             error = str(failure)
         # 输入分配失败先通知所有 rank，再进入 SHMEM，避免其他 rank 已在建链等待。
         collective_check(group, "input allocation", error)
-        self._runtime = _MegaRuntime(group, capacity, timeout, backend=self._backend_name)
+        self._runtime = _MegaRuntime(group, capacity, timeout, backend=self._backend_name, windowed=self._urma_windowed)
 
     def allocate_inputs(self):
         """Legacy idempotent helper. Inputs are already allocated by the constructor."""
@@ -209,9 +314,11 @@ class SymmBuffer:
 
     def _prepare(self, bs):
         integer("BS", bs, 1, self.num_max_tokens_per_rank)
+        logical_bs = bs
         if self._windowed:
-            bs = self._native_capacity
+            bs = self._native_capacity if self._urma_windowed else min(bs, self._native_capacity)
         if self._plan_bs == bs:
+            self._prepare_tail(logical_bs)
             return
         if self._backend_name == "urma":
             # Resource changes retire prior network sources before reusing the
@@ -234,6 +341,22 @@ class SymmBuffer:
         else:
             plan = self._create_plan(bs)
         self._plan, self._plan_bs = plan, bs
+        self._prepare_tail(logical_bs)
+
+    def _prepare_tail(self, bs):
+        if not self._windowed or self._urma_windowed or bs <= self._native_capacity:
+            return
+        tail = bs % self._native_capacity
+        if not tail or self._tail_bs == tail:
+            return
+        self._tail_plan = self._tail_bs = None
+        plan, error = None, None
+        try:
+            plan = self._create_plan(tail)
+        except Exception as exc:
+            error = str(exc) or type(exc).__name__
+        collective_check(self.group, "MTE tail plan", error)
+        self._tail_plan, self._tail_bs = plan, tail
 
     def _create_plan(self, bs):
         runtime = self._runtime
@@ -256,7 +379,8 @@ class SymmBuffer:
             topk_weights_type=self.topk_weights_type,
             activation=self.activation,
             mma_type=self.mma_type,
-            windowed=self._windowed,
+            windowed=self._urma_windowed,
+            timeout_seconds=self._timeout,
         )
 
     def num_forward_windows(self, bs: int) -> int:
@@ -287,9 +411,13 @@ class SymmBuffer:
         return self
 
     @property
+    def window_tokens(self) -> int:
+        return self._native_capacity
+
+    @property
     def workspace_bytes(self) -> int:
         """Prepared local scratch only; excludes symmetric heap, inputs and weights."""
-        return self._plan.workspace_bytes if self._plan is not None else 0
+        return sum(plan.workspace_bytes for plan in (self._plan, self._tail_plan) if plan is not None)
 
     @property
     def symmetric_buffer_bytes(self) -> int:
@@ -352,6 +480,7 @@ class SymmBuffer:
         with self._lock:
             self._runtime.close()
             self._plan = self._plan_bs = None
+            self._tail_plan = self._tail_bs = None
             self.x = self.x_sf = self.topk_idx = self.topk_weights = None
 
     def __del__(self):
@@ -614,15 +743,16 @@ def _forward_inputs(
         tensors = [
             (topk_idx, (bs, b.num_topk), torch.int32),
             (topk_weights, (bs, b.num_topk), torch.float32),
-            (data, (bs, h), torch.float8_e4m3fn),
-            (w1, (local, i, h // 2), torch.uint8),
-            (w2, (local, h, i // 2), torch.uint8),
+            (data, (bs, h), expected_x_dtype),
+            (w1, (local, i, h // (2 if w1.dtype == torch.uint8 else 1)), expected_dtype),
+            (w2, (local, h, i // (2 if w1.dtype == torch.uint8 else 1)), expected_dtype),
             (s1, (local, i, h // 64, 2), torch.float8_e8m0fnu),
             (s2, (local, h, i // 64, 2), torch.float8_e8m0fnu),
         ]
-        if scales.ndim == 3 and tuple(scales.shape) == (bs, h // 64, 2) and scales.is_contiguous():
-            scales = scales.reshape((bs, h // 32))
-        tensors.append((scales, (bs, h // 32), torch.float8_e8m0fnu))
+        if scales is not None:
+            if scales.ndim == 3 and tuple(scales.shape) == (bs, h // 64, 2) and scales.is_contiguous():
+                scales = scales.reshape((bs, h // 32))
+            tensors.append((scales, (bs, h // 32), torch.float8_e8m0fnu))
         if out is not None:
             tensors.append((out, (bs, h), torch.bfloat16))
         for tensor, shape, dtype in tensors:
@@ -636,10 +766,11 @@ def _forward_inputs(
         if timer is not None:
             if timer.device != b._device:
                 raise ValueError("timer must be on the buffer device")
-            _extension().validate_timer(timer, "urma")
+            _extension().validate_timer(timer, b._backend_name)
             if any(
                 timer.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr()
                 for tensor in (data, scales, topk_idx, topk_weights, w1, w2, s1, s2)
+                if tensor is not None
             ):
                 raise ValueError("timer must not share storage with inputs or weights")
         check_window_routes(topk_idx, topk_weights, b.num_experts)
@@ -682,7 +813,7 @@ def _run(
             bs = data.shape[0]
             if b._windowed:
                 signature = (bs, b._generation)
-                if b._generation + b.num_forward_windows(bs) >= 1 << 31:
+                if b._urma_windowed and b._generation + b.num_forward_windows(bs) >= 1 << 31:
                     raise ValueError("URMA generation exhausted; recreate the buffer")
                 if out is None:
                     out = torch.empty((bs, b.hidden), dtype=torch.bfloat16, device=b._device)
@@ -708,8 +839,9 @@ def _run(
                     for first in range(0, bs, b._native_capacity):
                         rows = slice(first, min(first + b._native_capacity, bs))
                         b._generation += 1
-                        _, window_counts = b._plan.forward(
-                            data[rows], scales[rows], ids[rows], weights[rows], *matrix,
+                        plan = b._plan if b._urma_windowed or rows.stop - first == b._plan_bs else b._tail_plan
+                        _, window_counts = plan.forward(
+                            data[rows], scales[rows] if scales is not None else None, ids[rows], weights[rows], *matrix,
                             timer if first == 0 else None, *shared, out[rows], b._generation, clamp,
                         )
                         if counts is None:
@@ -720,7 +852,7 @@ def _run(
             except Exception as exc:
                 # Window plan failures are collective and retryable. Once a launch
                 # starts, a peer may already be waiting on its generation.
-                if b._backend_name == "urma" and (not b._windowed or b._generation != start_generation):
+                if (b._backend_name == "urma" and not b._windowed) or (b._windowed and b._generation != start_generation):
                     b._failure = str(exc)
                     if isinstance(b.group, StoreGroup):
                         b.group.abort(b._failure)

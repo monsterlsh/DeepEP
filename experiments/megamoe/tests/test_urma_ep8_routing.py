@@ -1,4 +1,4 @@
-"""Exercise EP8 GELU route metadata using the production host/device planner."""
+"""Exercise windowed GELU route metadata using the production host/device planner."""
 
 from pathlib import Path
 import shutil
@@ -8,7 +8,7 @@ import sys
 import pytest
 
 
-def test_ep8_window_route_metadata_at_topk32(tmp_path):
+def test_window_route_metadata_and_peer_ownership_at_topk32(tmp_path):
     compiler = next((path for name in ("c++", "g++", "clang++") if (path := shutil.which(name))), None)
     if compiler is None:
         pytest.skip("A host C++17 compiler is required for the route planner check")
@@ -46,11 +46,11 @@ struct PackCheck {
     }
 };
 
-void check(uint32_t tokens, uint32_t topk, uint32_t cvRows, bool allSources)
+void check(uint32_t world, uint32_t tokens, uint32_t topk, uint32_t cvRows, bool allSources)
 {
     Config config{};
-    config.world = 8U;
-    config.rank = 3U;
+    config.world = world;
+    config.rank = world - 2U;
     config.localExperts = 100U;
     config.hidden = 4096U;
     config.intermediate = 1536U;
@@ -59,7 +59,7 @@ void check(uint32_t tokens, uint32_t topk, uint32_t cvRows, bool allSources)
     config.bs = tokens;
     config.topk = topk;
     config.cvRows = cvRows;
-    config.sourceRowCapacity = kEp8WindowTokens * topk;
+    config.sourceRowCapacity = kWindowTokens * topk;
     config.maxPeerChunks = (config.sourceRowCapacity + cvRows - 1U) / cvRows;
 
     DeviceRouteInfo routes{};
@@ -108,16 +108,79 @@ void check(uint32_t tokens, uint32_t topk, uint32_t cvRows, bool allSources)
     assert(pack.packed == localRows);
 }
 
-int main()
+void checkOwners(uint32_t world)
 {
-    assert(kEp8WindowTokens == 256U && kEp8MaxTopk == 32U);
-    for (uint32_t cv : {128U, 256U}) {
-        for (uint32_t tokens : {1U, 17U, 255U, kEp8WindowTokens}) {
-            for (uint32_t topk = 1U; topk <= kEp8MaxTopk; ++topk) {
-                check(tokens, topk, cv, true);
-                check(tokens, topk, cv, false);
+    uint32_t peers[kMaxWorld]{}, reducers[kLocalWorkers]{};
+    for (uint32_t block = 0; block < kAic; ++block) {
+        for (uint32_t slot = 0; slot < 2U; ++slot) {
+            const uint32_t owner = PeerOwnerForSlot(world, block, slot);
+            if (owner < world - 1U) ++peers[owner];
+        }
+        for (uint32_t subblock = 0; subblock < 2U; ++subblock) {
+            const uint32_t worker = ReduceWorkerIndex(block, subblock, world);
+            if (worker < ReduceWorkers(world)) ++reducers[worker];
+        }
+    }
+    for (uint32_t p = 0; p < world - 1U; ++p) assert(peers[p] == 1U);
+    for (uint32_t w = 0; w < ReduceWorkers(world); ++w) assert(reducers[w] == 1U);
+    assert(ActivationWorkers(world) > 0U);
+}
+
+// Every source selects K distinct IDs ending at 799. K32 spills its seven
+// additional routes onto rank 30. All other destinations must finish empty.
+void checkTarget(uint32_t tokens, uint32_t topk)
+{
+    for (uint32_t rank = 0; rank < 32U; ++rank) {
+        Config c{};
+        c.world = 32U; c.rank = rank; c.localExperts = 25U;
+        c.bs = tokens; c.topk = topk; c.cvRows = 256U; c.sourceRowCapacity = kWindowTokens * topk;
+        c.maxPeerChunks = (c.sourceRowCapacity + c.cvRows - 1U) / c.cvRows;
+        c.hidden = 4096U; c.intermediate = 1536U;
+        c.activationMode = static_cast<uint32_t>(MegaMoeImpl::MegaMoeActMode::GELU);
+        c.topkWeightsType = 1U;
+        DeviceRouteInfo routes{};
+        for (uint32_t e = 0; e < 800U; ++e) {
+            routes.outgoing[e + 1U] = routes.outgoing[e] + (e >= 800U - topk ? tokens : 0U);
+        }
+        for (uint32_t p = 0; p < c.world; ++p) {
+            routes.returnBase[p] = routes.outgoing[rank * c.localExperts];
+            for (uint32_t e = 0; e < c.localExperts; ++e) {
+                const uint32_t id = rank * c.localExperts + e;
+                routes.incoming[p][e + 1U] = routes.incoming[p][e] + (id >= 800U - topk ? tokens : 0U);
             }
         }
+        SummarizeRouteExperts(c, routes, 0U, c.localExperts);
+        FinishRouteSummaryPrefix(c, routes, false);
+        const uint32_t activeExperts = rank == 31U ? 25U : rank == 30U ? topk - 25U : 0U;
+        assert(c.receiveRows == c.world * tokens * activeExperts);
+        assert(c.selfRows == tokens * activeExperts);
+        assert(c.fragmentCount == ((c.world * tokens + 255U) / 256U) * activeExperts);
+        assert(routes.outgoing[800] == tokens * topk);
+        for (uint32_t cv = 0; cv < c.recvChunkCount; ++cv) {
+            const uint32_t peer = PlanPeerForCv(cv, c, routes, false);
+            const uint32_t peerRow = (cv - routes.recvCvBase[peer]) * c.cvRows;
+            assert(PlanExpertForPeerRow(peer, peerRow, c, routes) == c.localExperts - activeExperts + peerRow / tokens);
+        }
+    }
+}
+
+int main()
+{
+    assert(kWindowTokens == 256U && kWindowMaxTopk == 32U);
+    for (uint32_t world : {4U, 8U, 16U, 32U}) checkOwners(world);
+    for (uint32_t world : {8U, 16U, 32U}) {
+        for (uint32_t cv : {128U, 256U}) {
+            for (uint32_t tokens : {1U, 17U, 112U, 255U, kWindowTokens}) {
+                for (uint32_t topk = 1U; topk <= kWindowMaxTopk; ++topk) {
+                    check(world, tokens, topk, cv, true);
+                    check(world, tokens, topk, cv, false);
+                }
+            }
+        }
+    }
+    for (uint32_t tokens : {112U, 256U}) {
+        checkTarget(tokens, 25U);
+        checkTarget(tokens, 32U);
     }
 }
 """,

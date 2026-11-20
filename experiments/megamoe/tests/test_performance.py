@@ -39,6 +39,68 @@ def test_samples_merge_shards_sort_and_keep_slow_round(tmp_path):
     assert samples[-1]["row"] == 2 and "one" in samples[-1]["file"]
 
 
+@pytest.mark.parametrize("windows", [1, 2, 154])
+def test_mte_groups_window_samples_before_rank_statistics(tmp_path, windows):
+    rows = [kernel(i * 20, i) for i in range(1, 1 + 2 * windows)]
+    write_samples(tmp_path / "kernel_details.csv", list(reversed(rows)))
+    samples = read_kernel_samples(tmp_path, 2, windows)
+    assert [(s["phase"], s["iteration"], s["window"]) for s in samples] == [
+        ("formal", iteration, window) for iteration in range(2) for window in range(windows)
+    ]
+    expected = [sum(range(begin + 1, begin + 1 + windows)) for begin in (0, windows)]
+    assert performance.forward_durations(samples, windows) == expected
+    with pytest.raises(ValueError, match="expected"):
+        read_kernel_samples(tmp_path, 3, windows)
+
+
+def test_host_e2e_captures_completed_public_invocations(monkeypatch):
+    log = []
+    monkeypatch.setattr(performance, "flush_l2_before_call", lambda: log.append("flush"))
+    monkeypatch.setattr(performance, "perf_counter_ns", iter([10000, 12000, 20000, 25000]).__next__)
+    torch = SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: log.append("sync")))
+    group = SimpleNamespace(barrier=log.append, all_gather=lambda durations, stage: [durations, [3.0, 4.0]])
+    result = performance.measure_synchronized_forward(lambda: log.append("call"), group, torch, 2, 17)
+    assert log == ["flush", "sync", "host timing BS=17 iteration=0", "call", "sync",
+                   "flush", "sync", "host timing BS=17 iteration=1", "call", "sync"]
+    assert result["per_rank_rounds_us"] == [[2.0, 5.0], [3.0, 4.0]]
+    assert result["rank_max_mean_us"] == 4.0
+
+
+@pytest.mark.parametrize("config_name,topk", [("target_gelu_k25", 25), ("target_gelu_k32", 32), ("gelu_smoke_k25", 25)])
+def test_acceptance_configs(config_name, topk):
+    config = load_config(config_name)
+    model = config["model"]
+    smoke = config_name == "gelu_smoke_k25"
+    assert config["bs_values"] == ([17, 257] if smoke else [39280])
+    assert model == dict(
+        num_experts=32 if smoke else 800,
+        hidden=1024 if smoke else 4096,
+        intermediate_hidden=256 if smoke else 1536,
+        num_topk=topk,
+        num_shared_experts=0,
+        activation="gelu",
+        topk_weights_type=1,
+        mma_type="fp8xfp4",
+    )
+    assert all(model["num_experts"] % ep == 0 and model["num_experts"] // ep <= 128 for ep in (8, 16, 32))
+
+
+def test_chunked_input_generation_matches_existing_golden_rng():
+    import numpy as np
+    from deep_ep_experimental.megamoe.benchmark import inputs
+    from deep_ep_experimental.megamoe.reference import bf16
+
+    config = load_config("gelu_smoke_k25")
+    bs, rank = 257, 2
+    rng = np.random.default_rng(config["seed"] + rank * 1009 + bs)
+    expected = bf16(rng.normal(0, 0.2, (bs, config["model"]["hidden"])).astype(np.float32))
+    weights = rng.random((bs, 25), dtype=np.float32)
+    weights /= np.abs(weights).sum(axis=1, keepdims=True)
+    actual, _, actual_weights = inputs(config, rank, bs, world=8)
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(actual_weights, weights)
+
+
 @pytest.mark.parametrize(
     "rows,iterations,message",
     [

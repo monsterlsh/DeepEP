@@ -4,3 +4,4 @@
 #pragma once
 constexpr unsigned ACLSHMEM_TRANSPORT_MTE = 1U;
 constexpr unsigned ACLSHMEM_TRANSPORT_UDMA = 8U;
+constexpr unsigned ACLSHMEM_TRANSPORT_ROCE = 2U;

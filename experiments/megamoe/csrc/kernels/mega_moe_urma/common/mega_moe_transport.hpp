@@ -6,8 +6,10 @@
 #include <cstdint>
 #include "kernel_operator.h"
 #include "shmem.h"
+#include "device/gm2gm/engine/shmem_device_mte.h"
 #include "kernels/mega_moe_urma/mega_moe_urma_tiling.hpp"
 #include "kernels/mega_moe_urma/common/mega_moe_compute_contract.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_roce.hpp"
 
 // RO/SO transport, peer handshake and local completion accounting.
 
@@ -32,7 +34,7 @@ __aicore__ inline uint32_t PeerForOwner(uint32_t rank, uint32_t owner)
 // peer. Do not pass an already translated MTE peer pointer to this function.
 // The caller completes local GM producers before submitting and retains src
 // unchanged until Quiet(peer, qp) returns. This transport deliberately has no GET.
-__aicore__ inline void Put(__gm__ uint8_t* symmetricBase, uint64_t dstOffset, __gm__ uint8_t* src, uint32_t bytes,
+__aicore__ inline void Put(const Arguments& a, uint64_t dstOffset, __gm__ uint8_t* src, uint32_t bytes,
                            uint32_t peer)
 {
     if (bytes == 0U) return;
@@ -40,25 +42,55 @@ __aicore__ inline void Put(__gm__ uint8_t* symmetricBase, uint64_t dstOffset, __
         aclshmemi_kernel_abort("MegaMoE URMA PUT exceeds 256 MiB: bytes=%u peer=%u\n", bytes, peer);
         return;
     }
-    aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_S, kUrmaRO>(symmetricBase + dstOffset, src, nullptr, bytes, peer,
-                                                        kCommunicationQp, 0U);
+    if (RemoteHost(a, peer)) {
+        RocePut(a, dstOffset, src, bytes, peer, kPayloadQp);
+        return;
+    }
+    auto* dst = reinterpret_cast<__gm__ uint8_t*>(a.symmetric + dstOffset);
+    if (a.config.windowedTransport) {
+        AscendC::LocalTensor<uint8_t> scratch(AscendC::TPosition::VECCALC, kMteScratchOffset, kMteScratchBytes);
+        aclshmemx_mte_put_nbi(dst, src, reinterpret_cast<__ubuf__ uint8_t*>(scratch.GetPhyAddr()),
+                              kMteScratchBytes, bytes, peer, 7U);
+        // The SDK leaves its final MTE3 store outstanding. Transfer ownership
+        // back before reusing the UB staging area or publishing the CV.
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(7U);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(7U);
+        return;
+    }
+    aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_S, kUrmaRO>(dst, src, nullptr, bytes, peer, kCommunicationQp, 0U);
 }
+
+__aicore__ inline void PublishDone(__gm__ uint8_t* symmetricBase, uint64_t signalOffset, uint32_t peer,
+                                   uint64_t sequence, AscendC::LocalTensor<uint64_t> signalUb,
+                                   AscendC::TEventID eventId);
 
 // The receiver resets this invocation's slots before publishing its start.
 // SO is ordered after every preceding RO/SO on this PE/QP. Ordinary NO PUTs
 // would not provide this guarantee. This is async and has no per-CV quiet.
-__aicore__ inline void PublishOrdered(__gm__ uint8_t* symmetricBase, uint64_t signalOffset, uint32_t peer,
+__aicore__ inline void PublishOrdered(const Arguments& a, uint64_t signalOffset, uint32_t peer,
                                       uint64_t epoch)
 {
+    if (RemoteHost(a, peer)) {
+        RocePublish(a, signalOffset, peer, kPayloadQp);
+        return;
+    }
+    if (a.config.windowedTransport) {
+        AscendC::LocalTensor<uint64_t> flag(AscendC::TPosition::VECCALC, kMteScratchOffset, 4U);
+        PublishDone(reinterpret_cast<__gm__ uint8_t*>(a.symmetric), signalOffset, peer, epoch, flag, 7U);
+        return;
+    }
     aclshmemx_udma_atomic_add<uint64_t, ACLSHMEMX_UDMA_OP_CONFIG_SO>(
-        reinterpret_cast<__gm__ uint64_t*>(symmetricBase + signalOffset), epoch, peer);
+        reinterpret_cast<__gm__ uint64_t*>(a.symmetric + signalOffset), epoch, peer);
 }
 
 // Blocking completion of all local submissions, including the final SO flag.
 // The one-owner rule also applies here: no second worker may poll the same CQ.
-__aicore__ inline void Quiet(uint32_t peer)
+__aicore__ inline void Quiet(const Arguments& a, uint32_t peer)
 {
-    aclshmemx_udma_qp_quiet(peer, kCommunicationQp);
+    if (RemoteHost(a, peer))
+        RoceQuiet(a, peer, kPayloadQp);
+    else if (!a.config.windowedTransport)
+        aclshmemx_udma_qp_quiet(peer, kCommunicationQp);
 }
 
 // MTE publication is retained only for the invocation start/barrier handshake.
@@ -86,10 +118,12 @@ __aicore__ inline void PublishDone(__gm__ uint8_t* symmetricBase, uint64_t signa
 // Local polling only: this is not a remote read/GET and may be used by AIC or
 // AIV. ReadGmByPassDCache avoids a stale locally cached signal. Payload consumers
 // must likewise use the stage's coherent/cache-bypassing input access policy.
-__aicore__ inline void WaitLocalDone(__gm__ uint8_t* localSlot, uint64_t sequence)
+__aicore__ inline void WaitLocalDone(const Arguments& a, __gm__ uint8_t* localSlot, uint32_t peer)
 {
     auto* value = reinterpret_cast<__gm__ uint64_t*>(localSlot);
-    while (AscendC::ReadGmByPassDCache(value) != sequence) {
+    const uint64_t since = a.config.world == 32U ? AscendC::GetSystemCycle() : 0U;
+    while (AscendC::ReadGmByPassDCache(value) != a.config.epoch) {
+        CheckPeerDeadline(a, since, peer, kWaitRoutes);
     }
 }
 
@@ -193,7 +227,9 @@ __aicore__ inline bool ObserveIncomingCompletion(const Arguments& args, uint32_t
 __aicore__ inline void FinishCombinePeer(const Arguments& args, uint32_t owner, bool& peerCounted, bool& selfCounted)
 {
     using namespace AscendC;
+    const uint64_t since = args.config.world == 32U ? GetSystemCycle() : 0U;
     while (!ObserveIncomingCompletion(args, owner, peerCounted, selfCounted)) {
+        CheckPeerDeadline(args, since, PeerForOwner(args.config.rank, owner), kWaitFinished);
         const uint64_t start = GetSystemCycle();
         while (GetSystemCycle() - start < 200U) {
         }

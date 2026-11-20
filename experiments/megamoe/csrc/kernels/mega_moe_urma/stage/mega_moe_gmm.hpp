@@ -339,7 +339,9 @@ __aicore__ inline void GatherInputScaleImpl(const Arguments& args, const Fragmen
                     {static_cast<uint16_t>(segment.rows), scaleBytes, args.config.dispatchScaleStride - scaleBytes, 0U, 0U}, {false, 0U, 0U, 0U});
     }
     GlobalTensor<uint8_t> weights;
-    LocalTensor<uint8_t> weightScratch(TPosition::VECCALC, 192U * 1024U, kComputeTileM * 32U);
+    // The H4096 window lookup owns [192,224) KiB throughout the cooperative loop.
+    const uint32_t weightsOffset = args.geluLookupWords ? WindowGeluUb::gatherWeightOffset : 192U * 1024U;
+    LocalTensor<uint8_t> weightScratch(TPosition::VECCALC, weightsOffset, kComputeTileM * 32U);
     if (args.config.topkWeightsType) {
         weights.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.gatheredRouteWeights));
         auto weightCursor = RuntimeSegments(args, fragment).MakeCursor();
@@ -546,6 +548,11 @@ class UbRoutedActivation {
     using WeightedOp = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 256U, 256U, true, true, true>;
     using GeluOp = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 256U, 256U, false, false, true>;
     using WeightedGeluOp = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 256U, 256U, true, false, true>;
+    using LookupGeluOp = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t,
+        WindowGeluUb::rows, kComputeTileN, true, false, true>;
+    static_assert(kPackUbBase + kPackUbBytes <= WindowGeluUb::tableOffset);
+    static_assert(WindowGeluUb::tableOffset + WindowGeluUb::tableBytes <= kMteScratchOffset);
+    static_assert(WindowGeluUb::tableOffset + WindowGeluUb::tableBytes <= kRoceScratchOffset);
     static constexpr uint32_t kGeluWeightUbOffset = 208U * 1024U;
     static_assert(128U * 1024U + 256U * 32U <= kAiv1PersistentUbBase);
     static_assert(kGeluWeightUbOffset + 256U * 32U <= kAiv1PersistentUbBase);
@@ -569,6 +576,17 @@ public:
         const bool singleProjection =
             UrmaMegaMoeImpl::ActivationFactor(static_cast<uint8_t>(a.config.activationMode)) == 1U;
         if (singleProjection) {
+            if (a.geluLookupWords) {
+                lookupGelu_.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a.activation),
+                                  .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a.activationScale),
+                                  .actMode = static_cast<uint8_t>(a.config.activationMode),
+                                  .ubOffsetBytes = WindowGeluUb::epilogueBase,
+                                  .topkWeightUbOffsetBytes = WindowGeluUb::weightOffset - WindowGeluUb::epilogueBase,
+                                  .topkWeightIndex = 0U});
+                lookupGelu_.LoadWindowGeluTable(a.geluLookup, a.geluLookupWords);
+                lookupGelu_.UpdateNextProblem({0, a.config.intermediate, 0, 0});
+                return;
+            }
             if (a.config.topkWeightsType) {
                 weightedGelu_.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a.activation),
                                     .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a.activationScale),
@@ -613,7 +631,8 @@ public:
         const bool singleProjection =
             UrmaMegaMoeImpl::ActivationFactor(static_cast<uint8_t>(a.config.activationMode)) == 1U;
         if (singleProjection) {
-            if (a.config.topkWeightsType) RunImpl<true>(a, f, group, tile, timer, weightedGelu_);
+            if (a.geluLookupWords) RunImpl<true, true>(a, f, group, tile, timer, lookupGelu_);
+            else if (a.config.topkWeightsType) RunImpl<true>(a, f, group, tile, timer, weightedGelu_);
             else RunImpl<false>(a, f, group, tile, timer, gelu_);
             return;
         }
@@ -622,7 +641,7 @@ public:
     }
 
 private:
-    template <bool Early, class TimerT, class ActivationOp>
+    template <bool Early, bool Lookup = false, class TimerT, class ActivationOp>
     __aicore__ inline void RunImpl(const Arguments& a, const Fragment& f, uint32_t group,
                                     uint32_t tile, TimerT& timer, ActivationOp& op)
     {
@@ -635,16 +654,23 @@ private:
         auto meta = ComputeTileTraceMeta(FragmentTraceMeta(f, group), 0U, n, f.rows, columns);
         timer.Begin(Phase::Activation);
         const auto start = timer.TraceBegin();
-        if constexpr (Early) {
-            AscendC::GlobalTensor<float> weights;
-            weights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(a.gatheredRouteWeights));
-            auto ub = op.GetTopkWeightTensor();
-            AscendC::DataCopy(ub, weights[f.rowBegin * 8U], f.rows * 8U);
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        constexpr uint32_t batch = Lookup ? WindowGeluUb::rows : kComputeTileM;
+        for (uint32_t first = 0; first < f.rows; first += batch) {
+            const uint32_t rows = f.rows - first < batch ? f.rows - first : batch;
+            if constexpr (Lookup) op.SelectGeluMailboxRows(first);
+            if constexpr (Early) {
+                AscendC::GlobalTensor<float> weights;
+                weights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(a.gatheredRouteWeights));
+                auto ub = op.GetTopkWeightTensor();
+                AscendC::DataCopy(ub, weights[(f.rowBegin + first) * 8U], rows * 8U);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            }
+            AscendC::SetCtrlSpr<60, 60>(0);
+            const auto outputOffset = static_cast<int64_t>(first) * a.config.intermediate + n;
+            op({rows, columns, 0, 0}, {outputOffset, outputOffset / 32U, 0, 0, 0, 0}, 0U);
+            if constexpr (!Lookup) break;
         }
-        AscendC::SetCtrlSpr<60, 60>(0);
-        op({f.rows, columns, 0, 0}, {n, n / 32U, 0, 0, 0, 0}, 0U);
         // operator() retains the existing SeparateSigmoid FP32 sequence,
         // BF16 rounding and MX groups. It drains both output DMA planes.
         AscendC::AtomicAdd(ComputeFlag(a.activationDone, group), 1);
@@ -657,5 +683,6 @@ private:
     WeightedOp weighted_;
     GeluOp gelu_;
     WeightedGeluOp weightedGelu_;
+    LookupGeluOp lookupGelu_;
 };
 }  // namespace MegaMoeUrma

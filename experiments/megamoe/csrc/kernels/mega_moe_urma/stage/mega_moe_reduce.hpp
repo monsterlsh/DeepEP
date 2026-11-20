@@ -123,6 +123,11 @@ struct ReduceUbContract {
     static constexpr uint32_t routeRingBytes = (inputs * sizeof(uint32_t) + 31U) / 32U * 32U;
     static constexpr uint32_t end = routeRingOffset + routeRingBytes;
 };
+static_assert((kWindowTokens + ReduceWorkers(kMaxWorld) - 1U) / ReduceWorkers(kMaxWorld) <=
+              ReduceUbContract::maxTokens);
+static_assert(kMaxWorld * kWindowPeerChunks <= ReduceUbContract::maxRemoteDependencies);
+static_assert(kMaxWorld * kWindowTokens * ReduceUbContract::topk / kComputeTileM + kMaxLocalExperts <=
+              ReduceUbContract::maxSelfDependencies);
 static_assert(ReduceUbContract::maxTokens == 200U && ReduceUbContract::end == 191328U);
 static_assert(ReduceUbContract::end <= kRequiredUbBytes);
 static_assert(ReduceUbContract::inputFp32Offset % 32U == 0U && ReduceUbContract::accumulatorOffset % 32U == 0U &&
@@ -389,7 +394,7 @@ namespace MegaMoeUrma::GenericReduce {
 
 // H is sliced at 2048 columns. Each worker keeps its metadata resident so a
 // late token cannot block another metadata batch. Legacy K<=8 at BS16384
-// determines the capacity; EP8's short K<=32 windows also fit it.
+// determines the capacity; the short K<=32 windows also fit it.
 struct ReduceUbContract {
     static constexpr uint32_t hidden = 2048U;
     static constexpr uint32_t legacyTopk = 8U;
@@ -423,10 +428,13 @@ struct ReduceUbContract {
     static constexpr uint32_t end = routeRingOffset + routeRingBytes;
 };
 static_assert(ReduceUbContract::maxTokens == 400U);
-constexpr uint32_t kEp8ReduceWorkers = ReduceWorkers(8U);
-constexpr uint32_t kEp8ReduceTokens = (kEp8WindowTokens + kEp8ReduceWorkers - 1U) / kEp8ReduceWorkers;
-static_assert(kEp8ReduceTokens <= ReduceUbContract::maxTokens);
-static_assert(kEp8ReduceTokens * kEp8MaxTopk <= ReduceUbContract::maxRoutes);
+constexpr uint32_t kWindowReduceWorkers = ReduceWorkers(kMaxWorld);
+constexpr uint32_t kWindowReduceTokens = (kWindowTokens + kWindowReduceWorkers - 1U) / kWindowReduceWorkers;
+static_assert(kWindowReduceTokens <= ReduceUbContract::maxTokens);
+static_assert(kWindowReduceTokens * kWindowMaxTopk <= ReduceUbContract::maxRoutes);
+static_assert(kMaxWorld * kWindowPeerChunks <= ReduceUbContract::maxRemoteDependencies);
+static_assert(kMaxWorld * kWindowTokens * kWindowMaxTopk / kComputeTileM + kMaxLocalExperts <=
+              ReduceUbContract::maxSelfDependencies);
 static_assert(ReduceUbContract::end <= kRequiredUbBytes);
 static_assert(ReduceUbContract::inputFp32Offset % 32U == 0U && ReduceUbContract::accumulatorOffset % 32U == 0U &&
               ReduceUbContract::outputOffset % 32U == 0U && ReduceUbContract::inverseOffset % 32U == 0U &&
@@ -738,9 +746,10 @@ __aicore__ inline void ReduceGeneric(const Arguments& a, uint32_t worker, uint32
 {
     using Ub = GenericReduce::ReduceUbContract;
     if (a.config.topk == 0U ||
-        (a.config.topk > Ub::legacyTopk &&
-         (a.config.world != 8U || a.config.bs > kEp8WindowTokens || a.config.topk > kEp8MaxTopk ||
-          a.config.maxPeerChunks > kMaxPeerChunks || workers < GenericReduce::kEp8ReduceWorkers))) {
+        ((a.config.topk > Ub::legacyTopk || a.config.world == kMaxWorld) &&
+         ((a.config.world != 8U && a.config.world != 16U && a.config.world != kMaxWorld) ||
+          a.config.bs > kWindowTokens || a.config.topk > kWindowMaxTopk ||
+          a.config.maxPeerChunks > kWindowPeerChunks || workers < GenericReduce::kWindowReduceWorkers))) {
         aclshmemi_kernel_abort("MegaMoE URMA Reduce shape is outside the UB contract\n");
         return;
     }

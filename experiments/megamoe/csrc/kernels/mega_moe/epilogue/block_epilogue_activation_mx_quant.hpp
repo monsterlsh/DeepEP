@@ -81,6 +81,24 @@ public:
 public:
     __aicore__ inline void Init(Params const& params);
     __aicore__ inline auto GetTopkWeightTensor();
+    __aicore__ inline void LoadGeluTable(GM_ADDR src, uint16_t words)
+    {
+        if constexpr (g_coreType == AIV && TopkWeightsPrefetch && TileM == 128 && TileN == 256 && !IsInterleaved_) {
+            constexpr auto offsets = Detail::BuildActivationMxQuantUbOffsets<DataTypeIn, TileM, TileN, IsInterleaved_>();
+            if constexpr (offsets.topkWeightOffsetBytes + offsets.topkWeightElementCapacity * sizeof(float) >
+                              MTE_GELU_LUT_UB_BEGIN ||
+                          offsets.reciprocalScaleOffsetBytes + offsets.scaleElementCapacity * sizeof(uint16_t) >
+                              MTE_GELU_LUT_UB_BEGIN) return;
+            if (src != nullptr && words > 0 && words <= MTE_GELU_LUT_WORD_CAPACITY) {
+                LocalTensor<uint32_t> table(TPosition::VECCALC, MTE_GELU_LUT_UB_BEGIN, MTE_GELU_LUT_WORD_CAPACITY);
+                GlobalTensor<uint32_t> gm;
+                gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(src));
+                DataCopy(table, gm, words);
+                SyncFuncStatic<HardEvent::MTE2_V, SYNC_EVENT_ID2>();
+                geluTable_ = reinterpret_cast<__ubuf__ uint32_t*>(table.GetPhyAddr());
+            }
+        }
+    }
     // 计算并写回一个激活/量化 tile，不包含流水通知。
     __aicore__ inline void operator()(const BlockShape& blockShape, const BlockCoord& blockCoord,
                                       uint16_t pingpongIdx = 0);
@@ -88,6 +106,7 @@ public:
     __aicore__ inline void UpdateNextProblem(const ProblemShape& problemShape);
 
 private:
+    __ubuf__ uint32_t* geluTable_ = nullptr;
     using UbPointers = Detail::ActivationMxQuantUbPointers<DataTypeIn>;
 
     __aicore__ inline void RunMxQuantTile(const UbPointers& ubPointers, uint16_t validRowCount,
@@ -322,6 +341,12 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
     const ActMode actMode = static_cast<ActMode>(actMode_);
     const ActSubMode actSubMode = static_cast<ActSubMode>(actSubMode_);
     if (actMode == ActMode::GELU) {
+        if constexpr (TopkWeightsPrefetch && TileM == 128 && TileN == 256 && !IsInterleaved_) {
+            if (geluTable_ != nullptr) {
+                Activation::RunGELU<DataTypeIn, TopkWeightsPrefetch, true>(gatedActivationContext, geluTable_);
+                return;
+            }
+        }
         Activation::RunGELU<DataTypeIn, TopkWeightsPrefetch>(gatedActivationContext);
     } else if (actMode == ActMode::SITU) {
         const float invBeta = activationBeta_ != 0.0f ? 1.0f / activationBeta_ : 1.0f;

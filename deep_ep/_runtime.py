@@ -30,7 +30,7 @@ class _MegaMoEProfile(NamedTuple):
 
 _MEGAMOE_PROFILES = {
     "mte": _MegaMoEProfile(1 << 30, False, False, None),
-    "urma": _MegaMoEProfile(32 << 30, True, True, (4, 8, 16)),
+    "urma": _MegaMoEProfile(32 << 30, True, True, (4, 8, 16, 32)),
 }
 
 
@@ -106,7 +106,7 @@ class Runtime:
                 raise ValueError("MegaMoE backend must be mte or urma")
             profile = _MEGAMOE_PROFILES[self._megamoe_backend]
         native = require_native("Runtime.__init__")
-        self.ll_backend = os.environ.get("DEEPEP_LL_BACKEND", "mte")
+        self.ll_backend = "mte" if getattr(self, "_megamoe_windowed", False) else os.environ.get("DEEPEP_LL_BACKEND", "mte")
         if self.ll_backend not in ("mte", "rdma"):
             raise ValueError("DEEPEP_LL_BACKEND must be mte or rdma")
         integer("capacity", capacity, 2 << 20, profile.maximum_capacity if profile else (1 << 63) - 1)
@@ -155,11 +155,13 @@ class Runtime:
         if self._megamoe:
             integer("world_size", size, 2, 128)
             if profile.world_sizes is not None and size not in profile.world_sizes:
-                raise ValueError("Selected MegaMoE backend requires EP4/EP8/EP16")
+                raise ValueError("Selected MegaMoE backend requires EP4/EP8/EP16/EP32")
             create = getattr(native, "create_megamoe_runtime", None)
             if create is None:
                 raise RuntimeError("Rebuild with DEEPEP_BUILD_MEGAMOE=ON")
             factory = partial(create, backend=self._megamoe_backend)
+            if getattr(self, "_megamoe_windowed", False):
+                factory = partial(factory, windowed=True)
         else:
             from .buffers._elastic_layout import WORLD_SIZES
 
@@ -176,11 +178,13 @@ class Runtime:
         npu = npu_api()
         self.device = npu.current_device()
         self.group = group
-        self.host_coordinated = self.ll_backend == "rdma"
+        self.host_coordinated = self.ll_backend == "rdma" or (
+            self._megamoe and self._megamoe_backend == "urma" and size == 32
+        )
         self.coordination_failed = False
         if self.host_coordinated and group is None:
             raise ValueError("NDR requires Host coordination: pass a ProcessGroup or a StoreGroup")
-        if self.host_coordinated and not store_group and backend != "hccl":
+        if self.ll_backend == "rdma" and not store_group and backend != "hccl":
             raise ValueError("NDR requires an HCCL ProcessGroup for Host coordination")
         self.low_latency_comm_args = None
         self.closed = False
@@ -213,6 +217,7 @@ class Runtime:
                     + 16 * int(debug_collectives)
                     + 32 * int(self.ll_backend == "rdma")
                     + 64 * int(profile is not None and profile.peer_access_check)
+                    + 128 * int(getattr(self, "_megamoe_windowed", False))
                 )
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")

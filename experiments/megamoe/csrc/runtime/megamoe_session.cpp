@@ -12,18 +12,27 @@
 namespace deepep::megamoe {
 namespace {
 
-SessionOptions options_for(const std::string& backend)
+SessionOptions options_for(const std::string& backend, int size, bool windowed)
 {
     SessionOptions options;
     options.megamoe = true;
     if (backend == "mte") {
+        if (windowed) throw std::invalid_argument("The UBX transport requires the URMA kernel");
         options.maximum_bytes = 1ULL << 30;
         return options;
     }
     if (backend != "urma") throw std::invalid_argument("MegaMoE backend must be mte or urma");
 
-    options.udma = true;
     options.maximum_bytes = 32ULL << 30;
+    if (windowed) {
+        if (size != 8 && size != 16 && size != 32)
+            throw std::invalid_argument("UBX windowed transport requires EP8, EP16 or EP32");
+        options.required_peer_transports = ACLSHMEM_TRANSPORT_MTE;
+        options.window_ranks_per_host = size == 32 ? 16 : size;
+        return options;
+    }
+    if (size == 32) throw std::invalid_argument("UBX EP32 requires windowed transport");
+    options.udma = true;
     options.required_peer_transports = ACLSHMEM_TRANSPORT_MTE | ACLSHMEM_TRANSPORT_UDMA;
     options.dedicated_peer_qp = true;
 
@@ -45,9 +54,9 @@ SessionOptions options_for(const std::string& backend)
 }  // namespace
 
 std::unique_ptr<Session> create_runtime(int rank, int size, uint64_t bytes, const std::string& endpoint,
-                                        unsigned timeout, const std::string& backend)
+                                        unsigned timeout, const std::string& backend, bool windowed)
 {
-    return std::make_unique<Session>(rank, size, bytes, endpoint, timeout, options_for(backend));
+    return std::make_unique<Session>(rank, size, bytes, endpoint, timeout, options_for(backend, size, windowed));
 }
 
 }  // namespace deepep::megamoe
