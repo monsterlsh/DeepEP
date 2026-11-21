@@ -47,12 +47,12 @@ torchrun --standalone --nproc-per-node=8 -m deep_ep_experimental.megamoe.benchma
 
 ### UBX GELU 精度与性能
 
-在目标机器安装本次构建的 MegaMoE wheel。统一入口 `run_ubx_gelu.py` 支持单机 16 卡和双机 32 卡，默认 K25、每卡 39,280 token、均衡路由、全量精度比对。`accuracy` 默认测 W4A8 和 W8A8，`perf` 默认测 W4A8。`both` 依次执行精度和性能。显式传 `w4a8`、`w8a8` 或 `all` 时，应用到该命令的所有模式。
+在目标机器安装本次构建的 MegaMoE wheel。统一入口 `run_ubx_gelu.py` 支持单机 16 卡和双机 32 卡，默认 K25、每卡 39,280 token、均衡路由、全量精度比对。`--mode accuracy` 单独测精度，默认两种精度。`--mode perf` 单独测 GELU 性能，默认 W4A8。`--mode compare` 测 A/B 性能和掩盖率。`--precision w8a8|a8w4|all` 独立选择精度。旧的位置参数仍可用，`both` 可显式连续跑精度和 GELU 性能。
 
 ```bash
 UBX=experiments/megamoe/scripts/run_ubx_gelu.py
-python3 "$UBX" accuracy --ep-size 16
-python3 "$UBX" perf w8a8 --ep-size 16
+python3 "$UBX" --mode accuracy --precision all --ep-size 16
+python3 "$UBX" --mode perf --precision w8a8 --ep-size 16
 
 # 在 90.90.93.84 上执行，自动通过 SSH 拉起 90.90.93.184。
 python3 "$UBX" accuracy all --ep-size 32
@@ -78,6 +78,55 @@ python3 "$UBX" "${ARGS[@]}" --stage run
 - 精度和性能输出分别位于 `accuracy-<精度>/rank_<r>/bs_<B>/accuracy.json` 和 `perf-<精度>/rank_<r>/bs_<B>/performance.json`。手动模式和自动模式均保留各节点日志。
 
 原 EP16 和 EP32 文件名仍可调用统一入口。双机环境和验收判据见 [GELU 验证手册](../../docs/megamoe-gelu-validation.md#41-ep32-验收清单)。
+
+### UBX 设备 timer 与通信掩盖率
+
+在两台 UBX 安装由当前源码构建、启用 `DEEPEP_MEGAMOE_TIMER=ON` 的 wheel 后，可在节点 0 运行以下命令。W4A8 和分窗 URMA W8A8 都支持该采集方式。
+
+```bash
+UBX=experiments/megamoe/scripts/run_ubx_gelu.py
+RUN=/shared/ubx-ep32-w8a8-timer
+python3 "$UBX" perf w8a8 --ep-size 32 --timer --output-dir "$RUN"
+python3 experiments/megamoe/scripts/summarize_megamoe_overlap.py "$RUN" --output "$RUN/overlap.json"
+```
+
+统一入口在每台节点自动采 4 个均匀分布的 rank。EP16 采 `0,4,8,12`，EP32 的第二台再采 `16,20,24,28`。每个参与采集的 rank 约分配 672 MiB 的 timer 缓冲区。独立输出盘时，把两侧的本轮目录都交给汇总脚本。需要验证打点前后一致性时，用 `accuracy w8a8 --timer`，分别检查全量和首窗误差。
+
+报告按同一 rank、同一首窗的设备 tick 计算。GMM 区间从 AIC 提交打点起点到对应 AIV1 FIX 完成观测点，通信区间使用有完成点的 Dispatch / Combine 包络。各类区间先取并集，掩盖率为 `通信区间与 GMM 区间的交集时长 / 通信区间时长`。总通信先合并 Dispatch 与 Combine，跨 rank 的汇总用各 rank 的重叠时间之和除以通信时间之和。缺少配对或完成点会显示覆盖缺口。这个指标是首窗的事件包络估计，包含已记录边界之间的等待和间隙。
+
+### UBX GELU 与 SwiGLU 性能对照
+
+`run_ubx_gelu.py compare` 固定 A 为 GELU 提前加权，B 为原生 SwiGLU Finalize 加权。`--precision w8a8` 或 `--precision a8w4` 单独选择精度，`--precision all`（默认）依次安排两组。A8W4 也可写作 W4A8，表示 FP8 激活与 FP4 权重。可比的 A/B 用例使用同一输入、路由和 GMM2 权重，A 的 GMM1 取 B 的 gate 权重。
+
+1. 先跑正式同步端到端计时。可配对时默认跑 8 对独立作业，按 A/B、B/A 交替，逐轮取全组最慢 rank。
+2. 正式计时全部结束后，`compare` 自动启动独立诊断作业，为每个可运行的组采集首窗 timer。两侧使用同一套 rank，每台采 4 个。
+3. 生成 `comparison.json`。配对端到端时延比中位数须 **A/B ≤ 1**，总通信首窗掩盖率须 **A ≥ B**。报告同时保留 Dispatch、Combine、总通信和底层产物路径。两侧窗口序列、timer rank 和通信端点需可比，缺少有效数据时保留未完成状态。
+
+```bash
+UBX=experiments/megamoe/scripts/run_ubx_gelu.py
+
+# 先检查目标配置和支持矩阵，不启动作业。
+python3 "$UBX" --mode compare --ep-size 32 --plan
+
+# 在主节点采 EP32/K25 的 W4A8、W8A8 GELU 端到端与掩盖率。
+python3 "$UBX" --mode compare --precision all --ep-size 32 --output-dir /shared/ubx-ep32-k25-compare
+
+# 单独测 W8A8。
+python3 "$UBX" --mode compare --precision w8a8 --ep-size 32 --output-dir /shared/ubx-ep32-k25-w8a8
+
+# 在 EP16 的共同支持配置做一次完整 W4A8 A/B 验收。
+python3 "$UBX" --mode compare --precision a8w4 --ep-size 16 --topk 8 --bs 64 \
+  --output-dir /shared/ubx-ep16-k8-w4a8-compare --require-no-regression
+```
+
+当前 UBX 原生 B 只支持 W4A8、单机 EP16、K≤8、每卡 B≤16,384。选 `--bs 64` 可让原生 B 和分窗 A 使用同样的单窗行数。EP32、K25/K32 和 W8A8 缺少对应的原生 B，统一入口会采 A 的绝对数据，并在报告中注明 B 为 `BLOCKED`。`--require-no-regression` 在退化、证据不全或基线缺失时返回非零。用 `ROUTING=skewed` 或 `--config target_gelu_k32` 另起目录测其他组。
+
+双机用独立输出盘时，把节点 1 本轮目录复制到汇总机器，再通过同一入口汇总：
+
+```bash
+python3 "$UBX" compare --report-only --output-dir /shared/ubx-ep32-k25-compare \
+  --peer-output-dir /copied/node1/ubx-ep32-k25-compare
+```
 
 ### 950POD 非 UBX GELU 精度
 
@@ -173,7 +222,7 @@ buffer = SymmBuffer(
 MTE 约束：EP=2～128，E 可被 EP 整除且每卡最多 128 个路由专家；S=0～8；B=1～65536；
 H=1024～8192 且为64的倍数，I=256～4096 且为128的倍数，1≤K≤min(32,E)。
 各 rank 必须同序、同 B 调用；仅推理，不支持反向、空/不等长 B 或图捕获。
-`mma_type="fp8xfp8"` 使用 FP8 E4M3 路由权重，不支持共享专家或 timer。UBX 上该精度限用于分窗 GELU 的 EP16 单机与 EP32 双机，传入连续 ND 权重 `[L,N,K]` 及 E8M0 scale `[L,N,K/64,2]`。benchmark 从配置文件的 `model.mma_type` 读取矩阵乘精度。
+`mma_type="fp8xfp8"` 使用 FP8 E4M3 路由权重。UBX 上该精度用于零共享专家的分窗 GELU EP16 单机与 EP32 双机，传入连续 ND 权重 `[L,N,K]` 及 E8M0 scale `[L,N,K/64,2]`。启用 `DEEPEP_MEGAMOE_TIMER=ON` 的 wheel 支持该模式的设备打点。benchmark 从配置文件的 `model.mma_type` 读取矩阵乘精度。
 
 兼容入口 `mega_moe(x, ids, weights, w1, w2, buffer, ...)` 返回 `(y, per_call_counts)`。
 接口签名参照 DeepGEMM `78b6900`。本实现使用 int32 路由 ID、E8M0 输入 scale，

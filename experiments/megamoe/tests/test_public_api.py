@@ -753,6 +753,12 @@ def test_a8w8_activation_modes_reach_native(backend, activation):
         b.topk_idx.data[:] = [0, 1]
         b.topk_weights.data[:] = [0.4, 0.6]
         y = Tensor(np.zeros((17, 1024)), "bfloat16")
+        assert not b.timer_enabled
+        with pytest.raises(RuntimeError, match="windowed URMA W8A8"):
+            b.allocate_timer()
+        with pytest.raises(RuntimeError, match="windowed URMA W8A8"):
+            api.fp8_fp4_mega_moe(y, first, second, b, activation=activation, timer=backend.buffer.allocate_timer())
+        assert not native_launches(backend)
         api.fp8_fp4_mega_moe(y, first, second, b, activation=activation)
         assert b._plan.mma_type == "fp8xfp8" and b._plan.activation == activation
         assert b._plan.topk_weights_type == (1 if activation == "gelu" else 0)
@@ -821,71 +827,59 @@ def test_urma_gelu_uses_single_planar_projection_within_existing_limits(backend,
         b.destroy()
 
 
-def test_urma_ep16_w8a8_gelu_uses_same_public_windowed_forward(backend, monkeypatch):
+@pytest.mark.parametrize("world", [16, 32])
+def test_urma_w8a8_gelu_uses_timer_only_on_first_window(backend, monkeypatch, world):
     from deep_ep_experimental.megamoe import backend as selector
 
     monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
     monkeypatch.setattr(api, "_host_boot_id", lambda: "ab" * 16)
-    group = backend.group_type(16)
+    group = backend.group_type(world)
     model = dict(activation="gelu", mma_type="fp8xfp8")
+    local = 800 // world
     with pytest.raises(ValueError, match="install a MegaMoE wheel with URMA W8A8 support"):
         api.SymmBuffer(group, 800, 257, 25, 256, 256, **model)
 
-    def window_bytes(world, experts, tokens, topk, hidden, intermediate, mma_type):
-        assert (world, experts, topk, hidden, intermediate, mma_type) == (16, 50, 25, 256, 256, "fp8xfp8")
+    def window_bytes(size, experts, tokens, topk, hidden, intermediate, mma_type):
+        assert (size, experts, topk, hidden, intermediate, mma_type) == (world, local, 25, 256, 256, "fp8xfp8")
         return 2 << 20, tokens << 20
 
     monkeypatch.setattr(backend.ext, "urma_w8a8_enabled", True, raising=False)
     monkeypatch.setattr(backend.ext, "urma_window_bytes", window_bytes)
     b = api.SymmBuffer(group, 800, 257, 25, 256, 256, **model)
     try:
+        with monkeypatch.context() as uninstrumented_build:
+            uninstrumented_build.setattr(backend.ext, "timer_enabled", False)
+            assert not b.timer_enabled
+            with pytest.raises(RuntimeError, match="DEEPEP_MEGAMOE_TIMER=ON"):
+                b.allocate_timer()
+        assert b.timer_enabled
+        timer = b.allocate_timer()
+        assert not timer.data.any()
+
         weights = tuple(
-            (Tensor(np.zeros((50, 256, 256)), "float8_e4m3fn"),
-             Tensor(np.full((50, 256, 4, 2), 127), "float8_e8m0fnu"))
+            (Tensor(np.zeros((local, 256, 256)), "float8_e4m3fn"),
+             Tensor(np.full((local, 256, 4, 2), 127), "float8_e8m0fnu"))
             for _ in range(2)
         )
         weights = api.transform_weights_for_mega_moe(*weights, activation="gelu")
         b.topk_idx.data[:] = np.arange(25)
         b.topk_weights.data.fill(1.0 / 25)
-        y = Tensor(np.zeros((257, 256)), "bfloat16")
-        stats = Tensor(np.full(50, 7), "int32")
-        api.fp8_fp4_mega_moe(y, *weights, b, activation="gelu", cumulative_local_expert_recv_stats=stats)
+        b.x.data[:] = (np.arange(257) % 17)[:, None]
+        y = Tensor(np.full((257, 256), -1), "bfloat16")
+        stats = Tensor(np.full(local, 7), "int32")
+        assert api.fp8_fp4_mega_moe(
+            y, *weights, b, activation="gelu", cumulative_local_expert_recv_stats=stats, timer=timer,
+        ) is None
         assert b._plan.windowed and b._plan.mma_type == "fp8xfp8" and b._plan.topk_weights_type == 1
         launches = native_launches(backend)
         assert [launch[0].shape[0] for launch in launches] == [256, 1]
-    finally:
-        b.destroy()
+        assert [launch[8] for launch in launches] == [timer, None]
+        assert backend.events.count(("validate_timer", timer, "urma")) == 1
+        assert timer.data[-1] == launches[0][-1]
         assert all(launch[4] is weights[0][0] and launch[5] is weights[1][0] for launch in launches)
-        np.testing.assert_array_equal(stats.data, np.repeat([264, 7], 25))
-
-
-def test_urma_ep32_w8a8_gelu_uses_same_public_windowed_forward(backend, monkeypatch):
-    from deep_ep_experimental.megamoe import backend as selector
-
-    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
-    model = dict(activation="gelu", mma_type="fp8xfp8")
-
-    def window_bytes(world, experts, tokens, topk, hidden, intermediate, mma_type):
-        assert (world, experts, topk, hidden, intermediate, mma_type) == (32, 25, 25, 256, 256, "fp8xfp8")
-        return 2 << 20, tokens << 20
-
-    monkeypatch.setattr(backend.ext, "urma_w8a8_enabled", True, raising=False)
-    monkeypatch.setattr(backend.ext, "urma_window_bytes", window_bytes)
-    b = api.SymmBuffer(backend.group_type(32), 800, 257, 25, 256, 256, **model)
-    try:
-        weights = tuple(
-            (Tensor(np.zeros((25, 256, 256)), "float8_e4m3fn"),
-             Tensor(np.full((25, 256, 4, 2), 127), "float8_e8m0fnu"))
-            for _ in range(2)
-        )
-        weights = api.transform_weights_for_mega_moe(*weights, activation="gelu")
-        b.topk_idx.data[:] = np.arange(25)
-        b.topk_weights.data.fill(1.0 / 25)
-        y = Tensor(np.zeros((257, 256)), "bfloat16")
-        stats = Tensor(np.full(25, 7), "int32")
-        api.fp8_fp4_mega_moe(y, *weights, b, activation="gelu", cumulative_local_expert_recv_stats=stats)
-        assert b._plan.windowed and b._plan.mma_type == "fp8xfp8" and b._plan.topk_weights_type == 1
-        assert [launch[0].shape[0] for launch in native_launches(backend)] == [256, 1]
+        assert all(np.shares_memory(launch[-2].data, y.data) for launch in launches)
+        np.testing.assert_array_equal(y.data, b.x.data)
+        np.testing.assert_array_equal(stats.data, np.where(np.arange(local) < 25, 264, 7))
     finally:
         b.destroy()
 

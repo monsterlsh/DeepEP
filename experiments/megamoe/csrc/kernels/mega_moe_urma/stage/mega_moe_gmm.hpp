@@ -230,13 +230,16 @@ __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block,
         const uint32_t columns = Get<UrmaMegaMoeImpl::N_VALUE>(tileShape);
         const auto tileMeta = ComputeTileTraceMeta(fragmentMeta, m, n, rows, columns);
         if constexpr (g_coreType == AIC) {
-            const uint64_t start = timer.TraceBegin();
             completion.Acquire();
+            const uint64_t start = timer.TraceBegin();
             pipeline.Compute(m, n, rows, columns);
-            timer.TraceEnd(gmm1 ? TraceEvent::Gmm1Tile : TraceEvent::Gmm2Tile, start, tileMeta);
+            const uint64_t end = timer.TraceBegin();
             // Enqueue actual FIX completion, then announce issue. Scalar does
-            // not wait for the output and cannot publish compute-ready here.
+            // not wait for the output. Trace writeback must not delay issue.
             completion.Commit();
+            if (end != 0U) {
+                timer.WriteTrace(gmm1 ? TraceEvent::Gmm1Tile : TraceEvent::Gmm2Tile, start, end, tileMeta);
+            }
         } else {
             const uint64_t start = timer.TraceBegin();
             pipeline.Dequantize(n, rows, columns);
@@ -280,11 +283,14 @@ __aicore__ inline void RunRoutedMxCompute(const Arguments& args, uint32_t block,
         const auto meta = ComputeTileTraceMeta(FragmentTraceMeta(fragment, item.group), 0U, column, fragment.rows, columns);
         const auto phase = item.gmm1 ? Phase::Gmm1 : Phase::Gmm2;
         timer.Begin(phase);
-        const auto start = timer.TraceBegin();
         completion.Acquire();
+        const auto start = timer.TraceBegin();
         pipeline.Compute(addresses, fragment.rows, n, k, column, columns);
-        timer.TraceEnd(item.gmm1 ? TraceEvent::Gmm1Tile : TraceEvent::Gmm2Tile, start, meta);
+        const auto end = timer.TraceBegin();
         completion.Commit();
+        if (end != 0U) {
+            timer.WriteTrace(item.gmm1 ? TraceEvent::Gmm1Tile : TraceEvent::Gmm2Tile, start, end, meta);
+        }
         timer.End(phase);
     }
     completion.Finish(timer);

@@ -303,7 +303,7 @@ fi
   --input fp8 --routing "$ROUTE" --output-dir "$RUN/perf"
 # 单独采集设备阶段，避免将带 timer 的调用混入性能数字
 "${LAUNCH[@]}" -m "$MOD.benchmark" --mode perf --config "$CFG" --bs-values "$BS" \
-  --input fp8 --routing "$ROUTE" --timer --timer-ranks 0 --output-dir "$RUN/timer"
+  --input fp8 --routing "$ROUTE" --timer --output-dir "$RUN/timer"
 ```
 
 先查各 rank 的 `manifest.json`，核对后端、配置和每次 forward 的窗口数。UBX 按各 rank 的空闲 HBM 共同选择 W256/W128/W64。MTE 在整批无法装入 1 GiB 对称区时，按大批输入、两组权重、对称内存、满窗和尾窗 Plan 的预算共同选 W2048/W1024/W512/W256。W256 保留原有分配行为。B39280 在 W2048 下为 19 个满窗加 368 行尾窗，在 W256 下为 153 个满窗加 112 行尾窗。
@@ -317,6 +317,8 @@ fi
 | `kernel_samples.json`、timer 文件 | 前者记录正式性能轮的每个 kernel。独立采集的设备 timer 仅覆盖首窗。 |
 
 集群输入吞吐量按 `EP × B × 10⁶ / host_e2e.rank_max_mean_us` 计算，单位为 token/s。
+
+UBX 的统一入口支持 `perf w4a8 --timer` 和 `perf w8a8 --timer`。EP16 自动采 `0,4,8,12`，EP32 的第二台再采 `16,20,24,28`。诊断调用单独执行，首窗 trace 不计入正式性能统计。使用 `summarize_megamoe_overlap.py` 汇总首窗的通信包络、GMM 包络、重叠时间及未覆盖时间。公式和命令见 [UBX 设备 timer 与通信掩盖率](../experiments/megamoe/README.md#ubx-设备-timer-与通信掩盖率)。
 
 ### GELU 与 SwiGLU 的性能门槛
 
@@ -353,23 +355,13 @@ for route in balanced skewed; do
 done
 ```
 
-UBX 的原 SwiGLU 比较使用单机共同支持的配置。例如在一台空闲 UBX 上设置 `LOCAL_RANKS=16`、`DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:29180`；EP8 用同一台的 8 张卡。以下作业在独立进程中交替测两侧，得到同机 K8 的配对结果。EP32 的绝对性能用前面的 GELU perf 命令测量。
+UBX 使用统一入口的 `compare`。先交替跑正式端到端配对作业，再自动采集两侧同一组 rank 的首窗设备 timer，最后出 `comparison.json`。当前原生 SwiGLU 后置加权的共同支持范围为 EP16、W4A8、K≤8、每卡 B≤16,384，等窗对照用 B64。EP32/K25 和 W8A8 的目标配置中，报告记录 GELU 绝对值及 SwiGLU 基线阻塞原因。详细流程见 [UBX 性能对照](../experiments/megamoe/README.md#ubx-gelu-与-swiglu-性能对照)。
 
 ```bash
-SCRIPTS="$REPO/experiments/megamoe/scripts"
-for route in balanced skewed; do
-  OUT="$RUN/ubx-ep$LOCAL_RANKS-k8-$route"
-  for pair in {0..7}; do
-    arms=(gelu swiglu)
-    if (( pair % 2 )); then arms=(swiglu gelu); fi
-    for arm in "${arms[@]}"; do
-      python -m torch.distributed.run --standalone --nproc-per-node="$LOCAL_RANKS" "$SCRIPTS/paired_benchmark.py" \
-        --config gelu_smoke_k25 --topk 8 --bs 257 --routing "$route" --isolated-arm "$arm" \
-        --warmup 2 --pairs 3 --output-dir "$OUT/$pair/$arm"
-    done
-  done
-  python "$SCRIPTS/summarize_isolated_pairs.py" "$OUT" --pairs 8 --require-no-regression
-done
+UBX="$REPO/experiments/megamoe/scripts/run_ubx_gelu.py"
+python3 "$UBX" compare --precision a8w4 --ep-size 16 --topk 8 --bs 64 \
+  --output-dir "$RUN/ubx-ep16-k8-w4a8" --require-no-regression
+python3 "$UBX" compare --ep-size 32 --output-dir "$RUN/ubx-ep32-k25"
 ```
 
 出现错误时，先看第一个失败 rank 的输出及本轮 manifest。Golden 缺失通常需核对模型、EP、B、路由和抽样开关；窗口预算失败会给出 rank 与空闲 HBM。跨机检查物理节点、设备编号、SHMEM 引导地址及数据面链路。设备超时或部分 rank 已发起通信后失败，结束该轮全部 worker，确认卡已释放，再以新输出目录重启。

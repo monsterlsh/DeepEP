@@ -26,6 +26,7 @@ struct NoopTimer {
         return 0U;
     }
     __aicore__ inline void TraceEnd(TraceEvent, uint64_t, const TraceMeta& = TraceMeta{}) {}
+    __aicore__ inline void WriteTrace(TraceEvent, uint64_t, uint64_t, const TraceMeta&) {}
     __aicore__ inline void Begin(Phase) {}
     __aicore__ inline void End(Phase, uint64_t = 0U) {}
 };

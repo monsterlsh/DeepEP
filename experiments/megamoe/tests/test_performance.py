@@ -296,3 +296,102 @@ def test_packaged_ep8_gelu_topk25_case_crosses_a_window():
     assert model["num_topk"] == 25 and model["num_shared_experts"] == 0
     assert model["activation"] == "gelu" and model["mma_type"] == "fp8xfp4" and model["topk_weights_type"] == 1
     assert min(config["bs_values"]) < 256 < max(config["bs_values"])
+
+
+def test_paired_perf_weight_fixture_shares_swiglu_gate_and_gmm2():
+    import numpy as np
+
+    from deep_ep_experimental.megamoe.benchmark import routed_weights
+    from deep_ep_experimental.megamoe.reference import make_weights
+
+    model = dict(num_experts=8, hidden=64, intermediate_hidden=64, mma_type="fp8xfp4")
+    gelu = {"model": dict(model, activation="gelu"), "seed": 123}
+    swiglu = {"model": dict(model, activation="swiglu"), "seed": 123}
+    gelu_w1, gelu_w2 = routed_weights(gelu, 4, 3, paired=True)
+    swi_w1, swi_w2 = routed_weights(swiglu, 4, 3, paired=True)
+    for actual, original in zip(gelu_w1, swi_w1):
+        assert actual.flags.c_contiguous
+        np.testing.assert_array_equal(actual, original[:, :64])
+    for actual, original in zip(gelu_w2, swi_w2):
+        np.testing.assert_array_equal(actual, original)
+
+    gelu["model"]["mma_type"] = "fp8xfp8"
+    expected = make_weights(2, 64, 64, 126, "gelu", "fp8xfp8")
+    for actual_pair, expected_pair in zip(routed_weights(gelu, 4, 3), expected):
+        for actual, array in zip(actual_pair, expected_pair):
+            np.testing.assert_array_equal(actual, array)
+
+
+@pytest.mark.parametrize("scope", ["host", "timer"])
+def test_benchmark_runs_separate_host_and_timer_scopes(tmp_path, monkeypatch, scope):
+    from deep_ep import _machine, _runtime
+    from deep_ep_experimental.megamoe import api, backend, benchmark, urma_trace, validation
+
+    config = load_config("gelu_smoke_k25", "4")
+    config["model"].update(num_experts=4, hidden=64, intermediate_hidden=64, num_topk=2)
+    config.update(warmup=2, iters=3)
+    calls, exports = [], []
+    timer = object()
+
+    class Tensor:
+        def __getitem__(self, key):
+            return self
+
+        def npu(self):
+            return self
+
+        def view(self, dtype):
+            return self
+
+        def copy_(self, value):
+            pass
+
+    tensor = Tensor()
+    torch = SimpleNamespace(
+        npu=SimpleNamespace(reset_peak_memory_stats=lambda: None, synchronize=lambda: None,
+                            mem_get_info=lambda device: (500, 800), current_device=lambda: 0,
+                            max_memory_allocated=lambda: 150, max_memory_reserved=lambda: 200),
+        from_numpy=lambda value: tensor, empty=lambda *args, **kwargs: tensor,
+        float8_e4m3fn="fp8", float8_e8m0fnu="scale", bfloat16="bf16",
+    )
+    buffer = SimpleNamespace(
+        _urma_windowed=True, window_tokens=4, num_max_tokens_per_rank=4, num_forward_windows=lambda bs: 1,
+        timer_enabled=True, allocate_timer=lambda: timer, prepare=lambda bs: None, destroy=lambda: None,
+        workspace_bytes=16, symmetric_buffer_bytes=32, x=tensor, x_sf=tensor, topk_idx=tensor, topk_weights=tensor,
+    )
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 2, all_gather=lambda value, stage: [value] * 2,
+                            barrier=lambda stage: None, close=lambda: None)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    monkeypatch.setattr(api, "SymmBuffer", lambda *args, **kwargs: buffer)
+    monkeypatch.setattr(api, "fp8_fp4_mega_moe", lambda *args, timer, **kwargs: calls.append(timer))
+    monkeypatch.setattr(api, "transform_weights_for_mega_moe", lambda *args, **kwargs: args)
+    monkeypatch.setattr(backend, "select_backend", lambda group: "urma")
+    monkeypatch.setattr(_machine, "physical_device", lambda: 7)
+    monkeypatch.setattr(_runtime, "_host_boot_id", lambda: "ab" * 16)
+    monkeypatch.setattr(validation, "collective_check", lambda *args: None)
+    monkeypatch.setattr(benchmark, "flush_l2_before_call", lambda: None)
+    monkeypatch.setattr(performance, "flush_l2_before_call", lambda: None)
+    monkeypatch.setattr(performance, "UrmaLaunchGuard", lambda *args: pytest.fail("unexpected profiler guard"))
+    monkeypatch.setattr(urma_trace, "export_diagnostics", lambda group, trace, *args, **kw: exports.append(trace))
+    (tmp_path / "_build_info.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(benchmark, "files", lambda package: tmp_path)
+
+    args = SimpleNamespace(mode="perf", perf_scope=scope, paired_weights=True, input="fp8", routing="balanced",
+                           timer=scope == "timer", timer_ranks=[0], check_tokens=0, relative_rmse=0.02,
+                           output_dir=tmp_path / "run")
+    benchmark.run(args, config, group)
+    rank_dir = args.output_dir / "rank_0"
+    case = rank_dir / "bs_4"
+    manifest = json.loads((rank_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["perf_scope"] == scope and manifest["paired_weights"] is True
+    assert manifest["device_identity"] == dict(host_boot_id="ab" * 16, physical_device=7)
+    assert (case / "resources.json").is_file() and not (case / "kernel_samples.json").exists()
+    report = case / "performance.json"
+    if scope == "timer":
+        assert calls == [None, None, None, timer] and exports == [timer]
+        assert not report.exists()
+    else:
+        assert calls == [None] * 6 and not exports
+        assert set(json.loads(report.read_text(encoding="utf-8"))) == {"windows_per_forward", "host_e2e"}

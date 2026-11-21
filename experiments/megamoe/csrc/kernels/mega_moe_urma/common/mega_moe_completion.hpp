@@ -313,20 +313,29 @@ public:
         Prepare();
         const auto start = timer.TraceBegin();
         RoutedFixChannel::Wait(consumed_);
+        const auto end = timer.TraceBegin();
         item = next_;
         // Both stages go directly to same-core UB consumers. There is no
         // intermediate per-tile GM-ready write. Activation/Reorder publish
         // their downstream group-ready counts after final MTE3 completion.
         ++consumed_;
         prepared_ = false;
-        TraceMeta m;
-        m.fragment = item.group;
-        m.expert = item.fragment.expert;
-        m.row = item.fragment.rowBegin;
-        m.rows = item.fragment.rows;
-        m.tileN = uint64_t(item.tile) * (item.gmm1 ? kGmm1LogicalTileN : kComputeTileN);
-        m.columns = item.gmm1 ? kGmm1LogicalTileN : kComputeTileN;
-        timer.TraceEnd(item.gmm1 ? TraceEvent::Gmm1TileDrain : TraceEvent::Gmm2Drain, start, m);
+        if (end != 0U) {
+            TraceMeta meta;
+            meta.fragment = item.group;
+            meta.expert = item.fragment.expert;
+            meta.row = item.fragment.rowBegin;
+            meta.rows = item.fragment.rows;
+            // Each fragment fits one M tile. Use the AIC's logical N extent
+            // for both GELU (N256) and fused gate/up (N128).
+            const uint32_t tileN = item.gmm1 ? Gmm1LogicalTileN(a_.config) : kComputeTileN;
+            const uint32_t width = item.gmm1 ? a_.config.intermediate : a_.config.hidden;
+            meta.tileM = 0U;
+            meta.tileN = uint64_t(item.tile) * tileN;
+            const uint32_t remaining = width - static_cast<uint32_t>(meta.tileN);
+            meta.columns = remaining < tileN ? remaining : tileN;
+            timer.WriteTrace(item.gmm1 ? TraceEvent::Gmm1TileDrain : TraceEvent::Gmm2Drain, start, end, meta);
+        }
     }
     __aicore__ inline void ReleaseCompleted()
     {

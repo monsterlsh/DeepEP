@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     WeightPair = tuple[Tensor, Tensor]
 
 
+_TIMER_REQUIREMENTS = "Timer supports W4A8 and windowed URMA W8A8 in builds with DEEPEP_MEGAMOE_TIMER=ON"
+
+
 @lru_cache(maxsize=1)
 def _extension():
     core = require_native("MegaMoE")
@@ -438,13 +441,14 @@ class SymmBuffer:
 
     @property
     def timer_enabled(self) -> bool:
-        return bool(_extension().timer_enabled and self.mma_type == "fp8xfp4")
+        supports_timer = self.mma_type == "fp8xfp4" or (self.mma_type == "fp8xfp8" and self._urma_windowed)
+        return bool(_extension().timer_enabled and supports_timer)
 
     def allocate_timer(self) -> Tensor:
         """Fresh zeroed device trace; pass only to a separate diagnostic invocation."""
         self._runtime.ensure_alive()
         if not self.timer_enabled:
-            raise RuntimeError("W4A8 timer requires DEEPEP_MEGAMOE_TIMER=ON")
+            raise RuntimeError(_TIMER_REQUIREMENTS)
         return _extension().allocate_timer(self.x, backend=self._backend_name)
 
     def validate_inputs(self, bs: int, *, x: Tensor | None = None) -> None:
@@ -668,6 +672,8 @@ def _forward_inputs(
         sw2, ss2 = _pair(shared_l2_weights, "shared_l2_weights")
         shared = (sw1, sw2, ss1, ss2)
     b = sym_buffer
+    if timer is not None and not b.timer_enabled:
+        raise RuntimeError(_TIMER_REQUIREMENTS)
     if b.activation == "gelu" and activation_clamp is not None:
         raise ValueError("activation_clamp is only defined for SwiGLU")
     clamp = normalize_clamp(activation_clamp)

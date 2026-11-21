@@ -215,11 +215,43 @@ def accuracy(
     return group.all_gather(report, f"accuracy reports BS={bs}")
 
 
+def default_timer_ranks(world, ranks_per_node, *, urma):
+    if not urma:
+        return list(range(min(world, 8)))
+    if ranks_per_node < 1 or world % ranks_per_node:
+        raise ValueError("LOCAL_WORLD_SIZE must divide the EP world size")
+    samples_per_node = min(4, ranks_per_node)
+    return [
+        node_start + sample * ranks_per_node // samples_per_node
+        for node_start in range(0, world, ranks_per_node)
+        for sample in range(samples_per_node)
+    ]
+
+
+def routed_weights(config, world, rank, *, paired=False):
+    from .reference import make_weights
+
+    model = config["model"]
+    activation = model.get("activation", "swiglu")
+    width = model["intermediate_hidden"]
+    first, second = make_weights(
+        model["num_experts"] // world, model["hidden"], width, config["seed"] + rank,
+        "swiglu" if paired else activation, model.get("mma_type", "fp8xfp4"),
+    )
+    if paired and activation == "gelu":
+        first = tuple(array[:, :width].copy() for array in first)
+    return first, second
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="smoke", help="Packaged name or JSON path")
     parser.add_argument("--bs-values", help="Only model config override, e.g. 96,4096")
     parser.add_argument("--mode", choices=("accuracy", "perf"), default="accuracy")
+    parser.add_argument("--perf-scope", choices=("all", "host", "timer"), default="all",
+                        help="Run all performance measures, synchronized host timing, or a separate device trace")
+    parser.add_argument("--paired-weights", action="store_true",
+                        help="For performance comparisons, share SwiGLU gate and GMM2 weights with GELU")
     parser.add_argument("--input", choices=("bf16", "fp8", "fp4"), default="bf16")
     parser.add_argument(
         "--routing",
@@ -229,7 +261,7 @@ def main():
     )
     parser.add_argument("--output-dir", type=Path, required=True, help="New run directory; must not already exist")
     parser.add_argument("--timer", action="store_true", help="One separate instrumented call per case")
-    parser.add_argument("--timer-ranks", type=parse_ranks, help="Default: global ranks 0..min(7,EP-1)")
+    parser.add_argument("--timer-ranks", type=parse_ranks, help="Default: four evenly spaced ranks per URMA node; first eight ranks for MTE")
     parser.add_argument("--check-tokens", type=int, default=0, help="Accuracy samples per rank; default 0 checks all")
     parser.add_argument(
         "--golden-dir", type=Path, default=Path("benchmark-golden"), help="Precomputed CPU Golden cache"
@@ -240,6 +272,12 @@ def main():
     config = load_config(args.config, args.bs_values)
     if args.check_tokens < 0 or not 0 < args.relative_rmse < 1:
         parser.error("Invalid accuracy sample count or tolerance")
+    if args.mode != "perf" and (args.perf_scope != "all" or args.paired_weights):
+        parser.error("--perf-scope and --paired-weights require --mode perf")
+    if args.perf_scope == "timer" and not args.timer:
+        parser.error("--perf-scope timer requires --timer")
+    if args.perf_scope == "host" and args.timer:
+        parser.error("--perf-scope host cannot be combined with --timer")
     import torch
     import torch_npu  # noqa: F401 - Registers NPU dtype/device/stream support.
     from .api import StoreGroup
@@ -267,6 +305,9 @@ def run(args, config, group):
     from .validation import collective_check
 
     rank, world = group.rank(), group.size()
+    ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", world))
+    perf_scope = getattr(args, "perf_scope", "all")
+    paired_weights = bool(getattr(args, "paired_weights", False))
     collective_check(
         group,
         "benchmark configuration",
@@ -278,22 +319,45 @@ def run(args, config, group):
             args.routing,
             args.timer,
             args.timer_ranks,
+            ranks_per_node,
             args.check_tokens,
             args.relative_rmse,
             bool(getattr(args, "dual_reference", False)),
+            perf_scope,
+            paired_weights,
         ),
     )
-    mma_type = config["model"].get("mma_type", "fp8xfp4")
+    model = config["model"]
+    mma_type = model.get("mma_type", "fp8xfp4")
+    if paired_weights and (mma_type != "fp8xfp4" or model["num_shared_experts"]):
+        raise ValueError("--paired-weights requires routed W4A8 with zero shared experts")
     storage_kind = "fp4" if mma_type == "fp4xfp4" else "fp8"
     if args.input != "bf16" and args.input != storage_kind:
         raise ValueError(f"{mma_type} buffered input must be {storage_kind}")
     if urma and args.input != "fp8":
         raise ValueError("URMA requires --input fp8")
-    timer_ranks = args.timer_ranks if args.timer_ranks is not None else list(range(min(world, 8)))
+    timer_ranks = args.timer_ranks if args.timer_ranks is not None else default_timer_ranks(world, ranks_per_node, urma=urma)
     if any(value >= world for value in timer_ranks):
         raise ValueError("timer rank exceeds EP world size")
     if config["model"]["num_experts"] % world:
         raise ValueError("Global experts must divide EP")
+    device_identity = None
+    if perf_scope != "all":
+        from deep_ep._machine import physical_device
+        from deep_ep._runtime import _host_boot_id
+
+        error = None
+        try:
+            host_boot_id = _host_boot_id()
+            if not host_boot_id:
+                raise ValueError("Linux host boot ID is unavailable")
+            chip = physical_device()
+            if chip < 0:
+                raise ValueError(f"Invalid physical NPU ID {chip}")
+            device_identity = dict(host_boot_id=host_boot_id, physical_device=chip)
+        except Exception as failure:
+            error = str(failure) or type(failure).__name__
+        collective_check(group, "benchmark device identity", error)
     if args.mode == "accuracy":
         from .golden import contract, load
 
@@ -318,10 +382,14 @@ def run(args, config, group):
         config=config,
         input=args.input,
         mode=args.mode,
+        perf_scope=perf_scope,
+        paired_weights=paired_weights,
         routing=args.routing,
         ep_size=world,
         rank=rank,
         local_rank=int(os.environ["LOCAL_RANK"]),
+        ranks_per_node=ranks_per_node,
+        run_id=os.environ.get("TORCHELASTIC_RUN_ID"),
         timer_ranks=timer_ranks,
         host_coordination="tcpstore",
         backend=backend,
@@ -333,6 +401,8 @@ def run(args, config, group):
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
     )
+    if device_identity is not None:
+        manifest["device_identity"] = device_identity
     if urma:
         manifest.update(
             implementation="consumer",
@@ -341,7 +411,6 @@ def run(args, config, group):
             wait_events=False,
             device_routing_in_kernel=True,
         )
-    model = config["model"]
     if (
         not urma
         and model.get("shared_intermediate_hidden", model["intermediate_hidden"]) != model["intermediate_hidden"]
@@ -352,7 +421,7 @@ def run(args, config, group):
     buffer = SymmBuffer(
         group,
         num_max_tokens_per_rank=max(config["bs_values"]),
-        ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
+        ranks_per_node=ranks_per_node,
         **{k: v for k, v in model.items() if k not in ("shared_intermediate_hidden", "shared_output_rounding", "activation_clamp")},
     )
     windows_by_bs = {bs: buffer.num_forward_windows(bs) for bs in config["bs_values"]}
@@ -361,7 +430,7 @@ def run(args, config, group):
     manifest.update(
         windows_per_forward_by_bs=windows_by_bs,
         window_tokens=buffer.window_tokens,
-        kernel_duration_scope="sum_of_window_kernels_per_forward",
+        kernel_duration_scope="sum_of_window_kernels_per_forward" if perf_scope == "all" else None,
         timer_scope="first_window_only" if args.timer else "disabled",
     )
     (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -374,12 +443,9 @@ def run(args, config, group):
         return codes, torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu)
 
     if args.timer and not buffer.timer_enabled:
-        raise RuntimeError("Timer requires a W4A8 wheel built with DEEPEP_MEGAMOE_TIMER=ON")
+        raise RuntimeError("Timer requires a supported matrix mode and DEEPEP_MEGAMOE_TIMER=ON")
     activation_name = model.get("activation", "swiglu")
-    raw = make_weights(
-        model["num_experts"] // world, model["hidden"], model["intermediate_hidden"], config["seed"] + rank,
-        activation_name, mma_type,
-    )
+    raw = routed_weights(config, world, rank, paired=paired_weights)
     prepared = transform_weights_for_mega_moe(*map(device_pair, raw), activation=activation_name)
     shared_raw, shared_kwargs = None, {}
     if model["num_shared_experts"]:
@@ -409,7 +475,7 @@ def run(args, config, group):
         cascade_owned = init_process_group(group)
         cascade = CascadeReference(model, raw, shared_raw, host_group=group)
     guard = None
-    if urma and args.mode == "perf":
+    if urma and args.mode == "perf" and perf_scope == "all":
         from .performance import UrmaLaunchGuard
 
         alignment = config["alignment"]
@@ -478,7 +544,7 @@ def run(args, config, group):
                 error = str(failure)
             collective_check(group, f"timer allocation BS={bs}", error)
         prefix = None
-        if not urma and (args.mode == "perf" or args.timer):
+        if not urma and perf_scope == "all" and (args.mode == "perf" or args.timer):
             error = None
             try:
                 alignment = config["alignment"]
@@ -494,7 +560,7 @@ def run(args, config, group):
                     f"batch_iterations={config['iters']}",
                     flush=True,
                 )
-        if not (urma and args.mode == "perf"):
+        if not (urma and args.mode == "perf" and perf_scope == "all"):
             for _ in range(config["warmup"]):
                 if args.mode == "perf":
                     flush_l2_before_call()
@@ -554,7 +620,7 @@ def run(args, config, group):
                     f"[ACCURACY] BS={bs} all {world} ranks passed ({args.input}, sampled={args.check_tokens})",
                     flush=True,
                 )
-        elif urma:
+        elif urma and perf_scope == "all":
             from .performance import measure_profiled_forward, summarize_profile_rounds
 
             capture = measure_profiled_forward(
@@ -568,14 +634,14 @@ def run(args, config, group):
             )
             (case / "kernel_samples.json").write_text(json.dumps(capture["samples"], indent=2), encoding="utf-8")
             per_rank = group.all_gather(capture["durations_us"], f"profiling BS={bs}")
-            report = summarize_profile_rounds(per_rank, int(os.environ.get("LOCAL_WORLD_SIZE", world)))
+            report = summarize_profile_rounds(per_rank, ranks_per_node)
             report.update(
                 includes_device_routing=True,
                 windows_per_forward=windows_by_bs[bs],
                 kernel_duration_scope=manifest["kernel_duration_scope"],
             )
             performance_path = case / "performance.json"
-        else:
+        elif perf_scope == "all":
             samples = collect_profile(call, group, torch, config, prefix, case / "profiler", bs, windows_by_bs[bs])
             (case / "kernel_samples.json").write_text(json.dumps(samples, indent=2), encoding="utf-8")
             timings = forward_durations(samples, windows_by_bs[bs])
@@ -595,12 +661,18 @@ def run(args, config, group):
                     f"(last ceil(iters/2); kernel Duration; rank-min mean; timer off)",
                     flush=True,
                 )
-        if args.mode == "perf":
+        if args.mode == "perf" and perf_scope != "timer":
+            if perf_scope == "host":
+                report = dict(windows_per_forward=windows_by_bs[bs])
+                performance_path = case / "performance.json"
             report["host_e2e"] = measure_synchronized_forward(call, group, torch, config["iters"], bs)
             performance_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         if args.timer:
             uninstrumented = result.float().cpu().numpy() if args.mode == "accuracy" else None
-            if urma:
+            if perf_scope == "timer":
+                flush_l2_before_call()
+                call(timer)
+            elif urma:
                 if args.mode == "accuracy":
                     call(timer)
             else:
@@ -615,10 +687,15 @@ def run(args, config, group):
             if uninstrumented is not None:
                 from .reference import error_metrics
 
-                metrics = error_metrics(result.float().cpu().numpy(), uninstrumented)
+                instrumented = result.float().cpu().numpy()
+                metrics = error_metrics(instrumented, uninstrumented)
+                if timer is not None:
+                    first_window = slice(0, buffer.window_tokens)
+                    metrics["first_window"] = error_metrics(instrumented[first_window], uninstrumented[first_window])
                 comparisons = group.all_gather(dict(rank=rank, **metrics), f"timer accuracy BS={bs}")
                 (case / "timer_accuracy.json").write_text(json.dumps(comparisons, indent=2), encoding="utf-8")
-                if any(not item["finite"] or item["relative_rmse"] > args.relative_rmse for item in comparisons):
+                checks = [*comparisons, *(item["first_window"] for item in comparisons if "first_window" in item)]
+                if any(not item["finite"] or item["relative_rmse"] > args.relative_rmse for item in checks):
                     raise AssertionError(f"BS={bs}: timer-on/off output mismatch")
             if urma:
                 from .urma_trace import export_diagnostics

@@ -644,7 +644,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     uint64_t trace_capacity = 0;
     int64_t trace_elements = 0;
     if (timer) {
-        TORCH_CHECK(is_a8w4_, "MegaMoE timer requires routed A8W4");
+        TORCH_CHECK(is_a8w4_ || (urma && windowed_ && !is_w4),
+                    "MegaMoE timer requires routed A8W4 or windowed URMA A8W8");
         trace_elements = ValidateTimer(*timer, urma);
         if (urma) trace_capacity = trace_elements / kTraceRowElements - 1;
     }
