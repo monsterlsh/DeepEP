@@ -94,6 +94,15 @@ python3 experiments/megamoe/scripts/summarize_megamoe_overlap.py "$RUN" --output
 
 报告按同一 rank、同一首窗的设备 tick 计算。GMM 区间从 AIC 提交打点起点到对应 AIV1 FIX 完成观测点，通信区间使用有完成点的 Dispatch / Combine 包络。各类区间先取并集，掩盖率为 `通信区间与 GMM 区间的交集时长 / 通信区间时长`。总通信先合并 Dispatch 与 Combine，跨 rank 的汇总用各 rank 的重叠时间之和除以通信时间之和。缺少配对或完成点会显示覆盖缺口。这个指标是首窗的事件包络估计，包含已记录边界之间的等待和间隙。
 
+联合分析正式 profile 和首窗掩盖率时，在仓库根目录执行：
+
+```bash
+python3 experiments/megamoe/scripts/analyze_megamoe_profile.py "$RUN" \
+  --overlap "$RUN/overlap.json" --output "$RUN/analysis.json"
+```
+
+脚本读取 `performance.json` 和 `kernel_samples.json`。有完整采集配置时也可从结果树下的原始 profiler CSV 还原正式窗口。报告列出最慢 rank、首窗/稳态/尾窗和窗间空档。若保留了同轮 `urma_trace.json` 与 `communication_bandwidth.json`，还会将首窗未覆盖时间拆成首个 GMM 前、GMM 间隙和最后一个 GMM 后，并按观测结果给出排查方向。两台独立盘可同时传入本轮的两个结果目录。
+
 ### UBX GELU 与 SwiGLU 性能对照
 
 `run_ubx_gelu.py compare` 固定 A 为 GELU 提前加权，B 为原生 SwiGLU Finalize 加权。`--precision w8a8` 或 `--precision a8w4` 单独选择精度，`--precision all`（默认）依次安排两组。A8W4 也可写作 W4A8，表示 FP8 激活与 FP4 权重。可比的 A/B 用例使用同一输入、路由和 GMM2 权重，A 的 GMM1 取 B 的 gate 权重。
