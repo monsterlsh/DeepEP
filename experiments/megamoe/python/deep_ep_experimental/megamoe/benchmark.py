@@ -252,6 +252,8 @@ def main():
                         help="Run all performance measures, synchronized host timing, or a separate device trace")
     parser.add_argument("--paired-weights", action="store_true",
                         help="For performance comparisons, share SwiGLU gate and GMM2 weights with GELU")
+    parser.add_argument("--urma-window-tokens", type=int, choices=(64, 128, 256),
+                        help="Fix the URMA window for a same-window comparison")
     parser.add_argument("--input", choices=("bf16", "fp8", "fp4"), default="bf16")
     parser.add_argument(
         "--routing",
@@ -308,6 +310,7 @@ def run(args, config, group):
     ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", world))
     perf_scope = getattr(args, "perf_scope", "all")
     paired_weights = bool(getattr(args, "paired_weights", False))
+    urma_window_tokens = getattr(args, "urma_window_tokens", None)
     collective_check(
         group,
         "benchmark configuration",
@@ -325,6 +328,7 @@ def run(args, config, group):
             bool(getattr(args, "dual_reference", False)),
             perf_scope,
             paired_weights,
+            urma_window_tokens,
         ),
     )
     model = config["model"]
@@ -422,6 +426,7 @@ def run(args, config, group):
         group,
         num_max_tokens_per_rank=max(config["bs_values"]),
         ranks_per_node=ranks_per_node,
+        **({"urma_window_tokens": urma_window_tokens} if urma_window_tokens is not None else {}),
         **{k: v for k, v in model.items() if k not in ("shared_intermediate_hidden", "shared_output_rounding", "activation_clamp")},
     )
     windows_by_bs = {bs: buffer.num_forward_windows(bs) for bs in config["bs_values"]}

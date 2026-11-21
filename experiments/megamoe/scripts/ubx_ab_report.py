@@ -75,6 +75,8 @@ def validate_job(manifests, plan, precision, arm, stage, paired):
     window = first["window_tokens"]
     if type(window) is not int or window < 1:
         raise ValueError("invalid benchmark window capacity")
+    if paired and plan.get("window_tokens", window) != window:
+        raise ValueError("benchmark window capacity differs from the A/B plan")
     bs = plan["bs"]
     windows = [min(window, bs - start) for start in range(0, bs, window)]
     timers = first["timer_ranks"]

@@ -268,6 +268,7 @@ def backend(monkeypatch):
         validate_timer=validate_timer,
         small_batch_max_tokens=256,
         urma_ep8_window_tokens=256,
+        urma_windowed_swiglu_enabled=True,
     )
     monkeypatch.setattr(api, "_extension", lambda: ext)
     buffer = api.SymmBuffer(Group(), 4, 17, 2, 1024, 256)
@@ -889,15 +890,15 @@ def test_urma_unsafe_target_limits_remain_explicit(backend, monkeypatch):
 
     monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
     for world, kwargs in (
-        (16, dict(num_experts=32, num_max_tokens_per_rank=17, num_topk=9)),
-        (16, dict(num_experts=32, num_max_tokens_per_rank=16385, num_topk=8)),
-        (32, dict(num_experts=64, num_max_tokens_per_rank=17, num_topk=8)),
+        (8, dict(num_experts=32, num_max_tokens_per_rank=17, num_topk=9)),
+        (16, dict(num_experts=32, num_max_tokens_per_rank=16385, num_topk=8, topk_weights_type=1)),
+        (32, dict(num_experts=64, num_max_tokens_per_rank=17, num_topk=8, num_shared_experts=1)),
     ):
         with pytest.raises(ValueError):
             api.SymmBuffer(backend.group_type(world), hidden=256, intermediate_hidden=256, **kwargs)
 
 
-def windowed_urma_buffer(backend, monkeypatch, capacity, topk, *, group=None):
+def windowed_urma_buffer(backend, monkeypatch, capacity, topk, *, group=None, activation="gelu", window=None):
     from deep_ep_experimental.megamoe import backend as selector
 
     monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
@@ -909,7 +910,7 @@ def windowed_urma_buffer(backend, monkeypatch, capacity, topk, *, group=None):
     monkeypatch.setattr(api, "check_window_routes", validate_routes)
     if group is None:
         group = backend.group_type(8)
-    b = api.SymmBuffer(group, 64, capacity, topk, 256, 256, activation="gelu")
+    b = api.SymmBuffer(group, 64, capacity, topk, 256, 256, activation=activation, urma_window_tokens=window)
     rows = np.arange(capacity, dtype=np.int32)[:, None]
     slots = np.arange(topk, dtype=np.int32)[None, :]
     b.topk_idx.data[:] = (rows + 17 * slots) % b.num_experts
@@ -917,11 +918,12 @@ def windowed_urma_buffer(backend, monkeypatch, capacity, topk, *, group=None):
     b.x.data[:] = rows % 251
     b.x_sf.data[:] = (rows + 101) % 251
     local = b.num_experts // group.size()
+    columns = 512 if activation == "swiglu" else 256
     raw = (
-        (Tensor(np.zeros((local, 256, 128)), "uint8"), Tensor(np.full((local, 256, 4, 2), 127), "float8_e8m0fnu")),
+        (Tensor(np.zeros((local, columns, 128)), "uint8"), Tensor(np.full((local, columns, 4, 2), 127), "float8_e8m0fnu")),
         (Tensor(np.zeros((local, 256, 128)), "uint8"), Tensor(np.full((local, 256, 4, 2), 126), "float8_e8m0fnu")),
     )
-    return b, api.transform_weights_for_mega_moe(*raw, activation="gelu")
+    return b, api.transform_weights_for_mega_moe(*raw, activation=activation)
 
 
 def native_launches(backend):
@@ -1167,9 +1169,9 @@ def test_windowed_urma_rejects_different_hosts_even_with_ranks_per_node_8(backen
     assert sum(event[0] == "buffer_size" for event in backend.events if isinstance(event, tuple)) == 1
 
 
-@pytest.mark.parametrize("world", [8, 16, 32])
+@pytest.mark.parametrize(("world", "activation"), [(8, "gelu"), (16, "gelu"), (32, "gelu"), (16, "swiglu"), (32, "swiglu")])
 @pytest.mark.parametrize("k", [25, 32])
-def test_windowed_urma_target_prepares_256_rows_for_39280_token_capacity(backend, monkeypatch, world, k):
+def test_windowed_urma_target_prepares_256_rows_for_39280_token_capacity(backend, monkeypatch, world, k, activation):
     from deep_ep_experimental.megamoe import backend as selector
 
     monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
@@ -1181,7 +1183,7 @@ def test_windowed_urma_target_prepares_256_rows_for_39280_token_capacity(backend
 
     monkeypatch.setattr(torch, "empty", shape_only)
     monkeypatch.setattr(torch, "empty_like", lambda t, dtype: shape_only(t.shape, dtype, t.device))
-    b = api.SymmBuffer(backend.group_type(world), 800, 39280, k, 4096, 1536, activation="gelu")
+    b = api.SymmBuffer(backend.group_type(world), 800, 39280, k, 4096, 1536, activation=activation)
     try:
         assert b.x.shape == (39280, 4096) and b.topk_idx.shape == (39280, k)
         assert b.num_forward_windows(39280) == 154
@@ -1189,8 +1191,25 @@ def test_windowed_urma_target_prepares_256_rows_for_39280_token_capacity(backend
         assert ("buffer_size", (world, 800 // world, 256, k, 4096), "urma", True) in backend.events
         b.prepare(39280)
         assert b._plan.windowed and b._plan.bs == b._plan.max_tokens == 256
-        assert b._plan.local_experts == 800 // world and b._plan.topk_weights_type == 1
+        assert b._plan.local_experts == 800 // world and b._plan.topk_weights_type == int(activation == "gelu")
         assert not native_launches(backend)
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize("world", [16, 32])
+def test_windowed_urma_swiglu_uses_fixed_windows_and_first_window_timer(backend, monkeypatch, world):
+    b, weights = windowed_urma_buffer(
+        backend, monkeypatch, 129, 25, group=backend.group_type(world), activation="swiglu", window=64,
+    )
+    try:
+        timer = b.allocate_timer()
+        out = Tensor(np.zeros((129, 256)), "bfloat16")
+        api.fp8_fp4_mega_moe(out, *weights, b, activation="swiglu", timer=timer)
+        launches = native_launches(backend)
+        assert b._plan.windowed and b._plan.topk_weights_type == 0
+        assert [x[0].shape[0] for x in launches] == [64, 64, 1]
+        assert [x[8] for x in launches] == [timer, None, None]
     finally:
         b.destroy()
 

@@ -23,10 +23,12 @@ def test_registered_windows_and_local_scratch(tmp_path):
 using namespace deepep::megamoe;
 using namespace MegaMoeUrma;
 
-uint64_t check(int world, int tokens, int k, int h = 4096, int i = 1536, bool fp8Weights = false)
+uint64_t check(int world, int tokens, int k, int h = 4096, int i = 1536, bool fp8Weights = false, bool early = true)
 {
-    const auto layout = MakeUrmaSymmetricLayout(world, tokens, k, h, UrmaCvRows(world, tokens), 1, true);
+    const auto layout = MakeUrmaSymmetricLayout(world, tokens, k, h, UrmaCvRows(world, tokens), early, true);
     const auto& c = layout.config;
+    assert(c.topkWeightsType == early);
+    if (!early) assert(c.dispatchScaleStride == h / 32);
     const uint64_t sent = uint64_t(tokens) * k, recv = world * sent;
     assert(c.sourceRowCapacity == sent);
     assert(c.receiveXOffset == 0 && c.receiveScaleOffset >= recv * h);
@@ -73,7 +75,7 @@ uint64_t check(int world, int tokens, int k, int h = 4096, int i = 1536, bool fp
     } else {
         assert(a.gatheredInputX == 0);
     }
-    const bool target = (k == 25 || k == 32) && h == 4096 && i == 1536;
+    const bool target = early && (k == 25 || k == 32) && h == 4096 && i == 1536;
     assert(ReserveUrmaGeluLookup(a) == target);
     assert(a.geluLookupWords == 0 && (a.geluLookup != 0) == target);
     if (target) {
@@ -89,7 +91,8 @@ uint64_t check(int world, int tokens, int k, int h = 4096, int i = 1536, bool fp
         BindUrmaScratch(planned, layout, tokens, 4096, [&](uint64_t n) { withoutLut += n; return uint64_t{0}; });
         assert(estimate == withoutLut + WindowGeluUb::tableBytes);
     }
-    const uint64_t payload = recv * (uint64_t(h) + c.dispatchScaleStride + uint64_t(i) + i / 32 + 2ULL*h + h / 32 + 32)
+    const uint64_t payload = recv * (uint64_t(h) + c.dispatchScaleStride + uint64_t(i) + i / 32 + 2ULL*h + h / 32 +
+                                     (early ? 32 : 0))
                            + sent * (3ULL*h + c.dispatchScaleStride + 800 * 4 + sizeof(int64_t));
     assert(c.symmetricBytes + scratch >= payload);
     return c.symmetricBytes + scratch;
@@ -105,6 +108,11 @@ int main()
     }
     for (int tokens : {64, 128, 256}) {
         assert(check(16, tokens, 25, 4096, 1536, true) == check(16, tokens, 25) + 16ULL * tokens * 25 * 4096);
+        for (int world : {16, 32}) {
+            for (int k : {25, 32}) {
+                assert(check(world, tokens, k, 4096, 1536, false, false) < check(world, tokens, k));
+            }
+        }
     }
     assert(check(32, 256, 32, 8192, 16384) > (4ULL << 30));
     for (auto shape : {std::vector<int>{4, 256, 1}, {32, 257, 25}, {32, 0, 25}, {32, 128, 33}}) {

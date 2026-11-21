@@ -80,7 +80,8 @@ def test_ep16_compare_runs_ab_then_ba_before_separate_timers(tmp_path, monkeypat
     ]
 
 
-def test_ep32_k25_plan_marks_both_baselines_blocked_without_execution(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("world", [16, 32])
+def test_target_k25_plans_w4a8_pairing_without_execution(tmp_path, monkeypatch, capsys, world):
     output = tmp_path / "planned"
     monkeypatch.delenv("PYTHON")
 
@@ -92,29 +93,35 @@ def test_ep32_k25_plan_marks_both_baselines_blocked_without_execution(tmp_path, 
     monkeypatch.setattr(launcher, "run_stage", unexpected)
     monkeypatch.setattr(launcher, "run_case", unexpected)
     monkeypatch.setattr(launcher, "report_comparison", unexpected)
-    assert launcher.cli(["compare", "all", "--ep-size", "32", "--plan", "--output-dir", str(output)]) == 0
+    assert launcher.cli(["compare", "all", "--ep-size", str(world), "--plan", "--output-dir", str(output)]) == 0
     plan = json.loads(capsys.readouterr().out)
-    assert plan["ep_size"] == 32 and plan["config"]["model"]["num_topk"] == 25
-    assert plan["timer_ranks"] == [0, 4, 8, 12, 16, 20, 24, 28]
-    assert [case["precision"] for case in plan["cases"]] == ["w4a8", "w8a8"]
-    for case in plan["cases"]:
-        assert not case["pairs"]
-        assert list(case["absolute"]) == ["gelu"] and list(case["timer"]) == ["gelu"]
-        assert case["blocked"]["swiglu"]
+    assert plan["ep_size"] == world and plan["config"]["model"]["num_topk"] == 25
+    assert plan["bs"] == 39280 and plan["window_tokens"] == 256
+    assert plan["timer_ranks"] == list(range(0, world, 4))
+    w4a8, w8a8 = plan["cases"]
+    assert w4a8["precision"] == "w4a8" and w8a8["precision"] == "w8a8"
+    assert len(w4a8["pairs"]) == 8 and set(w4a8["timer"]) == {"gelu", "swiglu"}
+    assert not w4a8["absolute"] and not w4a8["blocked"]
+    assert not w8a8["pairs"] and w8a8["blocked"]["swiglu"]
+    assert list(w8a8["absolute"]) == ["gelu"] and list(w8a8["timer"]) == ["gelu"]
     assert not output.exists()
 
 
-def test_ep32_compare_forwards_arm_scope_and_topk_to_both_nodes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("precision", ["w4a8", "w8a8"])
+def test_ep32_compare_forwards_arm_scope_and_topk_to_both_nodes(tmp_path, monkeypatch, precision):
     events = []
+    paired = precision == "w4a8"
 
-    def run_case(python, env, args, mode, precision, config):
+    def run_case(python, env, args, mode, launched_precision, config):
         model = json.loads(config.read_text(encoding="utf-8"))["model"]
-        assert mode == "perf" and precision == "w8a8"
-        assert args.comparison_arm == model["activation"] == "gelu"
-        assert args.topk == model["num_topk"] == 7
+        assert mode == "perf" and launched_precision == precision
+        assert args.comparison_arm == model["activation"]
+        assert args.topk == model["num_topk"] == 25
+        assert model["topk_weights_type"] == int(model["activation"] == "gelu")
         assert args.timer == (args.perf_scope == "timer")
-        assert not args.paired_weights
-        events.append((args.perf_scope, args.node_rank))
+        assert args.paired_weights is paired
+        assert args.window_tokens == (128 if paired else None)
+        events.append((args.perf_scope, model["activation"], args.node_rank))
 
     def run_stage(label, scripts, logs, *, ssh_target, ssh_port):
         assert ssh_target == "tester@192.0.2.2"
@@ -130,8 +137,11 @@ def test_ep32_compare_forwards_arm_scope_and_topk_to_both_nodes(tmp_path, monkey
     monkeypatch.setattr(launcher, "report_comparison", lambda args, plan: 0)
     monkeypatch.setattr(launcher.subprocess, "run", lambda *args, **kwargs: None)
     assert launcher.cli([
-        "compare", "w8a8", "--ep-size", "32", "--node-ip", "192.0.2.1", "192.0.2.2",
-        "--ssh-user", "tester", "--topk", "7", "--bs", "64",
+        "compare", precision, "--ep-size", "32", "--node-ip", "192.0.2.1", "192.0.2.2",
+        "--ssh-user", "tester", "--topk", "25", "--bs", "39280", "--pairs", "2",
+        *(["--window-tokens", "128"] if paired else []),
         "--output-dir", str(tmp_path),
     ]) == 0
-    assert events == [("host", 0), ("host", 1), ("timer", 0), ("timer", 1)]
+    jobs = [("host", "gelu"), ("host", "swiglu"), ("host", "swiglu"), ("host", "gelu"),
+            ("timer", "gelu"), ("timer", "swiglu")] if paired else [("host", "gelu"), ("timer", "gelu")]
+    assert events == [(scope, arm, rank) for scope, arm in jobs for rank in (0, 1)]

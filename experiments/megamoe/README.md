@@ -108,18 +108,18 @@ UBX=experiments/megamoe/scripts/run_ubx_gelu.py
 # 先检查目标配置和支持矩阵，不启动作业。
 python3 "$UBX" --mode compare --ep-size 32 --plan
 
-# 在主节点采 EP32/K25 的 W4A8、W8A8 GELU 端到端与掩盖率。
-python3 "$UBX" --mode compare --precision all --ep-size 32 --output-dir /shared/ubx-ep32-k25-compare
+# 在主节点测 EP32/K25/B39280 的 W4A8 A/B。
+python3 "$UBX" --mode compare --precision a8w4 --ep-size 32 --output-dir /shared/ubx-ep32-k25-compare
 
 # 单独测 W8A8。
 python3 "$UBX" --mode compare --precision w8a8 --ep-size 32 --output-dir /shared/ubx-ep32-k25-w8a8
 
-# 在 EP16 的共同支持配置做一次完整 W4A8 A/B 验收。
-python3 "$UBX" --mode compare --precision a8w4 --ep-size 16 --topk 8 --bs 64 \
-  --output-dir /shared/ubx-ep16-k8-w4a8-compare --require-no-regression
+# 单机测 EP16/K25/B39280 的 W4A8 A/B。
+python3 "$UBX" --mode compare --precision a8w4 --ep-size 16 \
+  --output-dir /shared/ubx-ep16-k25-w4a8-compare --require-no-regression
 ```
 
-当前 UBX 原生 B 只支持 W4A8、单机 EP16、K≤8、每卡 B≤16,384。选 `--bs 64` 可让原生 B 和分窗 A 使用同样的单窗行数。EP32、K25/K32 和 W8A8 缺少对应的原生 B，统一入口会采 A 的绝对数据，并在报告中注明 B 为 `BLOCKED`。`--require-no-regression` 在退化、证据不全或基线缺失时返回非零。用 `ROUTING=skewed` 或 `--config target_gelu_k32` 另起目录测其他组。
+W4A8 的 A、B 两侧都走分窗 UBX，覆盖 EP16/EP32、K1–32、每卡 B1–65536、零共享专家。默认统一用 W256，HBM 预算不足时可用 `--window-tokens 128` 或 `--window-tokens 64` 重跑，两侧使用同一窗口大小。W8A8 的对照仍采 GELU 绝对数据，SwiGLU 标为 `BLOCKED`。`--require-no-regression` 在退化、证据不全或基线缺失时返回非零。用 `ROUTING=skewed` 或 `--config target_gelu_k32` 另起目录测其他组。
 
 双机用独立输出盘时，把节点 1 本轮目录复制到汇总机器，再通过同一入口汇总：
 

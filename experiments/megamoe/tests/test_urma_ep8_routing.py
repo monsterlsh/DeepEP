@@ -128,7 +128,7 @@ void checkOwners(uint32_t world)
 
 // Every source selects K distinct IDs ending at 799. K32 spills its seven
 // additional routes onto rank 30. All other destinations must finish empty.
-void checkTarget(uint32_t tokens, uint32_t topk)
+void checkTarget(uint32_t tokens, uint32_t topk, bool gelu)
 {
     for (uint32_t rank = 0; rank < 32U; ++rank) {
         Config c{};
@@ -136,8 +136,9 @@ void checkTarget(uint32_t tokens, uint32_t topk)
         c.bs = tokens; c.topk = topk; c.cvRows = 256U; c.sourceRowCapacity = kWindowTokens * topk;
         c.maxPeerChunks = (c.sourceRowCapacity + c.cvRows - 1U) / c.cvRows;
         c.hidden = 4096U; c.intermediate = 1536U;
-        c.activationMode = static_cast<uint32_t>(MegaMoeImpl::MegaMoeActMode::GELU);
-        c.topkWeightsType = 1U;
+        c.activationMode = static_cast<uint32_t>(gelu ? MegaMoeImpl::MegaMoeActMode::GELU
+                                                      : MegaMoeImpl::MegaMoeActMode::SWIGLU);
+        c.topkWeightsType = gelu ? 1U : 0U;
         DeviceRouteInfo routes{};
         for (uint32_t e = 0; e < 800U; ++e) {
             routes.outgoing[e + 1U] = routes.outgoing[e] + (e >= 800U - topk ? tokens : 0U);
@@ -155,6 +156,7 @@ void checkTarget(uint32_t tokens, uint32_t topk)
         assert(c.receiveRows == c.world * tokens * activeExperts);
         assert(c.selfRows == tokens * activeExperts);
         assert(c.fragmentCount == ((c.world * tokens + 255U) / 256U) * activeExperts);
+        assert(c.gmm1Tiles == c.fragmentCount * c.intermediate / (gelu ? 256U : 128U));
         assert(routes.outgoing[800] == tokens * topk);
         for (uint32_t cv = 0; cv < c.recvChunkCount; ++cv) {
             const uint32_t peer = PlanPeerForCv(cv, c, routes, false);
@@ -179,8 +181,10 @@ int main()
         }
     }
     for (uint32_t tokens : {112U, 256U}) {
-        checkTarget(tokens, 25U);
-        checkTarget(tokens, 32U);
+        for (bool gelu : {true, false}) {
+            checkTarget(tokens, 25U, gelu);
+            checkTarget(tokens, 32U, gelu);
+        }
     }
 }
 """,

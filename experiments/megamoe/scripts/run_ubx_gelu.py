@@ -93,6 +93,8 @@ def parse_args(argv):
     parser.add_argument("--weighting", choices=("auto", "early", "late"), default="auto")
     parser.add_argument("--bs", type=int, default=39280, help="每卡 token 数")
     parser.add_argument("--topk", type=int, help="覆盖模型 TopK")
+    parser.add_argument("--window-tokens", type=int, choices=(64, 128, 256),
+                        help="compare 的共同窗口上限，默认 256")
     parser.add_argument("--output-dir", type=Path, help="本轮输出目录。EP32 手动模式要求两侧显式给同一路径")
     parser.add_argument("--timer", action="store_true", help="另采一次首窗设备 trace，默认每台 4 个 rank")
     parser.add_argument("--force", action="store_true", help="强制重跑 CPU Golden 和 NPU 精度")
@@ -197,19 +199,17 @@ def parse_args(argv):
         args.perf_precisions = wanted if args.precision else ("w4a8",)
     if args.comparison_arm == "swiglu" and (
         args.mode != "perf" or len(args.perf_precisions) != 1
-        or swiglu_unavailable(args, args.perf_precisions[0])
+        or swiglu_unavailable(args.perf_precisions[0])
     ):
-        parser.error("SwiGLU 基线仅支持原生 UBX EP16 W4A8、K<=8、B<=16384")
+        parser.error("SwiGLU 基线需要 UBX EP16/EP32 W4A8")
+    if args.window_tokens is not None and args.mode != "compare" and not args.paired_weights:
+        parser.error("--window-tokens 用于 compare")
     return args
 
 
-def swiglu_unavailable(args, precision):
+def swiglu_unavailable(precision):
     if precision != "w4a8":
         return "当前 UBX W8A8 只支持分窗 GELU，缺少原生 SwiGLU 后置加权实现"
-    if args.ep_size != 16:
-        return "当前原生 UBX SwiGLU 只支持单机，统一入口中的可比规模为 EP16"
-    if (args.topk or args.spec["model"]["num_topk"]) > 8 or args.bs > 16384:
-        return "原生 UBX SwiGLU 要求 K<=8 且每卡 B<=16384"
     return None
 
 
@@ -230,7 +230,7 @@ def comparison_plan(args):
     cases = []
     pairs = args.pairs or 8
     for precision in args.perf_precisions:
-        blocked = swiglu_unavailable(args, precision)
+        blocked = swiglu_unavailable(precision)
         base = f"comparison/{precision}"
         arms = ("gelu",) if blocked else tuple(WEIGHT_MODE)
         pair_runs = []
@@ -250,6 +250,7 @@ def comparison_plan(args):
     return dict(
         schema="ubx_ab_plan_v1", ep_size=args.ep_size, bs=args.bs, routing=args.routing, config=config,
         pairs=pairs, cases=cases, timer_ranks=ubx_timer_ranks(args.ep_size),
+        window_tokens=min(args.bs, args.window_tokens or 256),
         measurement_order=["formal_host_e2e", "first_window_timer", "report"],
     )
 
@@ -378,7 +379,7 @@ def run_case(python, env, args, mode, precision, config):
     if args.perf_scope != "all":
         extra.extend(("--perf-scope", args.perf_scope))
     if args.paired_weights:
-        extra.append("--paired-weights")
+        extra.extend(("--paired-weights", "--urma-window-tokens", str(args.window_tokens or 256)))
     if args.timer:
         ranks = ",".join(map(str, ubx_timer_ranks(args.ep_size)))
         extra.extend(("--timer", "--timer-ranks", ranks))
@@ -479,6 +480,8 @@ def orchestrate(args, env):
             argv.extend(("--comparison-arm", args.comparison_arm, "--perf-scope", args.perf_scope))
         if args.paired_weights:
             argv.append("--paired-weights")
+            if args.window_tokens is not None:
+                argv.extend(("--window-tokens", str(args.window_tokens)))
         scripts = {
             rank: node_script(REPO_ROOT, extra_env, ENV_SCRIPT, [*argv, "--node-rank", str(rank)])
             for rank in (0, 1)

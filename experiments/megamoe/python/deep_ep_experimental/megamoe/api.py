@@ -47,27 +47,34 @@ def _pair(value, name):
     return value
 
 
-def _urma_window_capacity(group, ext, world, local_experts, tokens, topk, hidden, intermediate, mma_type):
+def _urma_window_capacity(
+    group, ext, world, local_experts, tokens, topk, hidden, intermediate, mma_type, *, activation, window_tokens,
+):
     error, selected = None, 0
     try:
         free, _ = npu_api().mem_get_info(npu_api().current_device())
         # Public FP8 input/scales, routing IDs/weights, BF16 output and both
-        # single-projection weights with one E8M0 byte per 32 elements.
+        # Expert weights with one E8M0 byte per 32 elements. SwiGLU uses two W1 projections.
         resident = tokens * (3 * hidden + hidden // 32 + 8 * topk)
-        elements = 2 * local_experts * hidden * intermediate
+        projections = 3 if activation == "swiglu" else 2
+        elements = projections * local_experts * hidden * intermediate
         resident += (elements // 2 if mma_type == "fp8xfp4" else elements) + elements // 32
         # sort() produces int32 values and int64 indices during route preflight.
         resident += tokens * topk * 12
-        for candidate in dict.fromkeys(min(tokens, n) for n in (256, 128, 64)):
+        sizes = (window_tokens,) if window_tokens is not None else (256, 128, 64)
+        for candidate in dict.fromkeys(min(tokens, n) for n in sizes):
             args = (world, local_experts, candidate, topk, hidden, intermediate)
             if mma_type == "fp8xfp8":
                 args += (mma_type,)
+            # Early weighting is a conservative bound for Finalize weighting, which
+            # omits the route weights in Dispatch and does not allocate the GELU lookup.
             heap, scratch = ext.urma_window_bytes(*args)
             if resident + heap + scratch <= free and heap <= _MEGAMOE_PROFILES["urma"].maximum_capacity:
                 selected = candidate
                 break
         if not selected:
-            raise ValueError(f"insufficient free HBM for the smallest window ({free} bytes available)")
+            window = f"requested W{min(tokens, window_tokens)}" if window_tokens is not None else "smallest window"
+            raise ValueError(f"insufficient free HBM for the {window} ({free} bytes available)")
     except Exception as exc:
         error = str(exc) or type(exc).__name__
     peers = gather_control(group, "window HBM budget", (error, selected))
@@ -175,6 +182,7 @@ class SymmBuffer:
         ranks_per_node: int = 0,
         timeout: int = 120,
         topk_weights_type: int | None = None,
+        urma_window_tokens: int | None = None,
     ):
         import torch
         import torch.distributed as dist
@@ -190,18 +198,30 @@ class SymmBuffer:
             urma and size in (16, 32) and mma_type == "fp8xfp8"
             and activation == "gelu" and num_shared_experts == 0
         )
-        self._urma_windowed = (
-            urma and size in (8, 16, 32) and activation == "gelu" and mma_type == "fp8xfp4" and num_shared_experts == 0
-        ) or urma_w8a8
-        self._windowed = self._urma_windowed
         if topk_weights_type is None:
             topk_weights_type = int(activation == "gelu")
+        self._urma_windowed = self._windowed = urma_swiglu_windowed = False
         error = None
         try:
             integer("num_experts", num_experts, 1, 16384)
+            integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 65536)
+            integer("num_topk", num_topk, 1, min(32, num_experts))
+            if urma_window_tokens is not None:
+                integer("urma_window_tokens", urma_window_tokens, 1, 256)
+            urma_swiglu_windowed = (
+                urma and size in (16, 32) and activation == "swiglu" and mma_type == "fp8xfp4"
+                and num_shared_experts == 0 and topk_weights_type == 0
+                and (size == 32 or num_topk > 8 or num_max_tokens_per_rank > 16384 or urma_window_tokens is not None)
+            )
+            self._urma_windowed = (
+                urma and size in (8, 16, 32) and activation == "gelu" and mma_type == "fp8xfp4"
+                and num_shared_experts == 0
+            ) or urma_w8a8 or urma_swiglu_windowed
+            self._windowed = self._urma_windowed
             legacy_urma = urma and not self._windowed
-            integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 16384 if legacy_urma else 65536)
-            integer("num_topk", num_topk, 1, min(8 if legacy_urma else 32, num_experts))
+            if legacy_urma:
+                integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 16384)
+                integer("num_topk", num_topk, 1, min(8, num_experts))
             integer("hidden", hidden, 256 if urma else 1024, 8192)
             integer("intermediate_hidden", intermediate_hidden, 256, 16384 if urma else 4096)
             integer("num_shared_experts", num_shared_experts, 0, 1 if urma else 8)
@@ -212,7 +232,7 @@ class SymmBuffer:
             if self._urma_windowed:
                 local_ranks = min(size, 16)
                 if ranks_per_node not in (0, local_ranks):
-                    raise ValueError(f"Windowed EP{size} GELU requires {local_ranks} ranks per host")
+                    raise ValueError(f"Windowed URMA EP{size} requires {local_ranks} ranks per host")
                 ranks_per_node = local_ranks
             h_align, i_align = (256, 256) if urma else (64, 128)
             if hidden % h_align or intermediate_hidden % i_align:
@@ -228,7 +248,9 @@ class SymmBuffer:
             if urma and mma_type == "fp8xfp8" and not urma_w8a8:
                 raise ValueError("URMA W8A8 requires windowed EP16/EP32 GELU with zero shared experts")
             if urma and size == 32 and not self._urma_windowed:
-                raise ValueError("URMA EP32 requires windowed routed GELU with zero shared experts")
+                raise ValueError("URMA EP32 requires windowed GELU or W4A8 SwiGLU with Finalize weighting and zero shared experts")
+            if urma_window_tokens is not None and not self._urma_windowed:
+                raise ValueError("urma_window_tokens requires a windowed URMA configuration")
             if mma_type != "fp8xfp4" and num_shared_experts:
                 raise ValueError("Shared experts currently require FP8xFP4 weights")
             if num_experts % size or num_experts // size > 128:
@@ -250,6 +272,7 @@ class SymmBuffer:
             ranks_per_node,
             timeout,
             topk_weights_type,
+            urma_window_tokens,
             _host_boot_id() if self._urma_windowed and size <= 16 else None,
         )
         collective_check(group, "configuration", error, config)
@@ -257,6 +280,11 @@ class SymmBuffer:
         if urma_w8a8:
             error = None if getattr(ext, "urma_w8a8_enabled", False) else "install a MegaMoE wheel with URMA W8A8 support"
             collective_check(group, "URMA W8A8 availability", error)
+        if urma_swiglu_windowed:
+            error = None if getattr(ext, "urma_windowed_swiglu_enabled", False) else (
+                "install a MegaMoE wheel with windowed URMA SwiGLU support"
+            )
+            collective_check(group, "Windowed URMA SwiGLU availability", error)
 
         def heap_bytes(tokens):
             return int(ext.buffer_size(
@@ -274,7 +302,8 @@ class SymmBuffer:
         self._native_capacity = num_max_tokens_per_rank
         if self._urma_windowed:
             self._native_capacity = _urma_window_capacity(
-                group, ext, size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, mma_type
+                group, ext, size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
+                mma_type, activation=activation, window_tokens=urma_window_tokens,
             )
         capacity = heap_bytes(self._native_capacity)
         if not urma and activation == "gelu" and not num_shared_experts and capacity > _MEGAMOE_PROFILES["mte"].maximum_capacity:
@@ -765,13 +794,14 @@ def _forward_inputs(
     if b._windowed:
         bs, h, i = data.shape[0], b.hidden, b.intermediate_hidden
         local = b.num_experts // b._world_size
+        w1_columns = 2 * i if b.activation == "swiglu" else i
         tensors = [
             (topk_idx, (bs, b.num_topk), torch.int32),
             (topk_weights, (bs, b.num_topk), torch.float32),
             (data, (bs, h), expected_x_dtype),
-            (w1, (local, i, h // (2 if w1.dtype == torch.uint8 else 1)), expected_dtype),
+            (w1, (local, w1_columns, h // (2 if w1.dtype == torch.uint8 else 1)), expected_dtype),
             (w2, (local, h, i // (2 if w1.dtype == torch.uint8 else 1)), expected_dtype),
-            (s1, (local, i, h // 64, 2), torch.float8_e8m0fnu),
+            (s1, (local, w1_columns, h // 64, 2), torch.float8_e8m0fnu),
             (s2, (local, h, i // 64, 2), torch.float8_e8m0fnu),
         ]
         if scales is not None:
@@ -787,7 +817,7 @@ def _forward_inputs(
                 or tensor.dtype != dtype
                 or not tensor.is_contiguous()
             ):
-                raise ValueError(f"Windowed GELU requires contiguous {dtype} {shape} on {b._device}")
+                raise ValueError(f"Windowed URMA requires contiguous {dtype} {shape} on {b._device}")
         if timer is not None:
             if timer.device != b._device:
                 raise ValueError("timer must be on the buffer device")

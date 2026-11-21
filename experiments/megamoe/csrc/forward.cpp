@@ -452,8 +452,10 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
                 "ranks_per_node must divide EP");
     const bool urma = backend_ == Backend::Urma;
     TORCH_CHECK(!windowed_ ||
-                    (urma && activation_ == "gelu" && shared_experts == 0 && topk_weights_type == 1),
-                "Windowed MegaMoE requires URMA, GELU, S0 and topk_weights_type=1");
+                    (urma && shared_experts == 0 &&
+                     ((activation_ == "gelu" && topk_weights_type == 1) ||
+                      (activation_ == "swiglu" && is_a8w4_ && topk_weights_type == 0 && (world == 16 || world == 32)))),
+                "Windowed MegaMoE requires URMA S0 with early GELU or EP16/EP32 W4A8 SwiGLU with Finalize weighting");
     TORCH_CHECK(timeout_seconds_ > 0 && timeout_seconds_ <= 3600, "Plan timeout_seconds must be in [1,3600]");
     TORCH_CHECK(!windowed_ || (world == 32 ? ranks_per_node == 16 : (ranks_per_node == 0 || ranks_per_node == world)),
                 "Windowed MegaMoE requires one host for EP8/16 or two contiguous 16-rank hosts for EP32");
@@ -831,8 +833,7 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
 {
     TORCH_CHECK(topk_weights_type == 0 || topk_weights_type == 1, "topk_weights_type must be 0 or 1");
     TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
-    TORCH_CHECK(!windowed || (backend == "urma" && topk_weights_type == 1),
-                "Windowed MegaMoE requires URMA with route weighting before quantization");
+    TORCH_CHECK(!windowed || backend == "urma", "Windowed native MegaMoE plans require URMA");
     const std::string resolved_mma_type = mma_type.empty() ? "fp8xfp8" : mma_type;
     TORCH_CHECK(resolved_mma_type == "fp8xfp4" || resolved_mma_type == "fp8xfp8" || resolved_mma_type == "fp4xfp4",
                 "mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4");

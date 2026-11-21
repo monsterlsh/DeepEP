@@ -326,7 +326,7 @@ UBX 的统一入口支持 `perf w4a8 --timer` 和 `perf w8a8 --timer`。EP16 自
 
 主判据是 **GELU / SwiGLU 的成对端到端时延比 ≤ 1**。每次从公开调用开始，到设备同步完成为止，先取本轮最慢 rank，再汇总配对轮次。预热、权重变换和计划准备在计时之外。用各窗 kernel 时长之和定位差异；输入检查、窗口间的专家计数累加和通信等待也会影响应用时延。
 
-当原 SwiGLU 的完整批次超过 MTE 的 1 GiB 对称区时，应注明对照采用的原生窗口大小、满窗数及尾窗，分别报告直接公开接口和相同窗口的对照结果。UBX 原有 SwiGLU 在 EP32/K25 上没有可运行的原生基线；UBX 须在共同支持的 EP 和 K 上做成对实测，并单独报告 EP32 目标的绝对耗时。
+当原 SwiGLU 的完整批次超过 MTE 的 1 GiB 对称区时，应注明对照采用的原生窗口大小、满窗数及尾窗，分别报告直接公开接口和相同窗口的对照结果。UBX 的 W4A8 对照将 GELU 和 SwiGLU 都放在同一个分窗规格下运行，覆盖 EP16/EP32 的 K25/K32 目标。
 
 非 UBX 950 的 K25 使用以下命令。每个 B 和路由单独出报告。`--require-no-regression` 会先写入 `paired.json`，再在配对中位数大于 1 时以非零状态退出。可在较小的 B 上追加 `--profile` 获取每窗耗时。
 
@@ -355,13 +355,13 @@ for route in balanced skewed; do
 done
 ```
 
-UBX 使用统一入口的 `compare`。先交替跑正式端到端配对作业，再自动采集两侧同一组 rank 的首窗设备 timer，最后出 `comparison.json`。当前原生 SwiGLU 后置加权的共同支持范围为 EP16、W4A8、K≤8、每卡 B≤16,384，等窗对照用 B64。EP32/K25 和 W8A8 的目标配置中，报告记录 GELU 绝对值及 SwiGLU 基线阻塞原因。详细流程见 [UBX 性能对照](../experiments/megamoe/README.md#ubx-gelu-与-swiglu-性能对照)。
+UBX 使用统一入口的 `compare`。先交替跑正式端到端配对作业，再自动采集两侧同一组 rank 的首窗设备 timer，最后出 `comparison.json`。W4A8 支持 EP16/EP32、K1–32、每卡 B1–65536，以 `--window-tokens` 固定两侧取窗。W8A8 记录 GELU 绝对值及 SwiGLU 基线阻塞原因。详细流程见 [UBX 性能对照](../experiments/megamoe/README.md#ubx-gelu-与-swiglu-性能对照)。
 
 ```bash
 UBX="$REPO/experiments/megamoe/scripts/run_ubx_gelu.py"
-python3 "$UBX" compare --precision a8w4 --ep-size 16 --topk 8 --bs 64 \
-  --output-dir "$RUN/ubx-ep16-k8-w4a8" --require-no-regression
-python3 "$UBX" compare --ep-size 32 --output-dir "$RUN/ubx-ep32-k25"
+python3 "$UBX" compare --precision a8w4 --ep-size 16 \
+  --output-dir "$RUN/ubx-ep16-k25-w4a8" --require-no-regression
+python3 "$UBX" compare --precision a8w4 --ep-size 32 --output-dir "$RUN/ubx-ep32-k25"
 ```
 
 出现错误时，先看第一个失败 rank 的输出及本轮 manifest。Golden 缺失通常需核对模型、EP、B、路由和抽样开关；窗口预算失败会给出 rank 与空闲 HBM。跨机检查物理节点、设备编号、SHMEM 引导地址及数据面链路。设备超时或部分 rank 已发起通信后失败，结束该轮全部 worker，确认卡已释放，再以新输出目录重启。

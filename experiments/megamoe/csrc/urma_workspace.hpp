@@ -41,8 +41,8 @@ inline UrmaSymmetricLayout MakeUrmaSymmetricLayout(int64_t world, int64_t tokens
         throw std::invalid_argument("Invalid URMA hidden dimension, CV height or route weight mode");
     if (windowed) {
         if ((world != 8 && world != 16 && world != 32) || tokens < 1 || tokens > kWindowTokens || topk < 1 ||
-            topk > kWindowMaxTopk || weightMode != 1)
-            throw std::invalid_argument("Windowed URMA requires EP8/16/32, W1..256, K1..32 and early weights");
+            topk > kWindowMaxTopk)
+            throw std::invalid_argument("Windowed URMA requires EP8/16/32, W1..256 and K1..32");
     } else if ((world != 4 && world != 8 && world != 16) || tokens < 1 || tokens > kMaxTokensPerRank || topk < 1 ||
                topk > 8) {
         throw std::invalid_argument("Full-batch URMA requires EP4/8/16, B1..16384 and K1..8");
