@@ -333,8 +333,8 @@ def run(args, config, group):
     )
     model = config["model"]
     mma_type = model.get("mma_type", "fp8xfp4")
-    if paired_weights and (mma_type != "fp8xfp4" or model["num_shared_experts"]):
-        raise ValueError("--paired-weights requires routed W4A8 with zero shared experts")
+    if paired_weights and (mma_type not in ("fp8xfp4", "fp8xfp8") or model["num_shared_experts"]):
+        raise ValueError("--paired-weights requires routed W4A8 or W8A8 with zero shared experts")
     storage_kind = "fp4" if mma_type == "fp4xfp4" else "fp8"
     if args.input != "bf16" and args.input != storage_kind:
         raise ValueError(f"{mma_type} buffered input must be {storage_kind}")
@@ -451,7 +451,7 @@ def run(args, config, group):
         raise RuntimeError("Timer requires a supported matrix mode and DEEPEP_MEGAMOE_TIMER=ON")
     activation_name = model.get("activation", "swiglu")
     raw = routed_weights(config, world, rank, paired=paired_weights)
-    prepared = transform_weights_for_mega_moe(*map(device_pair, raw), activation=activation_name)
+    prepared = transform_weights_for_mega_moe(*map(device_pair, raw), activation=activation_name, backend=backend)
     shared_raw, shared_kwargs = None, {}
     if model["num_shared_experts"]:
         shared_raw = make_weights(

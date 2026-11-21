@@ -454,14 +454,14 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     TORCH_CHECK(!windowed_ ||
                     (urma && shared_experts == 0 &&
                      ((activation_ == "gelu" && topk_weights_type == 1) ||
-                      (activation_ == "swiglu" && is_a8w4_ && topk_weights_type == 0 && (world == 16 || world == 32)))),
-                "Windowed MegaMoE requires URMA S0 with early GELU or EP16/EP32 W4A8 SwiGLU with Finalize weighting");
+                      (activation_ == "swiglu" && topk_weights_type == 0 && (world == 16 || world == 32)))),
+                "Windowed MegaMoE requires URMA S0 with early GELU or EP16/EP32 SwiGLU with Finalize weighting");
     TORCH_CHECK(timeout_seconds_ > 0 && timeout_seconds_ <= 3600, "Plan timeout_seconds must be in [1,3600]");
     TORCH_CHECK(!windowed_ || (world == 32 ? ranks_per_node == 16 : (ranks_per_node == 0 || ranks_per_node == world)),
                 "Windowed MegaMoE requires one host for EP8/16 or two contiguous 16-rank hosts for EP32");
     if (urma) {
         TORCH_CHECK(is_a8w4_ || (windowed_ && (world == 16 || world == 32)),
-                    "URMA routed FP8xFP8 requires windowed EP16/EP32 GELU without shared experts");
+                    "URMA routed FP8xFP8 requires windowed EP16/EP32 without shared experts");
         TORCH_CHECK(intermediate >= 256 && intermediate <= 16384 && intermediate % 256 == 0,
                     "URMA intermediate width must be divisible by 256, in [256,16384]");
         TORCH_CHECK(shared_experts == 0 || shared_experts == 1, "URMA supports S0/S1");

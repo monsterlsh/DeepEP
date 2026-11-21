@@ -59,6 +59,10 @@ def _urma_window_capacity(
         projections = 3 if activation == "swiglu" else 2
         elements = projections * local_experts * hidden * intermediate
         resident += (elements // 2 if mma_type == "fp8xfp4" else elements) + elements // 32
+        if activation == "swiglu" and mma_type == "fp8xfp8":
+            # The raw W1 is still live while its packed gate/up copy is prepared.
+            w1 = 2 * local_experts * hidden * intermediate
+            resident += w1 + w1 // 32
         # sort() produces int32 values and int64 indices during route preflight.
         resident += tokens * topk * 12
         sizes = (window_tokens,) if window_tokens is not None else (256, 128, 64)
@@ -194,12 +198,16 @@ class SymmBuffer:
 
         self._backend_name = select_backend(group)
         urma = self._backend_name == "urma"
-        urma_w8a8 = (
-            urma and size in (16, 32) and mma_type == "fp8xfp8"
-            and activation == "gelu" and num_shared_experts == 0
-        )
         if topk_weights_type is None:
             topk_weights_type = int(activation == "gelu")
+        urma_swiglu = (
+            urma and size in (16, 32) and activation == "swiglu"
+            and num_shared_experts == 0 and topk_weights_type == 0
+        )
+        urma_w8a8 = (
+            urma and size in (16, 32) and mma_type == "fp8xfp8"
+            and num_shared_experts == 0 and (activation == "gelu" or urma_swiglu)
+        )
         self._urma_windowed = self._windowed = urma_swiglu_windowed = False
         error = None
         try:
@@ -209,9 +217,10 @@ class SymmBuffer:
             if urma_window_tokens is not None:
                 integer("urma_window_tokens", urma_window_tokens, 1, 256)
             urma_swiglu_windowed = (
-                urma and size in (16, 32) and activation == "swiglu" and mma_type == "fp8xfp4"
-                and num_shared_experts == 0 and topk_weights_type == 0
-                and (size == 32 or num_topk > 8 or num_max_tokens_per_rank > 16384 or urma_window_tokens is not None)
+                urma_swiglu and (urma_w8a8 or (
+                    mma_type == "fp8xfp4"
+                    and (size == 32 or num_topk > 8 or num_max_tokens_per_rank > 16384 or urma_window_tokens is not None)
+                ))
             )
             self._urma_windowed = (
                 urma and size in (8, 16, 32) and activation == "gelu" and mma_type == "fp8xfp4"
@@ -246,9 +255,9 @@ class SymmBuffer:
             if urma and size not in (4, 8, 16, 32):
                 raise ValueError("URMA supports EP4/EP8/EP16/EP32")
             if urma and mma_type == "fp8xfp8" and not urma_w8a8:
-                raise ValueError("URMA W8A8 requires windowed EP16/EP32 GELU with zero shared experts")
+                raise ValueError("URMA W8A8 requires EP16/EP32 with zero shared experts and GELU or Finalize-weighted SwiGLU")
             if urma and size == 32 and not self._urma_windowed:
-                raise ValueError("URMA EP32 requires windowed GELU or W4A8 SwiGLU with Finalize weighting and zero shared experts")
+                raise ValueError("URMA EP32 requires windowed GELU or SwiGLU with Finalize weighting and zero shared experts")
             if urma_window_tokens is not None and not self._urma_windowed:
                 raise ValueError("urma_window_tokens requires a windowed URMA configuration")
             if mma_type != "fp8xfp4" and num_shared_experts:
@@ -281,8 +290,9 @@ class SymmBuffer:
             error = None if getattr(ext, "urma_w8a8_enabled", False) else "install a MegaMoE wheel with URMA W8A8 support"
             collective_check(group, "URMA W8A8 availability", error)
         if urma_swiglu_windowed:
-            error = None if getattr(ext, "urma_windowed_swiglu_enabled", False) else (
-                "install a MegaMoE wheel with windowed URMA SwiGLU support"
+            feature = "urma_w8a8_swiglu_enabled" if urma_w8a8 else "urma_windowed_swiglu_enabled"
+            error = None if getattr(ext, feature, False) else (
+                f"install a MegaMoE wheel with windowed URMA {mma_type} SwiGLU support"
             )
             collective_check(group, "Windowed URMA SwiGLU availability", error)
 
@@ -559,15 +569,22 @@ class _RoutedWeightPair(tuple):
         return tuple(self) if fused else self._planar
 
 
+class _UrmaMxSwiGluWeightPair(tuple):
+    """Contiguous ND FP8 weights and scales packed in gate128/up128 pairs."""
+
+
 def transform_weights_for_mega_moe(
-    l1_weights: WeightPair, l2_weights: WeightPair, activation: str = "swiglu", *, shared: bool = False
+    l1_weights: WeightPair, l2_weights: WeightPair, activation: str = "swiglu", *,
+    shared: bool = False, backend: str | None = None,
 ) -> tuple[WeightPair, WeightPair]:
-    """Convert raw Ascend packed weights to NZ once, without quantizing again.
+    """Prepare raw Ascend weights once, without quantizing again.
 
     Raw inputs use [gate | up]. Routed FP4 GMM1 prepares both planar Prefill and
     [gate128, up128] Decode layouts. Keep the returned l1 pair intact and immutable;
     the API selects its layout by actual BS without a timed conversion. Pass shared=True for
-    shared experts, whose GMM1 remains planar. FP8 and GMM2 keep their layout.
+    shared experts, whose GMM1 remains planar. For routed URMA FP8 SwiGLU, pass
+    backend="urma" to pack the same gate128/up128 tiles in ND, and keep the
+    returned l1 pair intact. Other FP8 weights keep their original layout.
     This is not the CUDA UTCCP transform. Old prepared FP4 routed weights must
     be regenerated from raw ND inputs; do not transform prepared NZ twice.
     """
@@ -576,8 +593,12 @@ def transform_weights_for_mega_moe(
 
     if activation not in ("swiglu", "gelu"):
         raise ValueError("activation must be 'swiglu' or 'gelu'")
+    if backend not in (None, "mte", "urma"):
+        raise ValueError("backend must be 'mte' or 'urma'")
     transformed = []
     for name, value in (("l1_weights", l1_weights), ("l2_weights", l2_weights)):
+        if isinstance(value, _UrmaMxSwiGluWeightPair):
+            raise ValueError(f"{name}: prepare from raw planar FP8 weights, not already packed gate/up weights")
         weight, scale = _pair(value, name)
         if weight.device.type != "npu" or scale.device != weight.device:
             raise ValueError("Move weights and scales to the same NPU before preparing")
@@ -599,8 +620,9 @@ def transform_weights_for_mega_moe(
         if scale.dtype != torch.float8_e8m0fnu or tuple(scale.shape) != expected:
             raise ValueError(f"{name}: expected E8M0 scales {expected} or raw packed int32 [E,N,K/128]")
         scale = scale.contiguous()
+        routed_swiglu = name == "l1_weights" and not shared and activation == "swiglu"
         if weight.dtype == torch.uint8:
-            if name == "l1_weights" and not shared and activation == "swiglu":
+            if routed_swiglu:
                 if weight.shape[1] % 256:
                     raise ValueError("Routed FP4 GMM1 requires gate/up widths divisible by 128")
                 # 两种布局一次准备；独立存储并启用版本计数，禁止原地修改后两份权重失配。
@@ -626,6 +648,13 @@ def transform_weights_for_mega_moe(
                 input_dtype=torch_npu.float4_e2m1fn_x2,
             )
             _check_fp4_weight_format(weight, name)
+        elif routed_swiglu and backend == "urma":
+            if weight.shape[1] % 256 or torch_npu.get_npu_format(weight) != 2:
+                raise ValueError("URMA FP8 SwiGLU GMM1 requires ND weights and gate/up widths divisible by 128")
+            weight = _interleave_gate_up_128(weight.view(torch.uint8)).view(torch.float8_e4m3fn)
+            scale = _interleave_gate_up_128(scale.view(torch.uint8)).view(torch.float8_e8m0fnu)
+            transformed.append(_UrmaMxSwiGluWeightPair((weight, scale)))
+            continue
         transformed.append((weight, scale))
     return tuple(transformed)
 
@@ -726,6 +755,11 @@ def _forward_inputs(
     expected_dtype = torch.uint8 if b.mma_type in {"fp8xfp4", "fp4xfp4"} else torch.float8_e4m3fn
     if w1.dtype != expected_dtype or w2.dtype != expected_dtype:
         raise TypeError("Weight dtype differs from buffer mma_type")
+    requires_packed_mx = urma and b.mma_type == "fp8xfp8" and b.activation == "swiglu"
+    if requires_packed_mx and not isinstance(l1_weights, _UrmaMxSwiGluWeightPair):
+        raise ValueError("Prepare URMA FP8 SwiGLU GMM1 with transform_weights_for_mega_moe(..., backend='urma')")
+    if not requires_packed_mx and isinstance(l1_weights, _UrmaMxSwiGluWeightPair):
+        raise ValueError("Packed FP8 SwiGLU GMM1 weights require the URMA FP8 SwiGLU buffer")
     prepared_inputs = ()
     if w1.dtype == torch.uint8:
         fused = b.activation == "swiglu" and b.mma_type == "fp8xfp4" and (

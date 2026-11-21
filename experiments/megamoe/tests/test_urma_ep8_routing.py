@@ -157,6 +157,17 @@ void checkTarget(uint32_t tokens, uint32_t topk, bool gelu)
         assert(c.selfRows == tokens * activeExperts);
         assert(c.fragmentCount == ((c.world * tokens + 255U) / 256U) * activeExperts);
         assert(c.gmm1Tiles == c.fragmentCount * c.intermediate / (gelu ? 256U : 128U));
+        const uint32_t factor = gelu ? 1U : 2U;
+        const uint32_t logicalTile = kComputeTileN / factor;
+        for (uint32_t tile = 0; tile < c.intermediate / logicalTile; ++tile) {
+            const auto columns = GetMxRoutedTileColumns(c, true, tile);
+            assert(columns.weightWidth == c.intermediate * factor);
+            assert(columns.weightColumn == tile * kComputeTileN && columns.weightColumns == kComputeTileN);
+            assert(columns.logicalColumn == tile * logicalTile && columns.logicalColumns == logicalTile);
+        }
+        const auto lastGmm2 = GetMxRoutedTileColumns(c, false, c.hidden / kComputeTileN - 1U);
+        assert(lastGmm2.weightWidth == c.hidden && lastGmm2.weightColumn == c.hidden - kComputeTileN);
+        assert(lastGmm2.logicalColumn == lastGmm2.weightColumn && lastGmm2.logicalColumns == kComputeTileN);
         assert(routes.outgoing[800] == tokens * topk);
         for (uint32_t cv = 0; cv < c.recvChunkCount; ++cv) {
             const uint32_t peer = PlanPeerForCv(cv, c, routes, false);

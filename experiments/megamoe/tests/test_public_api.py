@@ -461,6 +461,22 @@ def test_fp8_weights_remain_nd_without_fp4_format_cast(backend):
     assert not any(isinstance(event, tuple) and event[0] == "format_cast" for event in backend.events)
 
 
+def test_urma_fp8_swiglu_interleaves_weight_and_scale_rows_once(backend):
+    rows = np.repeat(np.arange(4, dtype=np.uint8), 128)
+    first = (Tensor(np.broadcast_to(rows[None, :, None], (1, 512, 64)).copy(), "float8_e4m3fn"),
+             Tensor(np.broadcast_to((rows + 120)[None, :, None, None], (1, 512, 1, 2)).copy(), "float8_e8m0fnu"))
+    second = (Tensor(np.zeros((1, 64, 256)), "float8_e4m3fn"),
+              Tensor(np.full((1, 64, 4, 2), 127), "float8_e8m0fnu"))
+    packed, gmm2 = api.transform_weights_for_mega_moe(first, second, backend="urma")
+    assert packed[0].npu_format == 2 and packed[0].is_contiguous() and packed[1].is_contiguous()
+    np.testing.assert_array_equal(packed[0].data[0, ::128, 0], [0, 2, 1, 3])
+    np.testing.assert_array_equal(packed[1].data[0, ::128, 0, 0], [120, 122, 121, 123])
+    np.testing.assert_array_equal(first[0].data[0, :, 0], rows)
+    assert gmm2[0] is second[0]
+    with pytest.raises(ValueError, match="already packed"):
+        api.transform_weights_for_mega_moe(packed, gmm2, backend="urma")
+
+
 @pytest.mark.parametrize("weight_format", [29, 50])
 def test_prepared_fp4_nz_variants_reach_launch(backend, weight_format):
     w1, w2 = weights()
@@ -829,13 +845,14 @@ def test_urma_gelu_uses_single_planar_projection_within_existing_limits(backend,
 
 
 @pytest.mark.parametrize("world", [16, 32])
-def test_urma_w8a8_gelu_uses_timer_only_on_first_window(backend, monkeypatch, world):
+@pytest.mark.parametrize("activation", ["gelu", "swiglu"])
+def test_urma_w8a8_uses_timer_only_on_first_window(backend, monkeypatch, world, activation):
     from deep_ep_experimental.megamoe import backend as selector
 
     monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
     monkeypatch.setattr(api, "_host_boot_id", lambda: "ab" * 16)
     group = backend.group_type(world)
-    model = dict(activation="gelu", mma_type="fp8xfp8")
+    model = dict(activation=activation, mma_type="fp8xfp8")
     local = 800 // world
     with pytest.raises(ValueError, match="install a MegaMoE wheel with URMA W8A8 support"):
         api.SymmBuffer(group, 800, 257, 25, 256, 256, **model)
@@ -846,6 +863,10 @@ def test_urma_w8a8_gelu_uses_timer_only_on_first_window(backend, monkeypatch, wo
 
     monkeypatch.setattr(backend.ext, "urma_w8a8_enabled", True, raising=False)
     monkeypatch.setattr(backend.ext, "urma_window_bytes", window_bytes)
+    if activation == "swiglu":
+        with pytest.raises(ValueError, match="windowed URMA fp8xfp8 SwiGLU support"):
+            api.SymmBuffer(group, 800, 257, 25, 256, 256, **model)
+        monkeypatch.setattr(backend.ext, "urma_w8a8_swiglu_enabled", True, raising=False)
     b = api.SymmBuffer(group, 800, 257, 25, 256, 256, **model)
     try:
         with monkeypatch.context() as uninstrumented_build:
@@ -857,21 +878,25 @@ def test_urma_w8a8_gelu_uses_timer_only_on_first_window(backend, monkeypatch, wo
         timer = b.allocate_timer()
         assert not timer.data.any()
 
-        weights = tuple(
-            (Tensor(np.zeros((local, 256, 256)), "float8_e4m3fn"),
-             Tensor(np.full((local, 256, 4, 2), 127), "float8_e8m0fnu"))
-            for _ in range(2)
+        raw = tuple(
+            (Tensor(np.zeros((local, columns, 256)), "float8_e4m3fn"),
+             Tensor(np.full((local, columns, 4, 2), 127), "float8_e8m0fnu"))
+            for columns in (512 if activation == "swiglu" else 256, 256)
         )
-        weights = api.transform_weights_for_mega_moe(*weights, activation="gelu")
+        weights = api.transform_weights_for_mega_moe(*raw, activation=activation, backend="urma")
         b.topk_idx.data[:] = np.arange(25)
         b.topk_weights.data.fill(1.0 / 25)
         b.x.data[:] = (np.arange(257) % 17)[:, None]
         y = Tensor(np.full((257, 256), -1), "bfloat16")
         stats = Tensor(np.full(local, 7), "int32")
+        if activation == "swiglu":
+            with pytest.raises(ValueError, match="Prepare URMA FP8 SwiGLU GMM1"):
+                api.fp8_fp4_mega_moe(y, *raw, b, activation=activation)
         assert api.fp8_fp4_mega_moe(
-            y, *weights, b, activation="gelu", cumulative_local_expert_recv_stats=stats, timer=timer,
+            y, *weights, b, activation=activation, cumulative_local_expert_recv_stats=stats, timer=timer,
         ) is None
-        assert b._plan.windowed and b._plan.mma_type == "fp8xfp8" and b._plan.topk_weights_type == 1
+        assert b._plan.windowed and b._plan.mma_type == "fp8xfp8"
+        assert b._plan.topk_weights_type == int(activation == "gelu")
         launches = native_launches(backend)
         assert [launch[0].shape[0] for launch in launches] == [256, 1]
         assert [launch[8] for launch in launches] == [timer, None]

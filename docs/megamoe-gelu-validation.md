@@ -355,7 +355,7 @@ for route in balanced skewed; do
 done
 ```
 
-UBX 使用统一入口的 `compare`。先交替跑正式端到端配对作业，再自动采集两侧同一组 rank 的首窗设备 timer，最后出 `comparison.json`。W4A8 支持 EP16/EP32、K1–32、每卡 B1–65536，以 `--window-tokens` 固定两侧取窗。W8A8 记录 GELU 绝对值及 SwiGLU 基线阻塞原因。详细流程见 [UBX 性能对照](../experiments/megamoe/README.md#ubx-gelu-与-swiglu-性能对照)。
+UBX 使用统一入口的 `compare`。先交替跑正式端到端配对作业，再自动采集两侧同一组 rank 的首窗设备 timer，最后出 `comparison.json`。W4A8 和 W8A8 支持 EP16/EP32、K1–32、每卡 B1–65536，以 `--window-tokens` 固定两侧取窗。详细流程见 [UBX 性能对照](../experiments/megamoe/README.md#ubx-gelu-与-swiglu-性能对照)。
 
 ```bash
 UBX="$REPO/experiments/megamoe/scripts/run_ubx_gelu.py"

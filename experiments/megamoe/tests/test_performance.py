@@ -298,13 +298,14 @@ def test_packaged_ep8_gelu_topk25_case_crosses_a_window():
     assert min(config["bs_values"]) < 256 < max(config["bs_values"])
 
 
-def test_paired_perf_weight_fixture_shares_swiglu_gate_and_gmm2():
+@pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8"])
+def test_paired_perf_weight_fixture_shares_swiglu_gate_and_gmm2(mma_type):
     import numpy as np
 
     from deep_ep_experimental.megamoe.benchmark import routed_weights
     from deep_ep_experimental.megamoe.reference import make_weights
 
-    model = dict(num_experts=8, hidden=64, intermediate_hidden=64, mma_type="fp8xfp4")
+    model = dict(num_experts=8, hidden=64, intermediate_hidden=64, mma_type=mma_type)
     gelu = {"model": dict(model, activation="gelu"), "seed": 123}
     swiglu = {"model": dict(model, activation="swiglu"), "seed": 123}
     gelu_w1, gelu_w2 = routed_weights(gelu, 4, 3, paired=True)
@@ -315,8 +316,7 @@ def test_paired_perf_weight_fixture_shares_swiglu_gate_and_gmm2():
     for actual, original in zip(gelu_w2, swi_w2):
         np.testing.assert_array_equal(actual, original)
 
-    gelu["model"]["mma_type"] = "fp8xfp8"
-    expected = make_weights(2, 64, 64, 126, "gelu", "fp8xfp8")
+    expected = make_weights(2, 64, 64, 126, "gelu", mma_type)
     for actual_pair, expected_pair in zip(routed_weights(gelu, 4, 3), expected):
         for actual, array in zip(actual_pair, expected_pair):
             np.testing.assert_array_equal(actual, array)

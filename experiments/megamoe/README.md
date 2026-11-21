@@ -120,15 +120,19 @@ python3 "$UBX" --mode compare --ep-size 32 --plan
 # 在主节点测 EP32/K25/B39280 的 W4A8 A/B。
 python3 "$UBX" --mode compare --precision a8w4 --ep-size 32 --output-dir /shared/ubx-ep32-k25-compare
 
-# 单独测 W8A8。
+# 双机测 W8A8 的 GELU/SwiGLU 配对。
 python3 "$UBX" --mode compare --precision w8a8 --ep-size 32 --output-dir /shared/ubx-ep32-k25-w8a8
+
+# 先验证 W8A8 SwiGLU 的满窗、尾窗和 timer 前后一致性。
+CHECK_TOKENS=8 python3 "$UBX" accuracy w8a8 --ep-size 32 --comparison-arm swiglu \
+  --bs 257 --timer --output-dir /shared/ubx-ep32-swiglu-w8a8-check
 
 # 单机测 EP16/K25/B39280 的 W4A8 A/B。
 python3 "$UBX" --mode compare --precision a8w4 --ep-size 16 \
   --output-dir /shared/ubx-ep16-k25-w4a8-compare --require-no-regression
 ```
 
-W4A8 的 A、B 两侧都走分窗 UBX，覆盖 EP16/EP32、K1–32、每卡 B1–65536、零共享专家。默认统一用 W256，HBM 预算不足时可用 `--window-tokens 128` 或 `--window-tokens 64` 重跑，两侧使用同一窗口大小。W8A8 的对照仍采 GELU 绝对数据，SwiGLU 标为 `BLOCKED`。`--require-no-regression` 在退化、证据不全或基线缺失时返回非零。用 `ROUTING=skewed` 或 `--config target_gelu_k32` 另起目录测其他组。
+W4A8 和 W8A8 的 A、B 两侧都走分窗 UBX，覆盖 EP16/EP32、K1–32、每卡 B1–65536、零共享专家。默认统一用 W256，HBM 预算不足时可用 `--window-tokens 128` 或 `--window-tokens 64` 重跑，两侧使用同一窗口大小。W8A8 SwiGLU 在准备阶段将 W1 的 gate/up 按 128 列交错存放，运行时每个 GMM1 tile 一次提交两段权重。`--require-no-regression` 在退化、证据不全或基线缺失时返回非零。用 `ROUTING=skewed` 或 `--config target_gelu_k32` 另起目录测其他组。
 
 双机用独立输出盘时，把节点 1 本轮目录复制到汇总机器，再通过同一入口汇总：
 
@@ -231,7 +235,7 @@ buffer = SymmBuffer(
 MTE 约束：EP=2～128，E 可被 EP 整除且每卡最多 128 个路由专家；S=0～8；B=1～65536；
 H=1024～8192 且为64的倍数，I=256～4096 且为128的倍数，1≤K≤min(32,E)。
 各 rank 必须同序、同 B 调用；仅推理，不支持反向、空/不等长 B 或图捕获。
-`mma_type="fp8xfp8"` 使用 FP8 E4M3 路由权重。UBX 上该精度用于零共享专家的分窗 GELU EP16 单机与 EP32 双机，传入连续 ND 权重 `[L,N,K]` 及 E8M0 scale `[L,N,K/64,2]`。启用 `DEEPEP_MEGAMOE_TIMER=ON` 的 wheel 支持该模式的设备打点。benchmark 从配置文件的 `model.mma_type` 读取矩阵乘精度。
+`mma_type="fp8xfp8"` 使用 FP8 E4M3 路由权重。UBX EP16/EP32 支持零共享专家的分窗 GELU 和 SwiGLU，权重为连续 ND `[L,N,K]`，E8M0 scale 为 `[L,N,K/64,2]`。直接调用 API 时，SwiGLU 的 W1 传入原始 `[gate | up]` 给 `transform_weights_for_mega_moe(..., activation="swiglu", backend="urma")`，并保留它返回的完整 W1 权重对。启用 `DEEPEP_MEGAMOE_TIMER=ON` 的 wheel 支持设备打点。benchmark 从配置文件的 `model.mma_type` 读取矩阵乘精度。
 
 兼容入口 `mega_moe(x, ids, weights, w1, w2, buffer, ...)` 返回 `(y, per_call_counts)`。
 接口签名参照 DeepGEMM `78b6900`。本实现使用 int32 路由 ID、E8M0 输入 scale，

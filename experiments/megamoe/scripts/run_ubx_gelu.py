@@ -108,7 +108,8 @@ def parse_args(argv):
                         help="离线汇总时传入另一节点复制出的同一次运行目录")
     parser.add_argument("--require-no-regression", action="store_true",
                         help="compare 有退化、证据不全或基线不支持时返回非零")
-    parser.add_argument("--comparison-arm", choices=WEIGHT_MODE, help=argparse.SUPPRESS)
+    parser.add_argument("--comparison-arm", choices=WEIGHT_MODE,
+                        help="在 accuracy 或 perf 中单测 GELU 提前加权或 SwiGLU Finalize 加权")
     parser.add_argument("--perf-scope", choices=("all", "host", "timer"), default="all", help=argparse.SUPPRESS)
     parser.add_argument("--paired-weights", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -197,20 +198,11 @@ def parse_args(argv):
     args.perf_precisions = wanted if args.mode == "compare" else ()
     if args.mode in ("perf", "both"):
         args.perf_precisions = wanted if args.precision else ("w4a8",)
-    if args.comparison_arm == "swiglu" and (
-        args.mode != "perf" or len(args.perf_precisions) != 1
-        or swiglu_unavailable(args.perf_precisions[0])
-    ):
-        parser.error("SwiGLU 基线需要 UBX EP16/EP32 W4A8")
+    if args.comparison_arm is not None and args.mode not in ("accuracy", "perf"):
+        parser.error("--comparison-arm 用于单测 accuracy 或 perf")
     if args.window_tokens is not None and args.mode != "compare" and not args.paired_weights:
         parser.error("--window-tokens 用于 compare")
     return args
-
-
-def swiglu_unavailable(precision):
-    if precision != "w4a8":
-        return "当前 UBX W8A8 只支持分窗 GELU，缺少原生 SwiGLU 后置加权实现"
-    return None
 
 
 def ubx_timer_ranks(ep_size):
@@ -230,22 +222,17 @@ def comparison_plan(args):
     cases = []
     pairs = args.pairs or 8
     for precision in args.perf_precisions:
-        blocked = swiglu_unavailable(precision)
         base = f"comparison/{precision}"
-        arms = ("gelu",) if blocked else tuple(WEIGHT_MODE)
-        pair_runs = []
-        if not blocked:
-            for index in range(pairs):
-                pair_runs.append(dict(
-                    pair=index,
-                    **{arm: f"{base}/pairs/{index:02d}/{arm}/perf-{precision}" for arm in pair_order(index)},
-                ))
+        pair_runs = [
+            dict(pair=index, **{arm: f"{base}/pairs/{index:02d}/{arm}/perf-{precision}" for arm in pair_order(index)})
+            for index in range(pairs)
+        ]
         cases.append(dict(
             precision=precision,
             pairs=pair_runs,
-            absolute={"gelu": f"{base}/absolute/gelu/perf-{precision}"} if blocked else {},
-            timer={arm: f"{base}/timer/{arm}/perf-{precision}" for arm in arms},
-            blocked={"swiglu": blocked} if blocked else {},
+            absolute={},
+            timer={arm: f"{base}/timer/{arm}/perf-{precision}" for arm in WEIGHT_MODE},
+            blocked={},
         ))
     return dict(
         schema="ubx_ab_plan_v1", ep_size=args.ep_size, bs=args.bs, routing=args.routing, config=config,
@@ -506,7 +493,7 @@ def run_comparison(args, env, python, check_device):
         job.comparison_arm = arm
         job.perf_scope = scope
         job.timer = scope == "timer"
-        job.paired_weights = not case["blocked"]
+        job.paired_weights = True
         precision = case["precision"]
         job.perf_precisions = (precision,)
         if job.node_rank is None:
@@ -516,13 +503,9 @@ def run_comparison(args, env, python, check_device):
             run_case(python, env, job, "perf", precision, config_for(job, precision))
 
     for case in plan["cases"]:
-        for arm, reason in case["blocked"].items():
-            print(f"[COMPARE] {case['precision']} {arm} BLOCKED: {reason}", flush=True)
         for pair in case["pairs"]:
             for arm in pair_order(pair["pair"]):
                 run_job(case, arm, pair[arm], "host")
-        for arm, relative in case["absolute"].items():
-            run_job(case, arm, relative, "host")
     for case in plan["cases"]:
         for arm, relative in case["timer"].items():
             run_job(case, arm, relative, "timer")

@@ -16,6 +16,7 @@ PYBIND11_MODULE(_C, module)
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.attr("urma_ep8_window_tokens") = MegaMoeUrma::kWindowTokens;
     module.attr("urma_w8a8_enabled") = true;
+    module.attr("urma_w8a8_swiglu_enabled") = true;
     module.attr("urma_windowed_swiglu_enabled") = true;
     module.def("buffer_size", &deepep::megamoe::buffer_size, py::arg("world"), py::arg("experts"), py::arg("tokens"),
                py::arg("topk"), py::arg("hidden"), py::arg("backend") = "mte", py::arg("topk_weights_type") = 0,

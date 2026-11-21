@@ -41,7 +41,7 @@ def test_ep16_compare_runs_ab_then_ba_before_separate_timers(tmp_path, monkeypat
         scope = args.perf_scope
         assert mode == "perf" and args.ep_size == 16 and args.bs == 64
         assert args.timer == (scope == "timer")
-        assert args.paired_weights == (precision == "w4a8")
+        assert args.paired_weights
         assert spec["warmup"] >= 2
         assert spec["model"] == dict(
             template, activation=arm, mma_type=launcher.MMA_TYPES[precision], num_topk=8,
@@ -72,16 +72,20 @@ def test_ep16_compare_runs_ab_then_ba_before_separate_timers(tmp_path, monkeypat
         ("w4a8", "host", "swiglu", "comparison/w4a8/pairs/00/swiglu"),
         ("w4a8", "host", "swiglu", "comparison/w4a8/pairs/01/swiglu"),
         ("w4a8", "host", "gelu", "comparison/w4a8/pairs/01/gelu"),
-        ("w8a8", "host", "gelu", "comparison/w8a8/absolute/gelu"),
+        ("w8a8", "host", "gelu", "comparison/w8a8/pairs/00/gelu"),
+        ("w8a8", "host", "swiglu", "comparison/w8a8/pairs/00/swiglu"),
+        ("w8a8", "host", "swiglu", "comparison/w8a8/pairs/01/swiglu"),
+        ("w8a8", "host", "gelu", "comparison/w8a8/pairs/01/gelu"),
         ("w4a8", "timer", "gelu", "comparison/w4a8/timer/gelu"),
         ("w4a8", "timer", "swiglu", "comparison/w4a8/timer/swiglu"),
         ("w8a8", "timer", "gelu", "comparison/w8a8/timer/gelu"),
+        ("w8a8", "timer", "swiglu", "comparison/w8a8/timer/swiglu"),
         "report",
     ]
 
 
 @pytest.mark.parametrize("world", [16, 32])
-def test_target_k25_plans_w4a8_pairing_without_execution(tmp_path, monkeypatch, capsys, world):
+def test_target_k25_plans_both_precisions_without_execution(tmp_path, monkeypatch, capsys, world):
     output = tmp_path / "planned"
     monkeypatch.delenv("PYTHON")
 
@@ -98,19 +102,16 @@ def test_target_k25_plans_w4a8_pairing_without_execution(tmp_path, monkeypatch, 
     assert plan["ep_size"] == world and plan["config"]["model"]["num_topk"] == 25
     assert plan["bs"] == 39280 and plan["window_tokens"] == 256
     assert plan["timer_ranks"] == list(range(0, world, 4))
-    w4a8, w8a8 = plan["cases"]
-    assert w4a8["precision"] == "w4a8" and w8a8["precision"] == "w8a8"
-    assert len(w4a8["pairs"]) == 8 and set(w4a8["timer"]) == {"gelu", "swiglu"}
-    assert not w4a8["absolute"] and not w4a8["blocked"]
-    assert not w8a8["pairs"] and w8a8["blocked"]["swiglu"]
-    assert list(w8a8["absolute"]) == ["gelu"] and list(w8a8["timer"]) == ["gelu"]
+    assert [case["precision"] for case in plan["cases"]] == ["w4a8", "w8a8"]
+    for case in plan["cases"]:
+        assert len(case["pairs"]) == 8 and set(case["timer"]) == {"gelu", "swiglu"}
+        assert not case["absolute"] and not case["blocked"]
     assert not output.exists()
 
 
 @pytest.mark.parametrize("precision", ["w4a8", "w8a8"])
 def test_ep32_compare_forwards_arm_scope_and_topk_to_both_nodes(tmp_path, monkeypatch, precision):
     events = []
-    paired = precision == "w4a8"
 
     def run_case(python, env, args, mode, launched_precision, config):
         model = json.loads(config.read_text(encoding="utf-8"))["model"]
@@ -119,8 +120,8 @@ def test_ep32_compare_forwards_arm_scope_and_topk_to_both_nodes(tmp_path, monkey
         assert args.topk == model["num_topk"] == 25
         assert model["topk_weights_type"] == int(model["activation"] == "gelu")
         assert args.timer == (args.perf_scope == "timer")
-        assert args.paired_weights is paired
-        assert args.window_tokens == (128 if paired else None)
+        assert args.paired_weights
+        assert args.window_tokens == 128
         events.append((args.perf_scope, model["activation"], args.node_rank))
 
     def run_stage(label, scripts, logs, *, ssh_target, ssh_port):
@@ -139,9 +140,9 @@ def test_ep32_compare_forwards_arm_scope_and_topk_to_both_nodes(tmp_path, monkey
     assert launcher.cli([
         "compare", precision, "--ep-size", "32", "--node-ip", "192.0.2.1", "192.0.2.2",
         "--ssh-user", "tester", "--topk", "25", "--bs", "39280", "--pairs", "2",
-        *(["--window-tokens", "128"] if paired else []),
+        "--window-tokens", "128",
         "--output-dir", str(tmp_path),
     ]) == 0
     jobs = [("host", "gelu"), ("host", "swiglu"), ("host", "swiglu"), ("host", "gelu"),
-            ("timer", "gelu"), ("timer", "swiglu")] if paired else [("host", "gelu"), ("timer", "gelu")]
+            ("timer", "gelu"), ("timer", "swiglu")]
     assert events == [(scope, arm, rank) for scope, arm in jobs for rank in (0, 1)]

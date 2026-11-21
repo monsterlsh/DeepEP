@@ -88,6 +88,25 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm1LogicalTileN(const Config& c)
                                                                                            : kGmm1LogicalTileN;
 }
 
+struct MxRoutedTileColumns {
+    uint32_t weightWidth, weightColumn, weightColumns;
+    uint32_t logicalColumn, logicalColumns;
+};
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr MxRoutedTileColumns GetMxRoutedTileColumns(
+    const Config& c, bool gmm1, uint32_t tile)
+{
+    const uint32_t width = gmm1 ? c.intermediate : c.hidden;
+    const uint32_t tileN = gmm1 ? Gmm1LogicalTileN(c) : kComputeTileN;
+    const uint32_t factor = kComputeTileN / tileN;
+    const uint32_t column = tile * tileN;
+    const uint32_t remaining = width - column;
+    const uint32_t columns = remaining < tileN ? remaining : tileN;
+    // The SwiGLU W1 packs two consecutive 128-column projections per tile.
+    // The activation and FIX trace identify the tile in logical output columns.
+    return {width * factor, column * factor, columns * factor, column, columns};
+}
+
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t CommunicationWorkers(uint32_t world)
 {
     // EP32 assigns two independently progressed QPs to each of 15 AIV1s,

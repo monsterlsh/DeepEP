@@ -275,17 +275,16 @@ __aicore__ inline void RunRoutedMxCompute(const Arguments& args, uint32_t block,
             WaitComputeFlag(args.inputScaleDone, item.group, 1U);
         else
             WaitComputeFlag(args.activationDone, item.group, FragmentGmm1Tiles(args, fragment));
-        const uint32_t n = item.gmm1 ? args.config.intermediate : args.config.hidden;
         const uint32_t k = item.gmm1 ? args.config.hidden : args.config.intermediate;
-        const uint32_t column = item.tile * kComputeTileN;
-        const uint32_t columns = n - column < kComputeTileN ? n - column : kComputeTileN;
+        const auto columns = GetMxRoutedTileColumns(args.config, item.gmm1, item.tile);
         const auto addresses = item.gmm1 ? Gmm1Addresses<true>(args, fragment) : Gmm2Addresses<true>(args, fragment);
-        const auto meta = ComputeTileTraceMeta(FragmentTraceMeta(fragment, item.group), 0U, column, fragment.rows, columns);
+        const auto meta = ComputeTileTraceMeta(FragmentTraceMeta(fragment, item.group), 0U, columns.logicalColumn,
+                                               fragment.rows, columns.logicalColumns);
         const auto phase = item.gmm1 ? Phase::Gmm1 : Phase::Gmm2;
         timer.Begin(phase);
         completion.Acquire();
         const auto start = timer.TraceBegin();
-        pipeline.Compute(addresses, fragment.rows, n, k, column, columns);
+        pipeline.Compute(addresses, fragment.rows, columns.weightWidth, k, columns.weightColumn, columns.weightColumns);
         const auto end = timer.TraceBegin();
         completion.Commit();
         if (end != 0U) {
