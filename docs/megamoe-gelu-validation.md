@@ -67,11 +67,11 @@ bash experiments/megamoe/scripts/build_ubx.sh
 
 核对本机 CANN 安装路径时，运行 `bash experiments/megamoe/scripts/find_cann_env.sh`。默认从 `/` 扫描，也可传入一个或多个安装根目录。扫描会显示 UBX 配置路径是否可读，并把通过 Bash 语法检查的 CANN 候选输出为可复制的 `source` 命令。
 
-构建脚本将 wheel 安装到 `py311_tpr`，打印 wheel 路径和 SHA-256。默认拉取锁定的 CATLASS 提交。已有匹配的 CATLASS 检出时可设置 `CATLASS_ROOT`，重复构建时可复用 CMake 缓存。
+构建脚本将 wheel 安装到 `py311_tpr`，打印 wheel 路径和 SHA-256。首次使用时初始化 `third-party/catlass`，后续使用同一路径上的锁定检出，保留 CMake 增量构建缓存。CATLASS 是编译时头文件，可通过 `CATLASS_ROOT` 指定匹配的已有检出。同一仓库内经 `build_ubx.sh` 启动的构建会串行使用这些产物。
 
 `build_ubx.sh` 默认使用仓内锁定的 SHMEM 子模块。`SHMEM_ROOT` 指向外部 SDK 且其 `deepep-sdk.json` 记录的提交与 `dependencies.lock.json` 一致时，脚本沿用该路径，再执行原有的 SDK 校验。如果路径无效、清单无法读取或提交不符，脚本会提示原因并改用仓内 SDK。`SHMEM_ROOT` 指向仓内 `third-party/shmem/install/shmem` 时也走子模块流程，校验已有产物的构建身份。
 
-仓内 SDK 已有产物且构建身份与当前环境不符时，脚本会报错并保留现有产物。需要重建时，先停止使用该 SDK 的作业，再执行下面的命令。`--rebuild-shmem` 始终选择仓内子模块并重建 SDK，即使终端已设置 `SHMEM_ROOT`。
+仓内 SDK 的构建身份及文件校验通过后，脚本直接复用，即使已清理 SHMEM 的 CMake 中间目录。构建身份与当前环境不符时会报错并保留已有产物。需要重建时，先停止使用该 SDK 的作业，再执行下面的命令。`--rebuild-shmem` 始终选择仓内子模块并重建 SDK，即使终端已设置 `SHMEM_ROOT`。
 
 ```bash
 bash experiments/megamoe/scripts/build_ubx.sh --rebuild-shmem
@@ -83,7 +83,9 @@ bash experiments/megamoe/scripts/build_ubx.sh --rebuild-shmem
 bash experiments/megamoe/scripts/build_ubx.sh --latest-shmem
 ```
 
-`--latest-shmem` 将当前 DeepEP `HEAD` 的已提交源码复制到新的 `dist/shmem-latest-*/` 试编目录，拉取官方 SHMEM 默认分支，并把解析出的实际提交及其头文件哈希写入试编目录的依赖锁文件。每次试编都从该 SHMEM 提交构建 SDK，试编目录保留源码和构建日志。脚本将 wheel 安装到 `py311_tpr`，并打印 wheel 路径和 SHA-256。`--latest-shmem` 与 `--rebuild-shmem` 互斥。
+`--latest-shmem` 将当前 DeepEP `HEAD` 的已提交源码复制到新的 `dist/shmem-latest-*/` 试编目录，并把官方 SHMEM 默认分支的实际提交及其头文件哈希写入试编目录的依赖锁文件。每轮在该目录独立保存源码、构建日志和 wheel。SHMEM 检出及 SDK 保存在 `dist/ubx-dependencies/shmem/`，按 SHMEM 提交和 CANN 环境缓存。`--latest-shmem` 与 `--rebuild-shmem` 互斥。
+
+试编使用 `dist/ubx-dependencies/latest-native/` 下固定的 CMake 源码和构建目录。相同配置下重复构建或只改 Python 测试时，可直接复用已包含 CATLASS 模板的内核。Wave 和 URMA 分别跟踪各自的内核源码和头文件，修改一方的专用头只触发该内核重编。修改共享内核头或 CATLASS 头会触发两者重编，切换 SHMEM 版本或工具链会选择对应的构建缓存。
 
 分步构建时，在已初始化 Conda 的 Bash 中运行下列命令，然后执行第 2.3 节。其他 UBX 节点可用同一段命令准备安装环境。
 
@@ -236,6 +238,58 @@ LAUNCH=(python -m torch.distributed.run --nnodes="$NODES" --nproc-per-node="$LOC
   --routing "$ROUTE" --check-tokens "$CHECK" --dual-reference --golden-dir "$RUN/golden" --output-dir "$RUN/accuracy"
 ```
 
+### 4.1 EP32 验收清单
+
+上面的手工命令可用 UBX 统一入口代替。在节点 0（默认 `90.90.93.84`）启动，脚本通过免密 SSH 拉起节点 1（默认 `90.90.93.184`）。设置 `--node-ip NODE0 NODE1` 可覆盖地址。
+
+```bash
+export RUN_DIR=/shared/megamoe-accept/ep32-k25-$(date +%s)
+python3 experiments/megamoe/scripts/run_ubx_gelu.py accuracy all \
+  --ep-size 32 --config target_gelu_k25 --output-dir "$RUN_DIR"
+```
+
+逐节点运行时分别传 `--node-rank 0/1`，两台使用相同的 `--master-addr` 和 `--output-dir`。精度轮等两台的 `--stage prepare` 都成功后，再在两台执行 `--stage run`。性能轮只需 `--stage run`，用 `perf w8a8` 或 `perf w4a8` 指定精度。完整命令见 [MegaMoE 使用说明](../experiments/megamoe/README.md#ubx-gelu-精度与性能)。
+
+脚本等待两边各自完成 16 个 rank 的 Golden，再以 `--nnodes=2 --nproc-per-node=16` 启动同一轮，结束时核对每台首个 rank 的 manifest。EP32 的 A8W4 与 A8W8 均要求窗口化 GELU 和零共享专家。A8W8 的权重占双倍显存，对称区大小以协商结果为准。默认按配置使用提前加权（GELU 后、量化前），`--weighting late` 可切回 Finalize 加权。`--output-dir` 在两台使用相同绝对路径，各节点输出盘可以独立。
+
+前置条件：
+
+- [ ] 两台 UBX 均 16 张可见 NPU，板型 0x44，CPU 与 NPU 空闲
+- [ ] 两台安装同一 wheel，`sha256sum` 一致，`_C.api_protocol == 13`
+- [ ] 两台 CANN / 驱动 / Torch / torch_npu 版本一致
+- [ ] 节点 0 的 `MASTER_ADDR` 与 SHMEM endpoint 可从节点 1 访问，torchrun 端口和 SHMEM 端口互不冲突
+- [ ] 主节点到节点 1 的 ssh 免密可用（`--node-ip` 模式），`REMOTE_USER` / `REMOTE_PORT` 按需设置
+- [ ] 跑 A8W8 前确认 wheel 带 URMA W8A8，脚本会在设备检查阶段拦截
+- [ ] 记录 Git SHA、wheel SHA-256、各机板型与设备序列号
+
+每轮固定 B39280、`CHECK_TOKENS=0` 全量，按配置 × 路由 × 精度分别执行：
+
+- [ ] K25 + balanced：A8W4 accuracy 与 perf
+- [ ] K32 + balanced：A8W4 accuracy 与 perf
+- [ ] K25 + balanced：A8W8 accuracy 与 perf
+- [ ] K32 + balanced：A8W8 accuracy
+- [ ] K25 + skewed：A8W4 与 A8W8 accuracy（热点路由）
+- [ ] K32 + skewed：A8W4 与 A8W8 accuracy
+- [ ] K25 + balanced：A8W4 `--weighting late` accuracy 与 perf（Finalize 对照组）
+
+逐项判据：
+
+| 检查 | 通过条件 | 位置 |
+| --- | --- | --- |
+| 后端、规模和精度 | `backend=urma`、`ep_size=32`、`mma_type=fp8xfp4`（W4A8）或 `fp8xfp8`（W8A8） | 两台 `rank_<r>/manifest.json` |
+| 精度 | 32 个 rank 的 `passed`、`finite`、`counts_equal` 全为 true | `rank_<r>/bs_39280/accuracy.json` |
+| 级联双参考 | 设 `DUAL_REFERENCE=1` 时 `cascade_*` 与 `triangle_metrics` 全部通过 | 同上 |
+| 专家计数 | K25 均衡下每卡 25 个专家各接收 39,280 次，合计 982,000；K32 不整除，按 `counts_equal` 判定 | 同上 |
+| 窗口 | `windows_per_forward` 与协商 W 下的满窗/尾窗一致（W256 为 153 + 112 行） | `rank_0/bs_39280/resources.json` |
+| 显存 | 对称区与工作区不超过实测空闲 HBM | 同上 |
+| 性能 | 记录 kernel、同步端到端均值与全组吞吐，只留基线不设门槛 | `rank_0/bs_39280/performance.json` |
+
+产物与证据：
+
+- [ ] 两台各自的 `golden-<精度>-node{0,1}.log`、`accuracy-<精度>-node{0,1}.log`、`perf-<精度>-node{0,1}.log`
+- [ ] 协商出的 W、窗口数和 `symmetric_buffer_bytes`
+- [ ] 结论写入第 6 节实测记录，并注明失败的配置与首个错误行
+
 ## 5. 性能与复核
 
 单机时将 `LAUNCH` 设为下例的单机命令；多机沿用上一节的数组。保持板型、EP、路由、B、输入、窗口和 warmup/iters 一致。以下性能入口独立于 Golden。
@@ -266,7 +320,7 @@ fi
 
 ### GELU 与 SwiGLU 的性能门槛
 
-在同一组空闲卡上固定 EP、每卡 B、K、H、激活后的 I、输入精度和路由，使用同一份 wheel。SwiGLU 的 GMM1 输出宽度为 2I，GELU 为 I，GMM2 都是 I→H。产品基线使用 SwiGLU 原有的 Finalize 加权，GELU 使用量化前加权。每种路由分别测量，均衡与热点各自给结论。
+在同一组空闲卡上固定 EP、每卡 B、K、H、激活后的 I、输入精度和路由，使用同一份 wheel。SwiGLU 的 GMM1 输出宽度为 2I，GELU 为 I，GMM2 都是 I→H。SwiGLU 使用原有的 Finalize 加权，GELU 默认使用量化前加权；GELU 也可用 `topk_weights_type=0`（脚本 `--weighting late`）回到 Finalize 加权做对照。每种路由分别测量，均衡与热点各自给结论。
 
 主判据是 **GELU / SwiGLU 的成对端到端时延比 ≤ 1**。每次从公开调用开始，到设备同步完成为止，先取本轮最慢 rank，再汇总配对轮次。预热、权重变换和计划准备在计时之外。用各窗 kernel 时长之和定位差异；输入检查、窗口间的专家计数累加和通信等待也会影响应用时延。
 

@@ -6,8 +6,9 @@ FP32_MAX = float.fromhex('0x1.fffffep+127')
 
 
 def prequant_route_weight(model):
-    """GELU is always early-weighted; SwiGLU retains its explicit mode 0/1 contract."""
-    return model.get("activation", "swiglu") == "gelu" or model.get("topk_weights_type", 0) == 1
+    """显式 topk_weights_type 优先；未指定时 GELU 默认提前加权，SwiGLU 默认 Finalize 加权。"""
+    default = 1 if model.get("activation", "swiglu") == "gelu" else 0
+    return model.get("topk_weights_type", default) == 1
 
 
 def normalize_clamp(value=None):

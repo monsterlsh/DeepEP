@@ -128,6 +128,7 @@ def save(directory, spec, rank, output, counts, selected):
 def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
     """Compute a node's source ranks together; bound dense weights by worker count."""
     import numpy as np
+    from . import numerics
     from .benchmark import inputs
     from .reference import bf16, dequantize_activation, expert_forward, make_weights, quantize_activation, unpack_weight
 
@@ -137,6 +138,7 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
         raise ValueError("Golden source rank exceeds EP size")
     model, bs, world = spec["model"], spec["bs"], spec["world"]
     activation, mma_type = model.get("activation", "swiglu"), model.get("mma_type", "fp8xfp4")
+    early_weight = numerics.prequant_route_weight(model)
     local = model["num_experts"] // world
     selected = token_indices(bs, spec["check_tokens"])
     counts = np.zeros(model["num_experts"], dtype=np.int64)
@@ -190,19 +192,17 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
         result = np.empty((len(token), model["hidden"]), dtype=np.float32)
         for start in range(0, len(token), chunk_tokens):
             stop = start + chunk_tokens
-            early_weight = route_weight is not None and (
-                activation == "gelu" or model.get("topk_weights_type", 0) == 1
-            )
+            early = early_weight and route_weight is not None
             result[start:stop] = expert_forward(
                 x[token[start:stop]],
                 w1,
                 w2,
                 model.get("activation_clamp"),
-                route_weight[start:stop] if early_weight else None,
+                route_weight[start:stop] if early else None,
                 activation,
                 mma_type,
             )
-        if route_weight is not None and activation != "gelu" and model.get("topk_weights_type", 0) == 0:
+        if route_weight is not None and not early_weight:
             result *= route_weight[:, None]
         return token, result
 

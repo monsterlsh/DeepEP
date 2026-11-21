@@ -45,7 +45,7 @@ def build(root=ROOT, *, rebuild_shmem=False):
                 raise ValueError(f"{name} must be an existing dependency directory")
             env[name] = str(path.resolve())
     if beta == "ON" and "CATLASS_ROOT" not in env:
-        raise RuntimeError("MegaMoE requires explicit CATLASS_ROOT; CATLASS is no longer a submodule")
+        raise RuntimeError("Set CATLASS_ROOT to the initialized CATLASS submodule or a matching external checkout")
     if rebuild_shmem and "SHMEM_ROOT" in env:
         raise ValueError("--rebuild-shmem only rebuilds the bundled SDK; unset SHMEM_ROOT first")
 

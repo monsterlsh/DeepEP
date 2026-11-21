@@ -18,7 +18,7 @@ Modified by Joyce_An 2026
 
 | 状态 | 阶段 | 工作与验收条件 |
 | --- | --- | --- |
-| [x] | A · 计算 | 复用分支已有的单投影 W1。GMM1 输出按 BF16 舍入，FP32 计算 GELU 并乘当前 slot 的 `topk_weights`，再舍入、MXFP8 量化并进入 GMM2。源 rank 按原 slot 顺序用 FP32 累加，最后写 BF16。GELU 自动选择提前加权，阶段 A 显式传 0 会集体报错。 |
+| [x] | A · 计算 | 复用分支已有的单投影 W1。GMM1 输出按 BF16 舍入，FP32 计算 GELU 并乘当前 slot 的 `topk_weights`，再舍入、MXFP8 量化并进入 GMM2。源 rank 按原 slot 顺序用 FP32 累加，最后写 BF16。GELU 默认提前加权，显式传 `topk_weights_type=0` 时回到 Finalize 加权。 |
 | [x] | A · 路由 | 支持 `1 ≤ K ≤ min(32,E)`。K1–8 保留专用归约，K9–32 复用原有六槽流水，按实际 K 遍历。进入首个窗口前，全组核对 B、代号、张量形状和路由。拒绝越界 ID、同 token 重复专家和非有限权重，允许有限的零值及负权重。 |
 | [x] | A · 容量 | 对外 B 最大 65,536。所有 rank 协商 W，源 rank 至多展开 W×K 行，目的 rank 为全部源预留 EP×W×K 行。两个公开入口的尾窗都按实际行数写入原输出，每次调用按专家汇总各窗计数。W=256、B=39,280 时为 153 个满窗和 112 行尾窗。 |
 | [x] | A · 本地回归 | Host C++ 执行设备侧路由与归约代码，覆盖 K1–32、空 peer、热点和非顺序回传行。CPU Golden 检查 GELU 与提前加权。API 测试覆盖满窗、尾窗、重复调用、跨 rank 拒绝非法输入和计划分配失败后的重试。 |
@@ -45,17 +45,61 @@ torchrun --standalone --nproc-per-node=8 -m deep_ep_experimental.megamoe.benchma
 
 性能报告按一次逻辑 forward 汇总各窗 kernel 耗时。该指标不含输入预检、主机协调及窗口间的计数累加。可选设备 timer 只采首窗。
 
-### 单机 UBX EP16 GELU 精度
+### UBX GELU 精度与性能
 
-用本次源码构建并安装 MegaMoE wheel 后运行以下命令。两种精度均调用 UBX URMA 融合算子，默认按 `feat/roce-support` 的批量精度流程与 CPU Golden 做全量数值比对，并检查全量输出有限值和逐专家接收计数。W8A8 的两层路由权重使用独立生成的 FP8 E4M3 数据与 E8M0 scale。
+在目标机器安装本次构建的 MegaMoE wheel。统一入口 `run_ubx_gelu.py` 支持单机 16 卡和双机 32 卡，默认 K25、每卡 39,280 token、均衡路由、全量精度比对。`accuracy` 默认测 W4A8 和 W8A8，`perf` 默认测 W4A8。`both` 依次执行精度和性能。显式传 `w4a8`、`w8a8` 或 `all` 时，应用到该命令的所有模式。
 
 ```bash
-python3 experiments/megamoe/scripts/run_ubx_ep16_gelu.py accuracy
-python3 experiments/megamoe/scripts/run_ubx_ep16_gelu.py accuracy w8a8
-python3 experiments/megamoe/scripts/run_ubx_ep16_gelu.py perf
+UBX=experiments/megamoe/scripts/run_ubx_gelu.py
+python3 "$UBX" accuracy --ep-size 16
+python3 "$UBX" perf w8a8 --ep-size 16
+
+# 在 90.90.93.84 上执行，自动通过 SSH 拉起 90.90.93.184。
+python3 "$UBX" accuracy all --ep-size 32
+python3 "$UBX" perf w8a8 --ep-size 32 --config target_gelu_k32
 ```
 
-`accuracy w4a8` 或 `accuracy w8a8` 可单独运行。设置 `CHECK_TOKENS=8` 可每卡抽查 8 个 token，设置 `DUAL_REFERENCE=1` 可加入独立 NPU 级联并使用 `accuracy.py` 中的双参考判据。性能入口测 W4A8。
+EP32 自动模式先等待两台各自完成本机 rank 的 Golden，再一起启动 32 个 rank。一侧失败时会取消另一侧的当前阶段。两台需在相同绝对路径检出源码、安装同一 wheel，并配置节点 0 到节点 1 的免密 SSH。`--node-ip NODE0 NODE1`、`--ssh-user`、`--ssh-port` 可覆盖连接参数。自定义 JSON 路径需对两台都可读。未设置 `PYTHON` 时加载 `ubx_env.sh`；显式设置时，两台都应能使用该 Python 和已配置好的 CANN 动态库环境。
+
+手动模式在两台分别设置 `NODE_RANK=0` 和 `NODE_RANK=1`。两台的 `prepare` 均成功后，再在两台启动 `run`。性能命令只需 `run`。
+
+```bash
+UBX=experiments/megamoe/scripts/run_ubx_gelu.py
+ARGS=(accuracy w4a8 --ep-size 32 --node-rank "$NODE_RANK"
+      --master-addr 90.90.93.84 --output-dir /shared/ubx-ep32-k25)
+python3 "$UBX" "${ARGS[@]}" --stage prepare
+python3 "$UBX" "${ARGS[@]}" --stage run
+```
+
+- `--config target_gelu_k32` 选择 K32，`--weighting late` 切换到 Finalize 加权。每轮只运行一个配置。
+- `CHECK_TOKENS=8` 每卡抽查 8 个 token，`CHECK_TOKENS=0` 做全量。可设置 `ROUTING=skewed` 或 `DUAL_REFERENCE=1`。
+- `GOLDEN_DIR` 和 `RUN_BASE` 默认分别为仓库下的 `benchmark-golden` 和 `benchmark-runs`。默认自动分配本轮目录。显式给 `--output-dir` 时，为重跑选择新目录；双机可用共享盘或两台上的相同绝对路径。
+- EP16 可复用校验通过的 Golden 和同环境的 NPU 全组通过报告。`--force-cpu` 重算 Golden，内容一致时仍可复用 NPU 报告；`--force-npu` 重测 NPU；`--force` 重跑两段。EP32 每次实测 NPU，支持 `--force-cpu` 和 `--force`。
+- 精度和性能输出分别位于 `accuracy-<精度>/rank_<r>/bs_<B>/accuracy.json` 和 `perf-<精度>/rank_<r>/bs_<B>/performance.json`。手动模式和自动模式均保留各节点日志。
+
+原 EP16 和 EP32 文件名仍可调用统一入口。双机环境和验收判据见 [GELU 验证手册](../../docs/megamoe-gelu-validation.md#41-ep32-验收清单)。
+
+### 950POD 非 UBX GELU 精度
+
+在 B05 首节点运行默认单机 8 卡精度测试，主节点地址为 `177.22.21.1`，默认测 W4A8、K25、每卡 39,280 token。脚本加载 `/home/cann/b112/cann-9.2.0/set_env.sh`，使用 `/opt/miniconda3/envs/lsx/bin/python`。请先在选用的 Python 环境安装 MegaMoE wheel。若 wheel 安装在已有 venv 中，传 `PYTHON=/绝对路径/bin/python`；`CANN_ENV` 和 `BASE_PYTHON` 可覆盖基础环境。
+
+```bash
+POD=experiments/megamoe/scripts/run_950pod_gelu_accuracy.py
+python3 "$POD" --plan
+CHECK_TOKENS=8 python3 "$POD" --bs 257            # 快速验证
+python3 "$POD" --config target_gelu_k32           # K32 全量精度
+```
+
+B05 和 B07 双机各 8 卡时，在 B05 设置 `NODE_RANK=0`，在 B07 设置 `NODE_RANK=1`。两台使用相同的主节点地址、模型和测试参数。两台的 `--golden-only` 都完成后，再同时启动 `--skip-golden`。
+
+```bash
+POD=experiments/megamoe/scripts/run_950pod_gelu_accuracy.py
+ARGS=(--ep-size 16 --node-rank "$NODE_RANK" --output-dir /shared/950pod-ep16-k25)
+python3 "$POD" "${ARGS[@]}" --golden-only
+python3 "$POD" "${ARGS[@]}" --skip-golden
+```
+
+四台各 8 卡对应 `--ep-size 32` 和节点序号 0–3。`--master-addr` 可指定其他主节点地址。报告位于本轮目录的 `accuracy/rank_<r>/bs_<B>/accuracy.json`。
 
 ## 1. 输入、输出与公开接口
 
@@ -129,7 +173,7 @@ buffer = SymmBuffer(
 MTE 约束：EP=2～128，E 可被 EP 整除且每卡最多 128 个路由专家；S=0～8；B=1～65536；
 H=1024～8192 且为64的倍数，I=256～4096 且为128的倍数，1≤K≤min(32,E)。
 各 rank 必须同序、同 B 调用；仅推理，不支持反向、空/不等长 B 或图捕获。
-`mma_type="fp8xfp8"` 使用 FP8 E4M3 路由权重，不支持共享专家或 timer。UBX 上该精度限于单机 EP16 的分窗 GELU，传入连续 ND 权重 `[L,N,K]` 及 E8M0 scale `[L,N,K/64,2]`。benchmark 从配置文件的 `model.mma_type` 读取矩阵乘精度。
+`mma_type="fp8xfp8"` 使用 FP8 E4M3 路由权重，不支持共享专家或 timer。UBX 上该精度限用于分窗 GELU 的 EP16 单机与 EP32 双机，传入连续 ND 权重 `[L,N,K]` 及 E8M0 scale `[L,N,K/64,2]`。benchmark 从配置文件的 `model.mma_type` 读取矩阵乘精度。
 
 兼容入口 `mega_moe(x, ids, weights, w1, w2, buffer, ...)` 返回 `(y, per_call_counts)`。
 接口签名参照 DeepGEMM `78b6900`。本实现使用 int32 路由 ID、E8M0 输入 scale，
@@ -165,16 +209,18 @@ CATLASS GMM 的布局和同步机制见 [GMM 说明](csrc/kernels/mega_moe/catla
 ## 路由权重位置与 ProcessGroup
 
 通信实现称为 **MTE** 和 **URMA**，产品识别仍自动选择实现。
-`SymmBuffer` 的 `topk_weights_type` 缺省时按激活选择，SwiGLU 为 0，GELU 为 1。SwiGLU 的两种取值如下：
+`SymmBuffer` 的 `topk_weights_type` 选择路由权重位置，显式取值优先，缺省时 GELU 为 1、SwiGLU 为 0。提前加权（1）是为 GELU 设计的方案，SwiGLU 的 1 仅保留为早期控制实验。
 
-| 值 | 路由专家计算顺序 |
-| --- | --- |
-| 0（默认） | GMM1 → clamp → SwiGLU → BF16/MX 量化 → GMM2 → 乘路由权重 → reduce |
-| 1 | GMM1 → clamp → SwiGLU → 乘路由权重 → BF16/MX 量化 → GMM2 → reduce |
+| 激活 | 值 | 路由专家计算顺序 |
+| --- | --- | --- |
+| SwiGLU | 0（默认） | GMM1 → clamp → SwiGLU → BF16/MX 量化 → GMM2 → 乘路由权重 → reduce |
+| SwiGLU | 1（实验） | GMM1 → clamp → SwiGLU → 乘路由权重 → BF16/MX 量化 → GMM2 → reduce |
+| GELU | 0 | GMM1 → BF16 → GELU → BF16/MX 量化 → GMM2 → 乘路由权重 → reduce |
+| GELU | 1（默认） | GMM1 → BF16 → GELU → 乘路由权重 → BF16/MX 量化 → GMM2 → reduce |
 
-共享专家不乘路由权重。两种模式因量化位置不同不保证数值相同。
+共享专家不乘路由权重。各模式因量化位置不同不保证数值相同。
 所有 rank 必须选择相同模式；它影响通信内存布局，buffer 创建后不要修改。
-URMA 的提前模式把每条路由的 FP32 权重附在 Scale PUT 中，保持两次 data PUT，增加元数据传输与 Gather；默认模式不传路由权重。
+URMA 的提前模式把每条路由的 FP32 权重附在 Scale PUT 中，保持两次 data PUT，增加元数据传输与 Gather；Finalize 模式不传路由权重，由源 rank 在 reduce 阶段用本地权重累加。
 CPU Golden 与 NPU cascade 均按同一模式及 clamp 生成参考结果。benchmark 配置 JSON 的 `model` 支持 `topk_weights_type` 和 `activation_clamp`。
 
 ```python

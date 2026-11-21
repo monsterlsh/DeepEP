@@ -234,6 +234,68 @@ def test_shmem_cann_version(monkeypatch, tmp_path, version, accepted):
             builder.cann_version("9.2.0")
 
 
+@pytest.mark.parametrize("keep_intermediates", [False, True])
+def test_shmem_prepare_reuses_verified_sdk_without_compiling(monkeypatch, tmp_path, keep_intermediates):
+    import hashlib
+
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    builder = load(ROOT / "scripts/build_shmem.py")
+    trial = tmp_path / "megamoe trial"
+    source = tmp_path / "cached shmem"
+    sdk = source / "install/shmem"
+    revision = "a" * 40
+    expected = {"revision": revision, "header_sha256_lf": {"shmem.h": hashlib.sha256(b"header").hexdigest()}}
+    trial.mkdir()
+    (trial / "dependencies.lock.json").write_text(
+        json.dumps({"shmem": expected, "target": "Ascend950", "cann_version": "9.2.0"}), encoding="utf-8"
+    )
+    (source / ".git").mkdir(parents=True)
+    (source / "scripts").mkdir()
+    (source / "scripts/build.sh").touch()
+    (sdk / "include").mkdir(parents=True)
+    (sdk / "include/shmem.h").write_bytes(b"header")
+    (sdk / "lib").mkdir()
+    library = sdk / "lib/libshmem.so"
+    library.write_bytes(b"compiled library")
+    if keep_intermediates:
+        flags = source / "build/CMakeFiles/aclshmem_device.dir/flags.make"
+        flags.parent.mkdir(parents=True)
+        flags.write_text("CXX_DEFINES = -DACLSHMEMI_HNS_1825_PI_ON_CHIP=1\n", encoding="utf-8")
+    manifest = builder.record(
+        sdk, revision, expected=expected,
+        build_info={
+            "cann_version": "9.2.0", "cann_timestamp": "test", "target": "Ascend950", "source_patches": [],
+            "rdma_backend": "HNS_1825", "hns_1825_pi_on_chip": 1,
+        },
+    )
+    cann = tmp_path / "cann/compiler/version.info"
+    cann.parent.mkdir(parents=True)
+    cann.write_text("Version=9.2.0\ntimestamp=test\n", encoding="utf-8")
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(cann.parents[1]))
+    monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", "4")
+    monkeypatch.setattr(builder.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(builder, "source_patches", lambda _source: [])
+
+    def git(command, *, text):
+        assert command[:3] == ["git", "-C", str(source)] and text
+        if command[3:] == ["rev-parse", "--show-toplevel"]:
+            return str(source)
+        assert command[3:] == ["rev-parse", "HEAD"]
+        return revision
+
+    monkeypatch.setattr(builder.subprocess, "check_output", git)
+    monkeypatch.setattr(builder.subprocess, "run", lambda *args, **kwargs: pytest.fail("SHMEM compiled again"))
+    assert builder.prepare(trial, source_dir=source, if_needed=True) == manifest
+
+    cann.write_text("Version=9.2.0\ntimestamp=changed\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Existing SHMEM build identity changed"):
+        builder.prepare(trial, source_dir=source, if_needed=True)
+    cann.write_text("Version=9.2.0\ntimestamp=test\n", encoding="utf-8")
+    library.write_bytes(b"corrupted library")
+    with pytest.raises(ValueError, match="SDK checksum mismatch"):
+        builder.prepare(trial, source_dir=source, if_needed=True)
+
+
 def test_metadata_no_sdk_or_framework(tmp_path):
     # Query in a copy so egg metadata does not alter the checkout.
     import shutil
@@ -388,6 +450,52 @@ def test_cache_survives_source_edits_but_not_toolchain_changes(build):
         ("build_environment", {"CXXFLAGS": "-g"}),
     ):
         assert build.build_cache_key({**configuration, name: value}) != key
+
+
+def test_latest_shmem_trials_reuse_native_outputs_and_rebuild_on_rollback(tmp_path, build):
+    import os
+    import shutil
+
+    if not shutil.which("cmake") or not shutil.which("ninja"):
+        pytest.skip("Native cache integration test requires CMake and Ninja")
+    sync_trial = load(ROOT / "scripts/sync_megamoe_native_source.py").sync_trial
+    project = """cmake_minimum_required(VERSION 3.20)
+project(test_cache NONE)
+add_custom_command(OUTPUT kernel.so
+  COMMAND "${CMAKE_COMMAND}" -E copy "${CMAKE_SOURCE_DIR}/kernel.hpp" kernel.so
+  DEPENDS kernel.hpp COMMENT "Compiling test kernel" VERBATIM)
+add_custom_target(kernel ALL DEPENDS kernel.so)
+"""
+    cases = [
+        ("v1", "app1", True),
+        ("v1", "app1", False),
+        ("v1", "app2", False),
+        ("v2", "app2", True),
+        ("v1", "app1", True),
+    ]
+    directories = set()
+    for i, (kernel, app, recompile) in enumerate(cases):
+        trial = tmp_path / f"shmem-latest-{i}"
+        trial.mkdir()
+        (trial / "CMakeLists.txt").write_text(project)
+        header = trial / "kernel.hpp"
+        header.write_text(kernel)
+        # Even the newest Git commit can have a timestamp older than the cached output.
+        os.utime(header, (1_000_000_000, 1_000_000_000))
+        (trial / "app.py").write_text(app)
+        if i == 0:
+            (trial / "removed.hpp").touch()
+        source = sync_trial(trial)
+        assert (source / "app.py").read_text() == app
+        assert (source / "removed.hpp").exists() == (i == 0)
+        key = build.build_cache_key({"source_sha256": f"trial-{i}"}, source_root=source)
+        binary = source.parent / "build" / key
+        directories.add(binary)
+        subprocess.run(["cmake", "-S", source, "-B", binary, "-G", "Ninja"], check=True)
+        result = subprocess.run(["cmake", "--build", binary], check=True, capture_output=True, text=True)
+        assert ("Compiling test kernel" in result.stdout) == recompile, result.stdout
+        assert (binary / "kernel.so").read_text() == kernel
+    assert len(directories) == 1
 
 
 @pytest.fixture
@@ -622,6 +730,80 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     assert info["megamoe"] == {"enabled": beta, "timer": timer}
     assert "CATLASS_ROOT" not in info
     assert not {"cmake_path", "compiler_path", "python_executable", "build_environment"}.intersection(info)
+
+
+def test_latest_trials_share_cmake_cache_and_install_into_each_wheel(build, monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from setuptools import Distribution, Extension
+
+    cache = tmp_path / "native cache"
+    source = cache / "source"
+    source.mkdir(parents=True)
+    (source / "CMakeLists.txt").write_text("same native source")
+    monkeypatch.setenv("DEEPEP_UBX_NATIVE_CACHE", str(cache))
+    monkeypatch.setitem(sys.modules, "pybind11", SimpleNamespace(get_cmake_dir=lambda: str(tmp_path / "pybind")))
+    monkeypatch.setattr(build, "bundle_shmem_runtime", lambda *_: {})
+    monkeypatch.setattr(build, "publish_source_native", lambda *_: None)
+
+    def fingerprint(root):
+        return (root / "CMakeLists.txt").read_text()
+
+    monkeypatch.setattr(build, "source_fingerprint", fingerprint)
+    config = {
+        "cmake_path": "cmake",
+        "compiler_path": "c++",
+        "build_type": "Release",
+        "ASCEND_HOME_PATH": "cann",
+        "SHMEM_ROOT": "shmem",
+    }
+    monkeypatch.setattr(build, "build_configuration", lambda: {**config, "source_sha256": fingerprint(build.ROOT)})
+    invocations = []
+
+    def cmake(argv):
+        invocations.append(argv)
+        if "-S" in argv:
+            assert Path(argv[argv.index("-S") + 1]) == source
+            directory = Path(argv[argv.index("-B") + 1])
+            assert directory.parent == cache / "build"
+            assert f"-DCMAKE_INSTALL_PREFIX={directory / 'install'}" in argv
+            for name in ("compiler-info.json", "capabilities.json"):
+                (directory / name).write_text("{}")
+        elif "--install" in argv:
+            directory = Path(argv[argv.index("--install") + 1])
+            prefix = Path(argv[argv.index("--prefix") + 1])
+            prefix.mkdir(parents=True, exist_ok=True)
+            (prefix / "libdeepep_kernels.so").write_text(directory.name)
+
+    monkeypatch.setattr(build, "checked_run", cmake)
+    ext = Extension("deep_ep._C", sources=[])
+
+    def package_trial(name, content="same native source"):
+        trial = tmp_path / name
+        trial.mkdir()
+        (trial / "CMakeLists.txt").write_text(content)
+        monkeypatch.setattr(build, "ROOT", trial)
+        command = build.CMakeBuild(Distribution({"ext_modules": [ext]}))
+        command.ensure_finalized()
+        command.build_temp = str(trial / "temp")
+        command.build_lib = str(trial / "wheel")
+        command.build_extension(ext)
+        install = Path(command.get_ext_fullpath(ext.name)).parent
+        assert (install / "_build_info.json").is_file()
+        configure, compile_cmd, install_cmd = invocations[-3:]
+        directory = Path(configure[configure.index("-B") + 1])
+        assert Path(compile_cmd[compile_cmd.index("--build") + 1]) == directory
+        assert Path(install_cmd[install_cmd.index("--install") + 1]) == directory
+        assert (install / "libdeepep_kernels.so").read_text() == directory.name
+        return directory
+
+    first = package_trial("trial 1")
+    assert package_trial("trial 2") == first
+    config["build_type"] = "Debug"
+    assert package_trial("trial 3") != first
+    before = len(invocations)
+    with pytest.raises(RuntimeError, match="source differs"):
+        package_trial("trial 4", content="another source archive")
+    assert len(invocations) == before
 
 
 def test_compiler_symlink_keeps_invocation_name(build, monkeypatch, tmp_path):

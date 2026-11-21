@@ -853,8 +853,39 @@ def test_urma_ep16_w8a8_gelu_uses_same_public_windowed_forward(backend, monkeypa
         assert b._plan.windowed and b._plan.mma_type == "fp8xfp8" and b._plan.topk_weights_type == 1
         launches = native_launches(backend)
         assert [launch[0].shape[0] for launch in launches] == [256, 1]
+    finally:
+        b.destroy()
         assert all(launch[4] is weights[0][0] and launch[5] is weights[1][0] for launch in launches)
         np.testing.assert_array_equal(stats.data, np.repeat([264, 7], 25))
+
+
+def test_urma_ep32_w8a8_gelu_uses_same_public_windowed_forward(backend, monkeypatch):
+    from deep_ep_experimental.megamoe import backend as selector
+
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
+    model = dict(activation="gelu", mma_type="fp8xfp8")
+
+    def window_bytes(world, experts, tokens, topk, hidden, intermediate, mma_type):
+        assert (world, experts, topk, hidden, intermediate, mma_type) == (32, 25, 25, 256, 256, "fp8xfp8")
+        return 2 << 20, tokens << 20
+
+    monkeypatch.setattr(backend.ext, "urma_w8a8_enabled", True, raising=False)
+    monkeypatch.setattr(backend.ext, "urma_window_bytes", window_bytes)
+    b = api.SymmBuffer(backend.group_type(32), 800, 257, 25, 256, 256, **model)
+    try:
+        weights = tuple(
+            (Tensor(np.zeros((25, 256, 256)), "float8_e4m3fn"),
+             Tensor(np.full((25, 256, 4, 2), 127), "float8_e8m0fnu"))
+            for _ in range(2)
+        )
+        weights = api.transform_weights_for_mega_moe(*weights, activation="gelu")
+        b.topk_idx.data[:] = np.arange(25)
+        b.topk_weights.data.fill(1.0 / 25)
+        y = Tensor(np.zeros((257, 256)), "bfloat16")
+        stats = Tensor(np.full(25, 7), "int32")
+        api.fp8_fp4_mega_moe(y, *weights, b, activation="gelu", cumulative_local_expert_recv_stats=stats)
+        assert b._plan.windowed and b._plan.mma_type == "fp8xfp8" and b._plan.topk_weights_type == 1
+        assert [launch[0].shape[0] for launch in native_launches(backend)] == [256, 1]
     finally:
         b.destroy()
 
@@ -1089,7 +1120,6 @@ def test_windowed_urma_failed_launch_poisoning_and_stats(backend, monkeypatch):
     "topk,options,match",
     [
         (33, {}, "num_topk"),
-        (32, {"topk_weights_type": 0}, "topk_weights_type=1"),
         (32, {"ranks_per_node": 4}, "requires 8 ranks per host"),
     ],
 )
@@ -1101,6 +1131,29 @@ def test_windowed_urma_invalid_configuration_rejected(backend, monkeypatch, topk
     with pytest.raises(ValueError, match=match):
         api.SymmBuffer(backend.group_type(8), 64, 257, topk, 256, 256, activation="gelu", **options)
     assert sum(event[0] == "buffer_size" for event in backend.events if isinstance(event, tuple)) == 1
+
+
+def test_windowed_urma_gelu_supports_finalize_weighting(backend, monkeypatch):
+    from deep_ep_experimental.megamoe import backend as selector
+
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
+    monkeypatch.setattr(api, "_host_boot_id", lambda: "ab" * 16)
+    b = api.SymmBuffer(
+        backend.group_type(16), 32, 2048, 2, 256, 256, activation="gelu", topk_weights_type=0
+    )
+    raw = (
+        (Tensor(np.zeros((2, 256, 128)), "uint8"), Tensor(np.full((2, 256, 4, 2), 127), "float8_e8m0fnu")),
+        (Tensor(np.zeros((2, 256, 128)), "uint8"), Tensor(np.full((2, 256, 4, 2), 127), "float8_e8m0fnu")),
+    )
+    prepared = api.transform_weights_for_mega_moe(*raw, activation="gelu")
+    try:
+        b.topk_idx.data[:] = [0, 1]
+        b.topk_weights.data[:] = [0.4, 0.6]
+        y = Tensor(np.zeros((17, 256)), "bfloat16")
+        api.fp8_fp4_mega_moe(y, *prepared, b, activation="gelu")
+        assert b._plan.windowed and b._plan.topk_weights_type == 0
+    finally:
+        b.destroy()
 
 
 def test_windowed_urma_rejects_different_hosts_even_with_ranks_per_node_8(backend, monkeypatch):

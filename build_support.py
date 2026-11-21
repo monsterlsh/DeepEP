@@ -132,9 +132,10 @@ class CheckedInstallLib(install_lib):
         return super().install()
 
 
-def source_fingerprint():
+def source_fingerprint(root=None):
+    root = ROOT if root is None else root
     files = [
-        ROOT / name
+        root / name
         for name in (
             "VERSION",
             "setup.py",
@@ -163,13 +164,13 @@ def source_fingerprint():
     ):
         files.extend(
             path
-            for path in (ROOT / name).rglob("*")
+            for path in (root / name).rglob("*")
             if (path.suffix in {".sh", ".py", ".cpp", ".hpp", ".h", ".cmake", ".json"} or path.name == "CMakeLists.txt")
             and path.name != "_build_info.json"
         )
     digest = hashlib.sha256()
     for path in sorted(files):
-        digest.update(path.relative_to(ROOT).as_posix().encode() + b"\0")
+        digest.update(path.relative_to(root).as_posix().encode() + b"\0")
         digest.update(path.read_bytes().replace(b"\r\n", b"\n") + b"\0")
     return digest.hexdigest()
 
@@ -200,10 +201,10 @@ def validate_shmem_sdk(root, expected):
     return sdk
 
 
-def build_cache_key(configuration):
+def build_cache_key(configuration, *, source_root=None):
     """Keep object files across source edits; isolate incompatible toolchains."""
     identity = {key: value for key, value in configuration.items() if key not in {"source_sha256", "source_version"}}
-    identity["source_root"] = str(ROOT.resolve())
+    identity["source_root"] = str((ROOT if source_root is None else source_root).resolve())
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -496,9 +497,18 @@ class CMakeBuild(build_ext):
         configuration = build_configuration()
         megamoe = configuration.get("megamoe", {})
         ep_gmm_fused = configuration.get("ep_gmm_fused", {}).get("enabled", False)
-        fingerprint = build_cache_key(configuration)
-        directory = Path(self.build_temp).resolve() / fingerprint
+        source_root = ROOT
+        build_temp = Path(self.build_temp).resolve()
+        native_cache = os.environ.get("DEEPEP_UBX_NATIVE_CACHE")
+        if native_cache:
+            cache = Path(native_cache).resolve()
+            source_root = cache / "source"
+            if source_fingerprint(source_root) != configuration["source_sha256"]:
+                raise RuntimeError("UBX CMake source differs from the wheel source archive")
+            build_temp = cache / "build"
+        directory = build_temp / build_cache_key(configuration, source_root=source_root)
         destination = Path(self.get_ext_fullpath(ext.name)).resolve().parent
+        configure_prefix = directory / "install" if native_cache else destination
         default_jobs = os.environ.get("MAX_JOBS", "4") if ep_gmm_fused else "4"
         jobs = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL", default_jobs)
         if not jobs.isdecimal() or not 1 <= int(jobs) <= 64:
@@ -508,7 +518,7 @@ class CMakeBuild(build_ext):
         arguments = [
             cmake,
             "-S",
-            ROOT,
+            source_root,
             "-B",
             directory,
             f"-DCMAKE_BUILD_TYPE={configuration['build_type']}",
@@ -522,7 +532,7 @@ class CMakeBuild(build_ext):
             f"-DDEEPEP_MEGAMOE_TIMER={'ON' if megamoe.get('timer', False) else 'OFF'}",
             f"-DCATLASS_ROOT={configuration.get('CATLASS_ROOT', '')}",
             f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}",
-            f"-DCMAKE_INSTALL_PREFIX={destination}",
+            f"-DCMAKE_INSTALL_PREFIX={configure_prefix}",
         ]
         if ep_gmm_fused:
             arguments.extend(
@@ -534,7 +544,7 @@ class CMakeBuild(build_ext):
             )
         checked_run(arguments)
         checked_run([cmake, "--build", directory, "--parallel", jobs])
-        checked_run([cmake, "--install", directory])
+        checked_run([cmake, "--install", directory, "--prefix", destination])
         # A reused setuptools build_lib may still contain the former library.
         (destination / "libdeepep_notify.so").unlink(missing_ok=True)
         # Elastic implementation/layout modules now live under buffers/.

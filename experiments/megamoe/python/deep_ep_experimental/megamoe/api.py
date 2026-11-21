@@ -183,14 +183,16 @@ class SymmBuffer:
 
         self._backend_name = select_backend(group)
         urma = self._backend_name == "urma"
-        urma_w8a8 = urma and size == 16 and mma_type == "fp8xfp8" and activation == "gelu" and num_shared_experts == 0
+        urma_w8a8 = (
+            urma and size in (16, 32) and mma_type == "fp8xfp8"
+            and activation == "gelu" and num_shared_experts == 0
+        )
         self._urma_windowed = (
             urma and size in (8, 16, 32) and activation == "gelu" and mma_type == "fp8xfp4" and num_shared_experts == 0
         ) or urma_w8a8
         self._windowed = self._urma_windowed
         if topk_weights_type is None:
             topk_weights_type = int(activation == "gelu")
-        effective_topk_weights_type = 1 if activation == "gelu" else topk_weights_type
         error = None
         try:
             integer("num_experts", num_experts, 1, 16384)
@@ -206,8 +208,8 @@ class SymmBuffer:
             integer("topk_weights_type", topk_weights_type, 0, 1)
             if self._urma_windowed:
                 local_ranks = min(size, 16)
-                if ranks_per_node not in (0, local_ranks) or topk_weights_type != 1:
-                    raise ValueError(f"Windowed EP{size} GELU requires {local_ranks} ranks per host and topk_weights_type=1")
+                if ranks_per_node not in (0, local_ranks):
+                    raise ValueError(f"Windowed EP{size} GELU requires {local_ranks} ranks per host")
                 ranks_per_node = local_ranks
             h_align, i_align = (256, 256) if urma else (64, 128)
             if hidden % h_align or intermediate_hidden % i_align:
@@ -221,9 +223,9 @@ class SymmBuffer:
             if urma and size not in (4, 8, 16, 32):
                 raise ValueError("URMA supports EP4/EP8/EP16/EP32")
             if urma and mma_type == "fp8xfp8" and not urma_w8a8:
-                raise ValueError("URMA W8A8 requires single-host EP16 GELU with zero shared experts")
+                raise ValueError("URMA W8A8 requires windowed EP16/EP32 GELU with zero shared experts")
             if urma and size == 32 and not self._urma_windowed:
-                raise ValueError("URMA EP32 requires routed GELU FP8xFP4 with zero shared experts")
+                raise ValueError("URMA EP32 requires windowed routed GELU with zero shared experts")
             if mma_type != "fp8xfp4" and num_shared_experts:
                 raise ValueError("Shared experts currently require FP8xFP4 weights")
             if num_experts % size or num_experts // size > 128:
@@ -244,7 +246,7 @@ class SymmBuffer:
             activation,
             ranks_per_node,
             timeout,
-            effective_topk_weights_type,
+            topk_weights_type,
             _host_boot_id() if self._urma_windowed and size <= 16 else None,
         )
         collective_check(group, "configuration", error, config)
@@ -261,7 +263,7 @@ class SymmBuffer:
                 num_topk,
                 hidden,
                 backend=self._backend_name,
-                topk_weights_type=effective_topk_weights_type,
+                topk_weights_type=topk_weights_type,
                 mma_type=mma_type,
                 windowed=self._urma_windowed,
             ))
@@ -292,7 +294,7 @@ class SymmBuffer:
         self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
         self.activation = activation
         self.ranks_per_node = ranks_per_node
-        self.topk_weights_type = effective_topk_weights_type
+        self.topk_weights_type = topk_weights_type
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
         try:

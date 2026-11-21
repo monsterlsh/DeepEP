@@ -57,7 +57,8 @@ def load_config(name, bs_values=None):
     if model.get("activation") == "gelu" and "activation_clamp" in model:
         raise ValueError("activation_clamp is only defined for SwiGLU")
     normalize_clamp(model.get("activation_clamp"))
-    route_mode = config["model"].get("topk_weights_type", 0)
+    default_route_mode = 1 if config["model"].get("activation", "swiglu") == "gelu" else 0
+    route_mode = config["model"].get("topk_weights_type", default_route_mode)
     if type(route_mode) is not int or route_mode not in (0, 1):
         raise ValueError("topk_weights_type must be 0 or 1")
     if bs_values is not None:

@@ -13,7 +13,7 @@ import sys
 import numpy as np
 import pytest
 
-from deep_ep_experimental.megamoe import golden
+from deep_ep_experimental.megamoe import golden, numerics
 from deep_ep_experimental.megamoe.benchmark import accuracy, inputs
 from deep_ep_experimental.megamoe.reference import (
     bf16,
@@ -65,7 +65,7 @@ def naive(config, world, source, bs, routing, check_tokens):
             owner * local,
             activation,
             mma_type,
-            model.get("topk_weights_type", 0),
+            int(numerics.prequant_route_weight(model)),
         )
     if model["num_shared_experts"]:
         raw = make_weights(
@@ -127,6 +127,79 @@ def test_partial_cache_only_computes_missing_ranks(config, tmp_path, monkeypatch
     golden.prepare(config, 2, 7, [0, 1], tmp_path)
     assert seen == [[1]]
     np.testing.assert_array_equal(golden.load(tmp_path, spec, 1)[0], naive(config, 2, 1, 7, "balanced", 0)[0])
+
+
+def test_ubx_reuses_legacy_golden_and_repairs_only_bad_ranks(config, tmp_path, monkeypatch):
+    from experiments.megamoe.scripts.ubx_prepare_golden import prepare
+
+    spec = golden.prepare(config, 2, 7, [0], tmp_path, input_kind="fp8", workers=1)
+    real_generate = golden.generate
+    generated = []
+
+    def generate(config, spec, ranks, **kwargs):
+        generated.append(list(ranks))
+        return real_generate(config, spec, ranks, **kwargs)
+
+    def run(force=False, reuse_only=False):
+        return prepare(config, spec, [0, 1], tmp_path, workers=1, chunk_tokens=2, force=force, reuse_only=reuse_only)
+
+    monkeypatch.setattr(golden, "generate", generate)
+    partial = run(reuse_only=True)
+    assert partial == dict(config=config, identity=None, generated=[], reused=[0], missing=[1])
+    assert not generated and not golden.cache_path(tmp_path, spec, 1).exists()
+    first = run()
+    assert first["generated"] == [1] and first["reused"] == [0]
+    assert generated == [[1]]
+    with monkeypatch.context() as patch:
+        patch.setattr(golden, "load", lambda *_: pytest.fail("unchanged rank reread"))
+        second = run(reuse_only=True)
+        assert second["reused"] == [0, 1] and second["identity"] == first["identity"] and second["missing"] == []
+
+    damaged = golden.cache_path(tmp_path, spec, 0)
+    damaged.write_bytes(b"truncated NPZ")
+    invalid = run(reuse_only=True)
+    assert invalid == dict(config=config, identity=None, generated=[], reused=[1], missing=[0])
+    assert damaged.read_bytes() == b"truncated NPZ"
+    repaired = run()
+    assert repaired["generated"] == [0] and repaired["reused"] == [1]
+    assert repaired["identity"] == first["identity"]
+    assert run(force=True)["identity"] == first["identity"]
+    assert generated == [[1], [0], [0], [1]]
+
+    # A valid replacement Golden with different values must invalidate the NPU result.
+    output, counts, selected = golden.load(tmp_path, spec, 0)
+    golden.save(tmp_path, spec, 0, output + 1, counts, selected)
+    changed = run()
+    assert changed["identity"] != first["identity"] and changed["generated"] == []
+
+
+def test_ubx_concurrent_golden_prepares_once(config, tmp_path):
+    case = tmp_path / "case.json"
+    case.write_text(json.dumps(config), encoding="utf-8")
+    repo = Path(__file__).resolve().parents[3]
+    env = dict(os.environ, PYTHONSAFEPATH="1", PYTHONPATH=os.pathsep.join(map(str, [
+        repo, repo / "experiments/megamoe/python",
+    ])))
+    command = [
+        sys.executable, str(repo / "experiments/megamoe/scripts/ubx_prepare_golden.py"),
+        "--config", str(case), "--ep-size", "2", "--ranks", "0-1", "--bs-values", "7",
+        "--golden-dir", str(tmp_path / "cache"), "--input", "fp8", "--routing", "balanced",
+        "--check-tokens", "2", "--workers", "1",
+    ]
+    summaries = [tmp_path / f"run-{n}.json" for n in range(2)]
+    processes = [subprocess.Popen([*command, "--summary", str(path)], env=env) for path in summaries]
+    try:
+        for process in processes:
+            assert process.wait(timeout=60) == 0
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+    reports = [json.loads(path.read_text()) for path in summaries]
+    assert sorted(result["generated"] for result in reports) == [[], [0, 1]]
+    assert reports[0]["identity"] == reports[1]["identity"]
+    assert reports[0]["config"]["alignment"] == reports[1]["config"]["alignment"]
 
 
 def test_routing_source_change_invalidates_cached_golden(config, tmp_path, monkeypatch):

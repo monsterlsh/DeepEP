@@ -176,7 +176,7 @@ def expert_forward(x, w1, w2, activation_clamp=None, route_weights=None, activat
 def local_reference(x, indices, weights, l1, l2, first_expert, activation="swiglu", mma_type="fp8xfp4", topk_weights_type=0):
     """One rank's contribution to one source rank. l1/l2 contain local experts only."""
     result = np.zeros_like(x, dtype=np.float32)
-    early_weights = activation == "gelu" or topk_weights_type == 1
+    early_weights = topk_weights_type == 1
     for local in range(len(l1)):
         token, slot = np.where(indices == first_expert + local)
         if token.size:

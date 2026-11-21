@@ -51,14 +51,27 @@ if(api_header)
     string(REGEX REPLACE ".*ASCENDC_API_VERSION ([0-9]+).*" "\\1" api_version "${api_version}")
     list(APPEND kernel_flags "-DASCENDC_API_VERSION=${api_version}")
 endif()
+# Bisheng compiles separate host and device passes from each entry point.
+# Track device-only headers even when the host preprocessor skips them.
+function(megamoe_header_dependencies result)
+    file(GLOB_RECURSE headers CONFIGURE_DEPENDS ${ARGN})
+    list(FILTER headers INCLUDE REGEX "\\.(h|hh|hpp|hxx|inc|inl|ipp|tpp)$")
+    # A removed header must invalidate the kernel even after it leaves the glob.
+    set(manifest "${CMAKE_CURRENT_BINARY_DIR}/${result}.txt")
+    file(GENERATE OUTPUT "${manifest}" CONTENT "${headers}\n")
+    set(${result} ${headers} "${manifest}" PARENT_SCOPE)
+endfunction()
+megamoe_header_dependencies(shared_headers "csrc/kernels/mega_moe_common/*"
+    "${CATLASS_ROOT}/include/*" "${CATLASS_ROOT}/examples/common/*")
+megamoe_header_dependencies(wave_headers "csrc/kernels/mega_moe/*")
+megamoe_header_dependencies(urma_headers "csrc/kernels/mega_moe_urma/*")
 set(kernel_library "${CMAKE_CURRENT_BINARY_DIR}/libmegamoe_kernel.so")
-file(GLOB_RECURSE kernel_headers CONFIGURE_DEPENDS "csrc/kernels/*.hpp")
 add_custom_command(OUTPUT "${kernel_library}"
     COMMAND "${BISHENG}" ${kernel_flags} csrc/kernels/mega_moe/mega_moe.cpp
         "-L${ASCEND_HOME_PATH}/lib64" "-L${SHMEM_ROOT}/lib"
         -lruntime -lascendcl -lshmem -lgraph_base -ltiling_api -lplatform -lregister -ldl -lstdc++ -lm
         -o "${kernel_library}"
-    DEPENDS csrc/kernels/mega_moe/mega_moe.cpp csrc/kernel_launch.hpp ${kernel_headers}
+    DEPENDS csrc/kernels/mega_moe/mega_moe.cpp csrc/kernel_launch.hpp ${wave_headers} ${shared_headers}
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
 set(urma_kernel_library "${CMAKE_CURRENT_BINARY_DIR}/libmegamoe_urma_kernel.so")
 set(urma_kernel_flags ${kernel_flags})
@@ -73,7 +86,7 @@ add_custom_command(OUTPUT "${urma_kernel_library}"
         "-L${ASCEND_HOME_PATH}/lib64" "-L${SHMEM_ROOT}/lib"
         -lruntime -lascendcl -lshmem -lgraph_base -ltiling_api -lplatform -lregister -ldl -lstdc++ -lm
         -o "${urma_kernel_library}"
-    DEPENDS csrc/kernels/mega_moe_urma/mega_moe_urma.cpp ${kernel_headers}
+    DEPENDS csrc/kernels/mega_moe_urma/mega_moe_urma.cpp ${urma_headers} ${shared_headers}
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
 add_custom_target(megamoe_device DEPENDS "${kernel_library}" "${urma_kernel_library}")
 pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp csrc/kernel_launch.cpp)

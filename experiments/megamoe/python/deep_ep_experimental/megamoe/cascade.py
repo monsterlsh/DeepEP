@@ -105,9 +105,6 @@ class CascadeReference:
         self.shared_experts = int(model["num_shared_experts"])
         self.shared_intermediate = int(model.get("shared_intermediate_hidden", self.intermediate))
         self.activation_clamp = normalize_clamp(model.get("activation_clamp"))
-        self.topk_weights_type = model.get("topk_weights_type", 0)
-        if type(self.topk_weights_type) is not int or self.topk_weights_type not in (0, 1):
-            raise ValueError("topk_weights_type must be 0 or 1")
         self.shared_output_rounding = model.get("shared_output_rounding", "single_cast")
         if self.experts <= 0 or self.experts % self.world:
             raise ValueError("Cascade requires global experts divisible by EP world size")
@@ -120,8 +117,10 @@ class CascadeReference:
         self.activation, self.beta, self.linear_beta = normalize_activation(
             model.get("activation", "swiglu"), model.get("activation_params")
         )
-        if self.activation == "gelu":
-            self.topk_weights_type = 1
+        # 提前加权是为 GELU 设计的方案；SwiGLU 的 1 仅保留为早期控制实验。
+        self.topk_weights_type = model.get("topk_weights_type", int(self.activation == "gelu"))
+        if type(self.topk_weights_type) is not int or self.topk_weights_type not in (0, 1):
+            raise ValueError("topk_weights_type must be 0 or 1")
         self.mma_type = model.get("mma_type", "fp8xfp4")
         if self.mma_type == "fp4xfp4":
             raise ValueError("A4W4 (mma_type='fp4xfp4') is not enabled")

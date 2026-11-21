@@ -11,12 +11,17 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import tempfile
 
 
-def record(sdk, revision, *, build_info=None):
+def shmem_lock():
+    return json.loads((Path(__file__).resolve().parents[1] / "dependencies.lock.json").read_text(encoding="utf-8"))["shmem"]
+
+
+def record(sdk, revision, *, build_info=None, expected=None):
     sdk = Path(sdk).resolve()
-    lock = json.loads((Path(__file__).resolve().parents[1] / "dependencies.lock.json").read_text())
-    expected = lock["shmem"]
+    if expected is None:
+        expected = shmem_lock()
     if revision != expected["revision"]:
         raise ValueError("SDK source revision must match dependencies.lock.json")
     for relative, digest in expected["header_sha256_lf"].items():
@@ -41,14 +46,18 @@ def record(sdk, revision, *, build_info=None):
     identity = {"revision": revision, "sha256": hashes}
     if build_info is not None:
         identity["build"] = build_info
-    manifest.write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
+    # An interrupted writer must never leave a partially recorded SDK.
+    with tempfile.TemporaryDirectory(prefix=".deepep-sdk-", dir=sdk) as staging:
+        staged = Path(staging) / manifest.name
+        staged.write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
+        manifest.hardlink_to(staged)
     return manifest
 
 
-def check(sdk):
+def check(sdk, *, expected=None):
     """Validate an existing SDK identity without changing its files."""
     sdk = Path(sdk).resolve()
-    lock = json.loads((Path(__file__).resolve().parents[1] / "dependencies.lock.json").read_text())["shmem"]
+    lock = shmem_lock() if expected is None else expected
     manifest = sdk / "deepep-sdk.json"
     recorded = json.loads(manifest.read_text())
     if recorded.get("revision") != lock["revision"]:

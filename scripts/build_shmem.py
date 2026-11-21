@@ -15,7 +15,8 @@ import shutil
 import subprocess
 import tempfile
 
-from record_shmem_sdk import record
+from record_shmem_sdk import check, record
+from shmem_sdk_identity import validate_build_identity
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -65,14 +66,14 @@ def source_patches(source):
     return [{"kind": "local-worktree", "sha256": digest.hexdigest()}]
 
 
-def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=False):
+def prepare(root=ROOT, *, source_dir=None, rebuild=False, if_needed=False, allow_local_changes=False):
     if platform.system() != "Linux":
         raise RuntimeError("SHMEM compilation requires Linux and the pinned CANN SDK")
     root = Path(root).resolve()
     lock = json.loads((root / "dependencies.lock.json").read_text(encoding="utf-8"))
-    source = root / "third-party/shmem"
+    source = root / "third-party/shmem" if source_dir is None else Path(source_dir).absolute()
     if not (source / ".git").exists() or not (source / "scripts/build.sh").is_file():
-        raise RuntimeError("Initialize SHMEM first: git submodule update --init --recursive -- third-party/shmem")
+        raise RuntimeError(f"Invalid SHMEM checkout at {source}; initialize the SHMEM sources first")
     if source.resolve() != source or source.parent.resolve() != source.parent:
         raise RuntimeError("SHMEM source must not be a symlink to another checkout")
 
@@ -80,7 +81,7 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
         return subprocess.check_output(["git", "-C", str(source), *args], text=True).strip()
 
     if Path(git("rev-parse", "--show-toplevel")).resolve() != source:
-        raise RuntimeError("third-party/shmem must be its own initialized Git submodule")
+        raise RuntimeError(f"{source} must be its own SHMEM Git checkout")
     revision = git("rev-parse", "HEAD")
     if revision != lock["shmem"]["revision"]:
         raise RuntimeError("SHMEM revision differs from dependencies.lock.json; do not build a moving branch")
@@ -92,6 +93,13 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
         )
 
     version = cann_version(lock["cann_version"])
+    build_identity = {
+        "cann_version": version["Version"],
+        "cann_timestamp": version.get("timestamp", "unknown"),
+        "target": lock["target"],
+        "source_patches": patches,
+        "rdma_backend": "HNS_1825",
+    }
     jobs = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL", "4")
     if not jobs.isdecimal() or not 1 <= int(jobs) <= 64:
         raise ValueError("CMAKE_BUILD_PARALLEL_LEVEL must be in [1, 64]")
@@ -104,26 +112,17 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
     manifest = source / "install/shmem/deepep-sdk.json"
     if if_needed and not rebuild and manifest.is_file():
         identity = json.loads(manifest.read_text(encoding="utf-8"))
-        expected_build = {
-            "cann_version": version["Version"],
-            "cann_timestamp": version.get("timestamp", "unknown"),
-            "target": lock["target"],
-            "source_patches": patches,
-            "rdma_backend": "HNS_1825",
-            "hns_1825_pi_on_chip": rdma_build_mode(source),
-        }
-        if identity.get("revision") != revision or identity.get("build") != expected_build:
+        recorded = identity.get("build")
+        validate_build_identity(recorded, require_rdma=True)
+        # An installed SDK retains the attested device mode after CMake intermediates are removed.
+        mode = rdma_build_mode(source) if (source / "build").exists() else recorded["hns_1825_pi_on_chip"]
+        if identity.get("revision") != revision or recorded != dict(build_identity, hns_1825_pi_on_chip=mode):
             raise RuntimeError(
                 "Existing SHMEM build identity changed; stop SDK users and rebuild explicitly "
                 "with --rebuild (cluster launcher: --rebuild-shmem)"
             )
-        # 复用也校验全部头文件/库哈希，不把存在 manifest 当成构建成功。
-        import sys
-
-        sys.path.insert(0, str(ROOT))
-        from build_support import validate_shmem_sdk
-
-        validate_shmem_sdk(manifest.parent, lock["shmem"])
+        # 复用也校验全部头文件和库的哈希。
+        check(manifest.parent, expected=lock["shmem"])
         print(f"[SHMEM] Reusing validated SDK: {manifest.parent}", flush=True)
         return manifest
     if not rebuild and any((source / name).exists() for name in ("build", "install")):
@@ -169,14 +168,8 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
     manifest = record(
         sdk,
         revision,
-        build_info={
-            "cann_version": version["Version"],
-            "cann_timestamp": version.get("timestamp", "unknown"),
-            "target": lock["target"],
-            "source_patches": patches,
-            "rdma_backend": "HNS_1825",
-            "hns_1825_pi_on_chip": rdma_build_mode(source),
-        },
+        build_info=dict(build_identity, hns_1825_pi_on_chip=rdma_build_mode(source)),
+        expected=lock["shmem"],
     )
     print(f"[SHMEM] SDK identity: {manifest}", flush=True)
     print("[SHMEM] Add third-party/shmem/install/shmem/lib to LD_LIBRARY_PATH before loading the wheel.")
