@@ -821,6 +821,44 @@ def test_urma_gelu_uses_single_planar_projection_within_existing_limits(backend,
         b.destroy()
 
 
+def test_urma_ep16_w8a8_gelu_uses_same_public_windowed_forward(backend, monkeypatch):
+    from deep_ep_experimental.megamoe import backend as selector
+
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
+    monkeypatch.setattr(api, "_host_boot_id", lambda: "ab" * 16)
+    group = backend.group_type(16)
+    model = dict(activation="gelu", mma_type="fp8xfp8")
+    with pytest.raises(ValueError, match="install a MegaMoE wheel with URMA W8A8 support"):
+        api.SymmBuffer(group, 800, 257, 25, 256, 256, **model)
+
+    def window_bytes(world, experts, tokens, topk, hidden, intermediate, mma_type):
+        assert (world, experts, topk, hidden, intermediate, mma_type) == (16, 50, 25, 256, 256, "fp8xfp8")
+        return 2 << 20, tokens << 20
+
+    monkeypatch.setattr(backend.ext, "urma_w8a8_enabled", True, raising=False)
+    monkeypatch.setattr(backend.ext, "urma_window_bytes", window_bytes)
+    b = api.SymmBuffer(group, 800, 257, 25, 256, 256, **model)
+    try:
+        weights = tuple(
+            (Tensor(np.zeros((50, 256, 256)), "float8_e4m3fn"),
+             Tensor(np.full((50, 256, 4, 2), 127), "float8_e8m0fnu"))
+            for _ in range(2)
+        )
+        weights = api.transform_weights_for_mega_moe(*weights, activation="gelu")
+        b.topk_idx.data[:] = np.arange(25)
+        b.topk_weights.data.fill(1.0 / 25)
+        y = Tensor(np.zeros((257, 256)), "bfloat16")
+        stats = Tensor(np.full(50, 7), "int32")
+        api.fp8_fp4_mega_moe(y, *weights, b, activation="gelu", cumulative_local_expert_recv_stats=stats)
+        assert b._plan.windowed and b._plan.mma_type == "fp8xfp8" and b._plan.topk_weights_type == 1
+        launches = native_launches(backend)
+        assert [launch[0].shape[0] for launch in launches] == [256, 1]
+        assert all(launch[4] is weights[0][0] and launch[5] is weights[1][0] for launch in launches)
+        np.testing.assert_array_equal(stats.data, np.repeat([264, 7], 25))
+    finally:
+        b.destroy()
+
+
 def test_urma_unsafe_target_limits_remain_explicit(backend, monkeypatch):
     from deep_ep_experimental.megamoe import backend as selector
 

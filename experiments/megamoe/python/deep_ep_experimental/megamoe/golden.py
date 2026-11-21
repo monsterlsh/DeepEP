@@ -164,11 +164,13 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
             if not needed:
                 continue
             # 必须保留原始 RNG 的整组生成顺序；单专家重新播种会改变待测权重。
-            raw = make_weights(local, model["hidden"], model["intermediate_hidden"], config["seed"] + owner, activation)
+            raw = make_weights(
+                local, model["hidden"], model["intermediate_hidden"], config["seed"] + owner, activation, mma_type
+            )
             for expert in needed:
                 token, slot = np.where(ids == owner * local + expert)
                 pair = tuple((data[expert], scale[expert]) for data, scale in raw)
-                yield token, weights[token, slot], pair
+                yield token, weights[token, slot], pair, mma_type
         shared = model["num_shared_experts"]
         if shared:
             raw = make_weights(
@@ -179,11 +181,12 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
                 activation,
             )
             for expert in range(shared):
-                yield np.arange(len(x)), None, tuple((data[expert], scale[expert]) for data, scale in raw)
+                pair = tuple((data[expert], scale[expert]) for data, scale in raw)
+                yield np.arange(len(x)), None, pair, "fp8xfp4"
 
     def forward(job):
-        token, route_weight, pair = job
-        w1, w2 = map(unpack_weight, pair)
+        token, route_weight, pair, weight_mode = job
+        w1, w2 = (unpack_weight(layer, weight_mode) for layer in pair)
         result = np.empty((len(token), model["hidden"]), dtype=np.float32)
         for start in range(0, len(token), chunk_tokens):
             stop = start + chunk_tokens

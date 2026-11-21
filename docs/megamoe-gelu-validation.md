@@ -11,23 +11,23 @@
 
 ## 接手任务
 
-从 `feat/megamoe-topk` 的待验提交构建一份 wheel，用同一产物回答三个问题：大批次是否选择了预期窗口；精度和逐专家计数是否正确；相同负载下，GELU 的端到端时延是否满足原 SwiGLU 基线。按下表执行，在报告中为每一行单独标明提交、拓扑、覆盖范围及结果。
+从 `feat/megamoe-topk` 的待验提交为目标软件环境构建 wheel，同组节点使用同一产物。下表是 11 月 20 日单分支交接时的专项检查索引。本轮先验 UBX，再验 950。
 
-| 顺序 | 硬件与用例 | 本轮交付 |
+| 索引 | 硬件与用例 | 专项检查 |
 | --- | --- | --- |
 | 1 | 一台空闲非 UBX 950 | 按第 2 节构建并运行 Linux 主机测试。保留完整 Git SHA、wheel SHA-256 和版本信息。 |
 | 2 | 非 UBX EP8 | 第 3 节的窗口边界；再按第 4 节设 `NODES=1 LOCAL_RANKS=8`，跑 B39280、E800、K25/K32 的均衡及热点。记录生产接口实际选窗、尾窗、双参考和第 5 节的性能配对。 |
 | 3 | B05+B07 或同型非 UBX EP16 | 两机各 8 卡。先跑 B257，再跑 B39280 的目标几何，覆盖 K25/K32、均衡及热点；验证跨节点结果、专家计数和配对时延。 |
-| 4 | 真实 UBX EP8、单机 EP16 | EP8 跑第 3 节的 K 和 B 边界。EP16 增加热点和零接收专家的 rank；记录其计数及全组完成状态。在原 SwiGLU 支持的 EP8/16、K≤8 上配对。 |
+| 4 | 真实 UBX EP8、单机 EP16 | 按第 2.2 节准备 UBX 编译环境并构建。EP8 跑第 3 节的 K 和 B 边界。EP16 增加热点和零接收专家的 rank，记录其计数及全组完成状态。在原 SwiGLU 支持的 EP8/16、K≤8 上配对。 |
 | 5 | 真实 EP32 | UBX 两台 16 卡、非 UBX 四台 8 卡分别验收。运行每卡 B39280、E800、K25，并复测 K32；按路由分别交付全量精度、内存和端到端耗时。非 UBX 做原 SwiGLU 配对；UBX 的 EP32/K25 记录绝对性能，同配置基线留空并注明原因。 |
 
 **交接时的证据（2026-11-20）**：B05 最新构建日志已产出 wheel，SHA-256 为 `3a07b4ae9f6e7bb7726203f4b879d1ce0f0ba0a0b86c81ab41e3caae643273ca`，本轮止于编译。第 6 节的非 UBX EP8 配对、K32 抽查及 EP16 小批次数据来自较早构建。当前生产自动选窗、大几何 EP16、两种真实 EP32 以及真实 UBX 的结果均需按上表取得。已有 wheel 只有在来源提交和摘要都能核实时才复用。
 
 同日 Windows 工作区运行 `python -m pytest -q experiments/megamoe/tests`，322 项通过、9 项失败。其中 3 项涉及 POSIX 路径或启动命令，6 项在进入 SHMEM SDK 校验前触发了原生 wheel 的 Linux 平台检查。第 2 节包含同一套测试的 Linux 复验命令。
 
-## 1. 检查每个节点是否空闲
+## 1. 可选：查看节点占用
 
-编译、生成 CPU Golden、启动 torchrun 前，分别在所有参与节点执行下列命令。检查 `vmstat` 后几次采样的 `id`、`wa` 和进程列表，确保没有其他计算或编译作业；检查所有 NPU 的利用率、健康状态以及进程表，确保没有占卡作业。多机任务须同时确认所有参与节点空闲。任一节点占用或无法确认时，本次跳过并记录时间及原因。运行中发现其他作业进入，结束本轮自己的进程，保留已写日志。
+如需记录手动实验时的机器负载，可在参与节点执行下列命令，查看 `vmstat` 后几次采样的 `id`、`wa`，以及 NPU 利用率和进程表。
 
 ```bash
 hostname
@@ -39,13 +39,14 @@ df -h "$PWD"
 
 ## 2. 编译并安装到独立环境
 
-从目标提交的干净检出开始，在仓库根目录运行以下 Bash 命令。使用 Linux aarch64、CANN 9.2.0、匹配的 torch / torch_npu 和 Python。下例推荐 Python 3.11，与已有 wheel 及主机测试依赖匹配。将两个路径换为本机路径。所有参与节点需要相同的 wheel、依赖版本和兼容的驱动。
+从远程 Linux 的功能分支仓库根目录 `/mnt/share/l00911701/DeepEP-UBX` 开始，在目标提交的干净检出中用 Bash 操作。使用 Linux aarch64、CANN 9.2.0 或更高版本，以及相互匹配的 Python、torch 和 torch_npu。以下示例使用 Python 3.11。分步构建时，按板型准备第 2.1 或 2.2 节的环境，再在同一终端执行第 2.3 节。
+
+### 2.1 非 UBX Ascend 950 环境
+
+把 CANN 脚本和基础 Python 的路径换成本机路径。验证环境通过 `--system-site-packages` 复用基础 Python 环境里的框架包。
 
 ```bash
 set -eo pipefail
-export REPO=$(git rev-parse --show-toplevel)
-git rev-parse HEAD
-git status --short --branch
 export CANN_ENV=/path/to/cann-9.2.0/set_env.sh
 export BASE_PYTHON=/path/to/torch-npu-env/bin/python
 source "$CANN_ENV"
@@ -54,7 +55,60 @@ source .venv-megamoe/bin/activate
 export PYTHON="$VIRTUAL_ENV/bin/python"
 export PATH="$VIRTUAL_ENV/bin:$(dirname "$BASE_PYTHON"):$PATH"
 export LD_LIBRARY_PATH="$(dirname "$(dirname "$BASE_PYTHON")")/lib:${LD_LIBRARY_PATH:-}"
+```
+
+### 2.2 UBX 环境
+
+UBX 使用 Conda 环境 `py311_tpr` 和 `/usr/local/Ascend/cann-9.2.T101/set_env.sh`。确保 `conda` 在 PATH 中，且 `py311_tpr` 已安装与此 CANN 配套的 `torch` 和 `torch_npu`。在仓库根目录可直接构建并运行单机验证。
+
+```bash
+bash experiments/megamoe/scripts/build_ubx.sh
+```
+
+核对本机 CANN 安装路径时，运行 `bash experiments/megamoe/scripts/find_cann_env.sh`。默认从 `/` 扫描，也可传入一个或多个安装根目录。扫描会显示 UBX 配置路径是否可读，并把通过 Bash 语法检查的 CANN 候选输出为可复制的 `source` 命令。
+
+构建脚本将 wheel 安装到 `py311_tpr`，打印 wheel 路径和 SHA-256。默认拉取锁定的 CATLASS 提交。已有匹配的 CATLASS 检出时可设置 `CATLASS_ROOT`，重复构建时可复用 CMake 缓存。
+
+`build_ubx.sh` 默认使用仓内锁定的 SHMEM 子模块。`SHMEM_ROOT` 指向外部 SDK 且其 `deepep-sdk.json` 记录的提交与 `dependencies.lock.json` 一致时，脚本沿用该路径，再执行原有的 SDK 校验。如果路径无效、清单无法读取或提交不符，脚本会提示原因并改用仓内 SDK。`SHMEM_ROOT` 指向仓内 `third-party/shmem/install/shmem` 时也走子模块流程，校验已有产物的构建身份。
+
+仓内 SDK 已有产物且构建身份与当前环境不符时，脚本会报错并保留现有产物。需要重建时，先停止使用该 SDK 的作业，再执行下面的命令。`--rebuild-shmem` 始终选择仓内子模块并重建 SDK，即使终端已设置 `SHMEM_ROOT`。
+
+```bash
+bash experiments/megamoe/scripts/build_ubx.sh --rebuild-shmem
+```
+
+要试编官方 SHMEM 默认分支的最新提交，运行以下命令。
+
+```bash
+bash experiments/megamoe/scripts/build_ubx.sh --latest-shmem
+```
+
+`--latest-shmem` 将当前 DeepEP `HEAD` 的已提交源码复制到新的 `dist/shmem-latest-*/` 试编目录，拉取官方 SHMEM 默认分支，并把解析出的实际提交及其头文件哈希写入试编目录的依赖锁文件。每次试编都从该 SHMEM 提交构建 SDK，试编目录保留源码和构建日志。脚本将 wheel 安装到 `py311_tpr`，并打印 wheel 路径和 SHA-256。`--latest-shmem` 与 `--rebuild-shmem` 互斥。
+
+分步构建时，在已初始化 Conda 的 Bash 中运行下列命令，然后执行第 2.3 节。其他 UBX 节点可用同一段命令准备安装环境。
+
+```bash
+set -eo pipefail
+conda activate py311_tpr
+export CANN_ENV=/usr/local/Ascend/cann-9.2.T101/set_env.sh
+source "$CANN_ENV"
+export PYTHON="$CONDA_PREFIX/bin/python"
+export PATH="$CONDA_PREFIX/bin:$PATH"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+sed -n '/^Version=/p; /^timestamp=/p' "$ASCEND_HOME_PATH/compiler/version.info"
+```
+
+### 2.3 构建 wheel、安装并运行主机测试
+
+UBX 和非 UBX 都使用 `DEEPEP_NPU_ARCH=Ascend950`。wheel 包含 MTE 和 URMA，MegaMoE 在运行时根据板型选择后端。
+
+以下示例使用仓库锁定的 SHMEM 子模块。执行 `unset SHMEM_ROOT` 后，构建脚本会按需编译或复用子模块的 SDK。若使用已安装的外部 SDK，将该行替换为指向 SDK 安装根目录的 `export SHMEM_ROOT=...`，并核对目录里有 `include/host/shmem_host_def.h`、`lib/libshmem.so` 和 `deepep-sdk.json`。
+
+```bash
+git rev-parse HEAD
+git status --short --branch
 cmake --version
+unset SHMEM_ROOT
 git submodule update --init --recursive -- third-party/shmem
 depdir=$(mktemp -d)
 git clone https://gitcode.com/cann/catlass "$depdir/catlass"
@@ -68,22 +122,42 @@ WHEEL=$(sed -n 's/^\[BUILD\] Installed: //p' "$BUILD_LOG" | tail -1)
 sha256sum "$WHEEL"
 export SHMEM_ROOT="${SHMEM_ROOT:-$PWD/third-party/shmem/install/shmem}"
 export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
-python -I -c 'import torch, torch_npu; from deep_ep_experimental.megamoe import _C; print(torch.__version__, torch_npu.__version__, _C.api_protocol); assert _C.api_protocol == 13'
-python -m pip install -r experiments/megamoe/tests/requirements.txt
-python -m pytest -q experiments/megamoe/tests --tb=short
+"$PYTHON" -I -c 'import torch, torch_npu; from deep_ep_experimental.megamoe import _C; print(torch.__version__, torch_npu.__version__, _C.api_protocol); assert _C.api_protocol == 13'
+"$PYTHON" -m pip install -r experiments/megamoe/tests/requirements.txt
+"$PYTHON" -m pytest -q experiments/megamoe/tests --tb=short
 ```
 
-已有匹配的 SHMEM SDK 时，可在构建前导出 `SHMEM_ROOT`。构建使用仓库锁定的 SHMEM 提交 `b41a8fa560b03ddfd9001052cd6002c6a28de809`、HNS_1825 后端和 SDK 身份文件。wheel 写入本次构建输出所示的 `dist/build-*/`。多机时将该 wheel 复制到各节点，逐台核对 SHA-256，在对应虚拟环境执行 `python -m pip install --force-reinstall --no-deps "$WHEEL"`（`WHEEL` 指向该节点上的实物）。每台都设置 CANN、匹配的 SHMEM 运行库路径，复查上面的协议 13 导入命令。Git 提交、脚本及测试配置也使用同一版本。
+手动调用 `build.sh` 时，若出现 `SHMEM_ROOT must be an existing dependency directory`，可用 `declare -p SHMEM_ROOT` 查看当前终端导出的值。显式设置为空、指向不存在的目录或指向普通文件都会触发该错误。使用子模块时，在已准备好 CANN、Python 环境和 CATLASS 的原终端执行 `unset SHMEM_ROOT`，再从 `BUILD_LOG=$(mktemp)` 那行重试。`third-party/shmem/install/shmem` 是 SDK 安装产物，首次构建成功后再导出该路径。
+
+仓内 SHMEM SDK 按 `compiler/version.info` 中的 CANN 版本和时间戳校验。若在同一检出切换 CANN 后遇到 `Existing SHMEM build identity changed`，可从独立的干净检出构建。需要在当前检出重建时，先停止使用该 SDK 的作业，确保 `SHMEM_ROOT` 已取消设置，再给 `bash experiments/megamoe/scripts/build.sh` 加 `--rebuild-shmem`。
+
+### 2.4 在各节点验证安装
+
+构建使用仓库锁定的 SHMEM 提交 `b41a8fa560b03ddfd9001052cd6002c6a28de809`、HNS_1825 后端和 SDK 身份文件。wheel 写入本次构建输出所示的 `dist/build-*/`。多机时将该 wheel 复制到各节点，逐台核对 SHA-256，准备匹配的 CANN、驱动和 Python 环境，再执行 `python -m pip install --force-reinstall --no-deps "$WHEEL"`（`WHEEL` 指向该节点上的实物）。Git 提交、脚本及测试配置也使用同一版本。
 
 每个节点在实际运行环境中从仓库根进入独立运行目录，再执行后续各节。把 `RUN_BASE` 设在有足够 Golden 存储空间的文件系统上。多机间须打通 torchrun/TCPStore、SHMEM 及双参考所用的 HCCL 通信。
+
+验证已安装的 wheel 时，先加载 DeepEP 的 SHMEM 和 `torch`、`torch_npu`，再导入 MegaMoE 原生扩展。直接导入 `_C` 时，Linux 动态加载器可能找不到 `libc10.so` 等 PyTorch 运行库。
 
 ```bash
 set -eo pipefail
 export REPO=$(git rev-parse --show-toplevel)
-export RUN_BASE=${RUN_BASE:-$HOME/megamoe-validation}
+export RUN_BASE=${RUN_BASE:-/mnt/share/l00911701/megamoe-validation}
 mkdir -p "$RUN_BASE"
 cd "$RUN_BASE"
-python -c 'from importlib.resources import files; from deep_ep_experimental.megamoe import _C; assert files("deep_ep").joinpath("_build_info.json").is_file() and _C.api_protocol == 13; print(_C.__file__)'
+python -I - <<'PY'
+from importlib.resources import files
+from deep_ep._native import require_native
+
+assert files("deep_ep").joinpath("_build_info.json").is_file()
+require_native("MegaMoE validation")
+import torch
+import torch_npu
+from deep_ep_experimental.megamoe import _C
+
+assert _C.api_protocol == 13
+print(_C.__file__)
+PY
 ```
 
 ## 3. 单机精度、热点和窗口边界

@@ -54,12 +54,14 @@ def naive(config, world, source, bs, routing, check_tokens):
     x = dequantize_activation(*quantize_activation(x[selected], mma_type), mma_type)
     result = np.zeros_like(x)
     for owner in range(world):
-        raw = make_weights(local, model["hidden"], model["intermediate_hidden"], config["seed"] + owner, activation)
+        raw = make_weights(
+            local, model["hidden"], model["intermediate_hidden"], config["seed"] + owner, activation, mma_type
+        )
         result += local_reference(
             x,
             ids[selected],
             weights[selected],
-            *map(unpack_weight, raw),
+            *(unpack_weight(pair, mma_type) for pair in raw),
             owner * local,
             activation,
             mma_type,

@@ -116,27 +116,39 @@ def dequantize_activation(codes, scales, mma_type="fp8xfp4"):
     return values * np.repeat(scale, 32, axis=-1)
 
 
-def unpack_weight(pair):
-    packed, scales = pair
-    packed = np.asarray(packed, dtype=np.uint8)
-    values = np.empty((*packed.shape[:-1], packed.shape[-1] * 2), dtype=np.float32)
-    values[..., ::2], values[..., 1::2] = FP4[packed & 15], FP4[packed >> 4]
+def unpack_weight(pair, mma_type="fp8xfp4"):
+    data, scales = pair
+    data = np.asarray(data, dtype=np.uint8)
+    if mma_type == "fp8xfp8":
+        values = fp8_decode(data)
+    else:
+        values = np.empty((*data.shape[:-1], data.shape[-1] * 2), dtype=np.float32)
+        values[..., ::2], values[..., 1::2] = FP4[data & 15], FP4[data >> 4]
     shape = (*values.shape[:-1], values.shape[-1] // 32)
     scale = np.exp2(np.asarray(scales, dtype=np.int16).reshape(shape) - 127).astype(np.float32)
     return values * np.repeat(scale, 32, axis=-1)
 
 
-def make_weights(experts, hidden, intermediate, seed, activation="swiglu"):
-    """Generate packed FP4 and non-uniform E8M0 scales; never quantize weights on the hot path."""
+def make_weights(experts, hidden, intermediate, seed, activation="swiglu", mma_type="fp8xfp4"):
+    """Generate finite E4M3 or packed E2M1 weights with non-uniform E8M0 scales."""
     if activation not in ("swiglu", "gelu"):
         raise ValueError("activation must be 'swiglu' or 'gelu'")
+    if mma_type not in ("fp8xfp4", "fp8xfp8", "fp4xfp4"):
+        raise ValueError(f"Unknown MegaMoE mma_type: {mma_type!r}")
+    fp8_weights = mma_type == "fp8xfp8"
     rng = np.random.default_rng(seed)
     result = []
     for n, k in (((2 if activation == "swiglu" else 1) * intermediate, hidden), (hidden, intermediate)):
-        packed = rng.integers(0, 256, (experts, n, k // 2), dtype=np.uint8)
-        exponent = int(np.floor(-0.5 * np.log2(k))) - 2
+        data = rng.integers(0, 256, (experts, n, k if fp8_weights else k // 2), dtype=np.uint8)
+        if fp8_weights:
+            # Replace the two E4M3 NaN codes with signed finite maxima. Work
+            # one expert at a time to bound the mask's memory at large E.
+            for expert in data:
+                expert[(expert & 127) == 127] ^= 1
+        # Match the fixture's approximate weight RMS between E2M1 and E4M3.
+        exponent = int(np.floor(-0.5 * np.log2(k))) - (7 if fp8_weights else 2)
         scales = rng.integers(127 + exponent - 1, 127 + exponent + 2, (experts, n, k // 64, 2), dtype=np.uint8)
-        result.append((packed, scales))
+        result.append((data, scales))
     return tuple(result)
 
 

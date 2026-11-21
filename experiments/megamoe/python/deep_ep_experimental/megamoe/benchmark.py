@@ -286,8 +286,8 @@ def run(args, config, group):
     storage_kind = "fp4" if mma_type == "fp4xfp4" else "fp8"
     if args.input != "bf16" and args.input != storage_kind:
         raise ValueError(f"{mma_type} buffered input must be {storage_kind}")
-    if urma and (args.input != "fp8" or mma_type != "fp8xfp4"):
-        raise ValueError("URMA supports routed FP8xFP4 with --input fp8; other input/precision modes require MTE")
+    if urma and args.input != "fp8":
+        raise ValueError("URMA requires --input fp8")
     timer_ranks = args.timer_ranks if args.timer_ranks is not None else list(range(min(world, 8)))
     if any(value >= world for value in timer_ranks):
         raise ValueError("timer rank exceeds EP world size")
@@ -335,7 +335,7 @@ def run(args, config, group):
     if urma:
         manifest.update(
             implementation="consumer",
-            precision="routed_w4_shared_w8",
+            precision="routed_w8" if mma_type == "fp8xfp8" else "routed_w4_shared_w8",
             dual_reference=bool(getattr(args, "dual_reference", False)),
             wait_events=False,
             device_routing_in_kernel=True,
@@ -367,10 +367,6 @@ def run(args, config, group):
 
     def device_pair(pair):
         data, scale = pair
-        if mma_type == "fp8xfp8":
-            from .reference import expand_fp4_to_fp8
-
-            data, scale = expand_fp4_to_fp8(pair)
         codes = torch.from_numpy(data).npu()
         if mma_type == "fp8xfp8":
             codes = codes.view(torch.float8_e4m3fn)
@@ -380,7 +376,8 @@ def run(args, config, group):
         raise RuntimeError("Timer requires a W4A8 wheel built with DEEPEP_MEGAMOE_TIMER=ON")
     activation_name = model.get("activation", "swiglu")
     raw = make_weights(
-        model["num_experts"] // world, model["hidden"], model["intermediate_hidden"], config["seed"] + rank, activation_name
+        model["num_experts"] // world, model["hidden"], model["intermediate_hidden"], config["seed"] + rank,
+        activation_name, mma_type,
     )
     prepared = transform_weights_for_mega_moe(*map(device_pair, raw), activation=activation_name)
     shared_raw, shared_kwargs = None, {}

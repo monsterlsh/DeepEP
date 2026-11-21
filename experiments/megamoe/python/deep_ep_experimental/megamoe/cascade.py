@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by SimpleBrightMan 2026
 
-"""NPU operator cascade for accuracy, using the same raw FP4 data as MegaMoE.
+"""NPU operator cascade for accuracy, using the same raw weights as MegaMoE.
 
 GMM outputs and activated inputs round to BF16. Routing, EP reduction and
 shared-expert addition use FP32 before one final BF16 conversion, as in the CPU
@@ -87,10 +87,10 @@ def init_process_group(host_group):
 
 
 class CascadeReference:
-    """Independent MXFP8/FP4 FFN cascade; prepare planar weights once.
+    """Independent MXFP8 FFN cascade; prepare planar weights once.
 
-    raw and shared_raw are the two (packed_uint8, E8M0_uint8) weight pairs from
-    reference.make_weights, before any gate/up interleaving or NZ conversion.
+    raw and shared_raw are the GMM1/GMM2 (uint8 codes, E8M0 uint8 scales) pairs
+    from reference.make_weights, before any gate/up interleaving or NZ conversion.
     All ranks must call forward in the same order with the same batch size.
     """
 
@@ -129,8 +129,8 @@ class CascadeReference:
             raise ValueError("mma_type must be fp8xfp4 or fp8xfp8")
         if self.activation == "gelu" and "activation_clamp" in model:
             raise ValueError("activation_clamp is only defined for SwiGLU")
-        if self.mma_type == "fp4xfp4" and self.shared_experts:
-            raise ValueError("A4W4 cascade does not accept shared experts")
+        if self.mma_type == "fp8xfp8" and self.shared_experts:
+            raise ValueError("FP8xFP8 cascade does not accept shared experts")
         self._situ_glu = None
         if self.activation == "situglu":
             # aclnnSituGlu multiplies by FP32 reciprocals internally; reject
@@ -149,7 +149,7 @@ class CascadeReference:
         self.fp8 = self._tensor_dtype("float8_e4m3fn")
         self.e8m0 = self._tensor_dtype("float8_e8m0fnu")
         self.e8m0_operator = self._operator_dtype("float8_e8m0fnu")
-        self.fp4 = self._operator_dtype("float4_e2m1fn_x2")
+        self.fp4 = None if self.mma_type == "fp8xfp8" else self._operator_dtype("float4_e2m1fn_x2")
         if self.mma_type == "fp4xfp4":
             self.activation_storage_dtype = self.fp4 if isinstance(self.fp4, self.torch.dtype) else self.torch.uint8
         else:
@@ -183,7 +183,7 @@ class CascadeReference:
         value = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
         allowed = (torch.uint8, torch.int8, self.e8m0) if scale else (torch.uint8, torch.int8)
         if value.dtype not in allowed:
-            raise TypeError(f"{name} requires raw packed uint8/int8 codes")
+            raise TypeError(f"{name} requires raw uint8/int8 codes")
         if value.device.type == "npu" and self.npu.get_npu_format(value) in (29, 50):
             raise ValueError(f"{name} requires raw ND data, before NZ conversion")
         return value.contiguous().view(torch.uint8).to(device="npu")
@@ -194,17 +194,23 @@ class CascadeReference:
         prepared = []
         intermediate = self.shared_intermediate if name == "shared" else self.intermediate
         gmm1_width = intermediate * (1 if self.activation == "gelu" else 2)
+        fp8_weights = self.mma_type == "fp8xfp8"
         for layer, (n, k) in enumerate(((gmm1_width, self.hidden), (self.hidden, intermediate))):
             pair = raw[layer]
             if not isinstance(pair, (tuple, list)) or len(pair) != 2:
-                raise TypeError(f"{name} GMM{layer + 1} requires (packed_data, E8M0_scales)")
+                raise TypeError(f"{name} GMM{layer + 1} requires (data_codes, E8M0_scales)")
             data = self._raw_bytes(pair[0], f"{name} GMM{layer + 1} data")
             scale = self._raw_bytes(pair[1], f"{name} GMM{layer + 1} scales", scale=True)
-            if tuple(data.shape) != (experts, n, k // 2) or tuple(scale.shape) != (experts, n, k // 64, 2):
-                raise ValueError(f"{name} GMM{layer + 1} raw packed weight/scale shapes differ from the model")
+            data_width = k if fp8_weights else k // 2
+            if tuple(data.shape) != (experts, n, data_width) or tuple(scale.shape) != (experts, n, k // 64, 2):
+                raise ValueError(f"{name} GMM{layer + 1} raw weight/scale shapes differ from the model")
             # The raw GMM1 rows are [gate | up], including at decode batch sizes.
-            data = self.npu.npu_format_cast(data, 29, customize_dtype=self.fp8, input_dtype=self.fp4)
-            prepared.append((data.transpose(1, 2), scale.view(self.e8m0).transpose(1, 2)))
+            if fp8_weights:
+                data = data.view(self.fp8)
+            else:
+                data = self.npu.npu_format_cast(data, 29, customize_dtype=self.fp8, input_dtype=self.fp4)
+                scale = scale.view(self.e8m0)
+            prepared.append((data.transpose(1, 2), scale.transpose(1, 2)))
         return tuple(prepared)
 
     def _normalize_scale(self, scale, rows, k):
@@ -267,10 +273,16 @@ class CascadeReference:
         return expanded.view(self.activation_storage_dtype), expanded_scale, row_idx, counts
 
     def _gmm(self, data, scale, counts, weight):
+        if self.mma_type == "fp8xfp8":
+            # MXFP8 is fully quantized. The operator takes the two E8M0
+            # payloads as scale and per_token_scale with explicit dtype enums.
+            weight_options = dict(scale=[weight[1]], scale_dtype=self.e8m0_operator)
+            scale = scale.view(self.torch.uint8)
+        else:
+            weight_options = dict(antiquant_scale=[weight[1]], weight_dtype=self.fp4)
         return self.npu.npu_grouped_matmul(
             x=[data],
             weight=[weight[0]],
-            antiquant_scale=[weight[1]],
             group_list=counts,
             group_type=0,
             group_list_type=1,
@@ -278,7 +290,7 @@ class CascadeReference:
             split_item=2,
             output_dtype=self.torch.bfloat16,
             per_token_scale_dtype=self.e8m0_operator,
-            weight_dtype=self.fp4,
+            **weight_options,
         )[0]
 
     def _activation_quantize(self, first, route_weights=None):

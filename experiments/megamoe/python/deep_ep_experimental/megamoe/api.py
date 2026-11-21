@@ -44,18 +44,22 @@ def _pair(value, name):
     return value
 
 
-def _urma_window_capacity(group, ext, world, local_experts, tokens, topk, hidden, intermediate):
+def _urma_window_capacity(group, ext, world, local_experts, tokens, topk, hidden, intermediate, mma_type):
     error, selected = None, 0
     try:
         free, _ = npu_api().mem_get_info(npu_api().current_device())
         # Public FP8 input/scales, routing IDs/weights, BF16 output and both
-        # packed FP4 weights with one E8M0 byte per 32 elements.
+        # single-projection weights with one E8M0 byte per 32 elements.
         resident = tokens * (3 * hidden + hidden // 32 + 8 * topk)
-        resident += local_experts * hidden * intermediate * 17 // 16
+        elements = 2 * local_experts * hidden * intermediate
+        resident += (elements // 2 if mma_type == "fp8xfp4" else elements) + elements // 32
         # sort() produces int32 values and int64 indices during route preflight.
         resident += tokens * topk * 12
         for candidate in dict.fromkeys(min(tokens, n) for n in (256, 128, 64)):
-            heap, scratch = ext.urma_window_bytes(world, local_experts, candidate, topk, hidden, intermediate)
+            args = (world, local_experts, candidate, topk, hidden, intermediate)
+            if mma_type == "fp8xfp8":
+                args += (mma_type,)
+            heap, scratch = ext.urma_window_bytes(*args)
             if resident + heap + scratch <= free and heap <= _MEGAMOE_PROFILES["urma"].maximum_capacity:
                 selected = candidate
                 break
@@ -179,9 +183,10 @@ class SymmBuffer:
 
         self._backend_name = select_backend(group)
         urma = self._backend_name == "urma"
+        urma_w8a8 = urma and size == 16 and mma_type == "fp8xfp8" and activation == "gelu" and num_shared_experts == 0
         self._urma_windowed = (
             urma and size in (8, 16, 32) and activation == "gelu" and mma_type == "fp8xfp4" and num_shared_experts == 0
-        )
+        ) or urma_w8a8
         self._windowed = self._urma_windowed
         if topk_weights_type is None:
             topk_weights_type = int(activation == "gelu")
@@ -213,8 +218,10 @@ class SymmBuffer:
                 raise ValueError("A4W4 (mma_type='fp4xfp4') is not enabled")
             if mma_type not in {"fp8xfp4", "fp8xfp8"}:
                 raise ValueError("mma_type must be fp8xfp4 or fp8xfp8")
-            if urma and (size not in (4, 8, 16, 32) or mma_type != "fp8xfp4"):
-                raise ValueError("URMA supports EP4/EP8/EP16/EP32 and routed FP8xFP4")
+            if urma and size not in (4, 8, 16, 32):
+                raise ValueError("URMA supports EP4/EP8/EP16/EP32")
+            if urma and mma_type == "fp8xfp8" and not urma_w8a8:
+                raise ValueError("URMA W8A8 requires single-host EP16 GELU with zero shared experts")
             if urma and size == 32 and not self._urma_windowed:
                 raise ValueError("URMA EP32 requires routed GELU FP8xFP4 with zero shared experts")
             if mma_type != "fp8xfp4" and num_shared_experts:
@@ -242,6 +249,10 @@ class SymmBuffer:
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
+        if urma_w8a8:
+            error = None if getattr(ext, "urma_w8a8_enabled", False) else "install a MegaMoE wheel with URMA W8A8 support"
+            collective_check(group, "URMA W8A8 availability", error)
+
         def heap_bytes(tokens):
             return int(ext.buffer_size(
                 size,
@@ -258,7 +269,7 @@ class SymmBuffer:
         self._native_capacity = num_max_tokens_per_rank
         if self._urma_windowed:
             self._native_capacity = _urma_window_capacity(
-                group, ext, size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden
+                group, ext, size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, mma_type
             )
         capacity = heap_bytes(self._native_capacity)
         if not urma and activation == "gelu" and not num_shared_experts and capacity > _MEGAMOE_PROFILES["mte"].maximum_capacity:
@@ -676,7 +687,7 @@ def _forward_inputs(
     if (shared[0].shape[0] if shared[0] is not None else 0) != b.num_shared_experts:
         raise ValueError("Shared expert count does not match the buffer configuration")
     expected_dtype = torch.uint8 if b.mma_type in {"fp8xfp4", "fp4xfp4"} else torch.float8_e4m3fn
-    if w1.dtype != expected_dtype:
+    if w1.dtype != expected_dtype or w2.dtype != expected_dtype:
         raise TypeError("Weight dtype differs from buffer mma_type")
     prepared_inputs = ()
     if w1.dtype == torch.uint8:
@@ -722,6 +733,12 @@ def _forward_inputs(
                         raise ValueError("URMA shared weights require contiguous ND FP8 E4M3")
                 else:
                     _check_fp4_weight_format(weight, name)
+    elif urma:
+        import torch_npu
+
+        for weight in (w1, w2):
+            if not weight.is_contiguous() or torch_npu.get_npu_format(weight) != 2:
+                raise ValueError("URMA W8A8 routed weights require contiguous ND FP8 E4M3")
     if cumulative_stats is not None:
         stats = cumulative_stats
         if (

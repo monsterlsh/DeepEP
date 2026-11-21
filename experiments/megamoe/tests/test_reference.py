@@ -2,10 +2,12 @@
 # Modified by SimpleBright_Man 2026
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from deep_ep_experimental.megamoe.cascade import CascadeReference
 from deep_ep_experimental.megamoe.reference import (
     FP4,
     FP8_POSITIVE,
@@ -18,6 +20,7 @@ from deep_ep_experimental.megamoe.reference import (
     fp8_encode,
     gelu,
     local_reference,
+    make_weights,
     quantize_activation,
     quantize_input,
     unpack_weight,
@@ -57,6 +60,36 @@ def test_fp4_nibble_and_scale_order():
     np.testing.assert_array_equal(result[:32:2], FP4)
     np.testing.assert_array_equal(result[1:32:2], FP4[::-1])
     np.testing.assert_array_equal(result[32:], result[:32] * 2)
+
+
+def test_fp8_fixture_has_unpacked_e4m3_weights_and_mx_scales():
+    layers = make_weights(2, 128, 64, seed=7, activation="gelu", mma_type="fp8xfp8")
+    for (data, scales), (n, k) in zip(layers, ((64, 128), (128, 64))):
+        assert data.shape == (2, n, k)
+        assert scales.shape == (2, n, k // 64, 2)
+        assert data.dtype == scales.dtype == np.uint8
+        assert np.any(~np.isin(fp8_decode(data), FP4))
+        expected = fp8_decode(data).reshape(2, n, k // 64, 2, 32)
+        expected *= np.exp2(scales[..., None].astype(np.int16) - 127)
+        np.testing.assert_array_equal(unpack_weight((data, scales), "fp8xfp8"), expected.reshape(data.shape))
+
+
+def test_fp8_cascade_passes_e8m0_as_full_quantization_scales():
+    cascade = SimpleNamespace(
+        mma_type="fp8xfp8",
+        npu=SimpleNamespace(npu_grouped_matmul=lambda **kwargs: [kwargs]),
+        torch=SimpleNamespace(uint8=np.uint8, bfloat16="bf16"),
+        e8m0_operator="e8m0",
+    )
+    activation_scales = np.array([119, 120], dtype=np.int8)
+    weight_scales = np.array([120, 121], dtype=np.uint8)
+    call = CascadeReference._gmm(cascade, "fp8 data", activation_scales, "counts", ("fp8 weight", weight_scales))
+    assert call["x"] == ["fp8 data"]
+    assert call["weight"] == ["fp8 weight"]
+    assert call["scale"][0] is weight_scales
+    assert call["scale_dtype"] == call["per_token_scale_dtype"] == "e8m0"
+    assert call["per_token_scale"][0].dtype == np.uint8
+    assert "antiquant_scale" not in call and "weight_dtype" not in call
 
 
 def test_local_moe_decomposition_and_empty_expert():

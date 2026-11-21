@@ -8,15 +8,15 @@
 #include <type_traits>
 #include "kernels/mega_moe_urma/catlass_gmm/mega_moe_grouped_matmul.hpp"
 #include "kernels/mega_moe_urma/common/mega_moe_route_views.hpp"
+#include "kernels/mega_moe_common/catlass_gmm/block_mmad_mx.hpp"
 
 // Continuous routed matmul and paired-UB FIX output.
 
 namespace UrmaMegaMoeImpl::GmmKernel {
-// Pinned CATLASS 2b4bd7c implements only NO_QUANT for L0C->UB. This adapter
-// follows its NO_SPLIT stride/subblock handling, but preserves the existing
-// W4 GM-output PER_TENSOR *64 restoration before the BF16 cast.
+// Pinned CATLASS 2b4bd7c implements only NO_QUANT for L0C->UB. Retain its
+// NO_SPLIT stride/subblock handling and apply the W4 restoration before BF16.
 constexpr AscendC::FixpipeConfig kPairedUbFixConfig{AscendC::CO2Layout::ROW_MAJOR, true};
-template <class TensorL0C>
+template <bool RestoreW4Scale = true, class TensorL0C>
 __aicore__ inline void StoreUb(const TensorL0C& src, uint32_t rows, uint32_t columns, uint8_t unitFlag)
 {
     using Accumulator = typename TensorL0C::Element;
@@ -28,9 +28,8 @@ __aicore__ inline void StoreUb(const TensorL0C& src, uint32_t rows, uint32_t col
     p.srcStride = tla::get<1, 1>(src.stride()) / tla::get<0, 0>(src.stride());
     p.dstStride = 256U;
     p.quantPre = ::QuantMode_t::QF322BF16_PRE;
-    // Bit representation of float(64), identical to CATLASS PER_TENSOR's
-    // static_cast<uint64_t>(*reinterpret_cast<int32_t*>(&params.scale)).
-    p.deqScalar = 0x42800000ULL;
+    // IEEE FP32 encodings of 64 (W4 restoration) and 1 (native MXFP8).
+    p.deqScalar = RestoreW4Scale ? 0x42800000ULL : 0x3f800000ULL;
     p.reluEn = false;
     p.unitFlag = unitFlag;
     p.dualDstCtl = 0U;
@@ -38,9 +37,74 @@ __aicore__ inline void StoreUb(const TensorL0C& src, uint32_t rows, uint32_t col
     const auto offset = src.layout()(src.coord());
     AscendC::Fixpipe<bfloat16_t, Accumulator, kPairedUbFixConfig>(dst, src.data()[offset], p);
 }
+
+template <class Base>
+struct RoutedMxTileCopy : Base {
+    template <class TensorC>
+    struct CopyL0CToDst {
+        template <class TensorL0C>
+        __aicore__ inline void operator()(const TensorC& dst, const TensorL0C& src, uint8_t unitFlag = 0)
+        {
+            StoreUb<false>(src, dst.rows, dst.columns, unitFlag);
+        }
+    };
+};
 }  // namespace UrmaMegaMoeImpl::GmmKernel
 
 namespace MegaMoeUrma {
+
+// Both routed projections use the same MXFP8 pipeline and produce the BF16
+// mailbox consumed by the existing paired AIV1 activation and row reorder.
+class RoutedMxMatmul {
+    using Arch = Catlass::Arch::Ascend950;
+    using Row = Catlass::layout::RowMajor;
+    using Col = Catlass::layout::ColumnMajor;
+    using F = fp8_e4m3fn_t;
+    using S = fp8_e8m0_t;
+    using C = bfloat16_t;
+    using SA = decltype(tla::MakeMxScaleLayout<S, Row, false>(uint32_t{}, uint32_t{}));
+    using SB = decltype(tla::MakeMxScaleLayout<S, Col, true>(uint32_t{}, uint32_t{}));
+    using Copy = UrmaMegaMoeImpl::GmmKernel::RoutedMxTileCopy<
+        Catlass::Gemm::Tile::PackedMxTileCopyTla<Arch, F, Row, F, Col, S, SA, S, SB, C, Row, void>>;
+    using Policy = Catlass::Gemm::MmadMx<Arch, true, 2, 1, false, 2, 2, 2, 2>;
+    using L1 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<256>>;
+    using L0 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<128>>;
+    using Block = Catlass::Gemm::Block::MegaMoeBlockMmadMx<Policy, L1, L0, F, F, C, void, Copy>;
+    struct MailboxTile {
+        uint32_t rows, columns;
+    };
+
+    template <class Element, class Layout>
+    __aicore__ static inline auto View(GM_ADDR address, const Layout& layout)
+    {
+        AscendC::GlobalTensor<Element> gm;
+        gm.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(address));
+        return tla::MakeTensor(gm, layout, Catlass::Arch::PositionGM{});
+    }
+
+public:
+    __aicore__ inline RoutedMxMatmul() : block_(resource_) {}
+
+    __aicore__ inline void Compute(const UrmaMegaMoeImpl::GMMAddrInfo& addr, uint32_t rows, uint32_t n, uint32_t k,
+                                  uint32_t column, uint32_t columns)
+    {
+        const uint32_t scaleK = k / 32U;
+        auto a = View<F>(addr.aGlobal, tla::MakeLayout<F, Row>(rows, k));
+        auto b = View<F>(addr.bGlobal, tla::MakeLayout<F, Col>(k, n));
+        auto scaleA = View<S>(addr.aScaleGlobal, tla::MakeMxScaleLayout<S, Row, false>(rows, scaleK));
+        auto scaleB = View<S>(addr.bScaleGlobal, tla::MakeMxScaleLayout<S, Col, true>(scaleK, n));
+        auto tileA = tla::GetTile(a, tla::MakeCoord(0U, 0U), tla::MakeShape(rows, k));
+        auto tileB = tla::GetTile(b, tla::MakeCoord(0U, column), tla::MakeShape(k, columns));
+        auto tileScaleA = tla::GetTile(scaleA, tla::MakeCoord(0U, 0U), tla::MakeShape(rows, scaleK));
+        auto tileScaleB = tla::GetTile(scaleB, tla::MakeCoord(0U, column), tla::MakeShape(scaleK, columns));
+        MailboxTile output{rows, columns};
+        block_(tileA, tileB, output, Catlass::GemmCoord{rows, columns, k}, tileScaleA, tileScaleB);
+    }
+
+private:
+    Catlass::Gemm::Block::MegaMoeResource resource_;
+    Block block_;
+};
 
 // One physical pipeline owns every L1/L0 slot and AIC/AIV0 credit for both
 // projections. Updating the expert or stage must never reset those indices.

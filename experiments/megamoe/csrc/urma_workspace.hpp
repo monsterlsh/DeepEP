@@ -133,6 +133,7 @@ inline void BindUrmaScratch(MegaMoeUrma::Arguments& a, const UrmaSymmetricLayout
         a.expandedScale = region(sent * c.dispatchScaleStride);
         a.gmm2Output = region(received * c.hidden * 2);
     }
+    a.gatheredInputX = c.fp8Weights ? region(received * c.hidden) : 0;
     a.gatheredInputScale = region(received * (c.hidden / 32));
     a.gatheredRouteWeights = region(c.topkWeightsType ? received * 32U : 0U);
     a.activation = region(received * c.intermediate);

@@ -23,7 +23,7 @@ def test_registered_windows_and_local_scratch(tmp_path):
 using namespace deepep::megamoe;
 using namespace MegaMoeUrma;
 
-uint64_t check(int world, int tokens, int k, int h = 4096, int i = 1536)
+uint64_t check(int world, int tokens, int k, int h = 4096, int i = 1536, bool fp8Weights = false)
 {
     const auto layout = MakeUrmaSymmetricLayout(world, tokens, k, h, UrmaCvRows(world, tokens), 1, true);
     const auto& c = layout.config;
@@ -53,6 +53,7 @@ uint64_t check(int world, int tokens, int k, int h = 4096, int i = 1536)
     a.config = c;
     a.config.localExperts = 800 / world;
     a.config.intermediate = i;
+    a.config.fp8Weights = fp8Weights;
     a.symmetric = 8192;
     a.config.windowedTransport = 1;
     uint64_t localBase = a.symmetric + c.symmetricBytes;
@@ -66,6 +67,12 @@ uint64_t check(int world, int tokens, int k, int h = 4096, int i = 1536)
     for (auto address : {a.expandedX, a.expandedScale, a.gmm2Output})
         assert(address >= a.symmetric && (address < localBase) == (world == 32));
     assert(a.expertRoutes >= localBase && a.activation >= localBase && a.systemWorkspace >= localBase);
+    if (fp8Weights) {
+        assert(a.gatheredInputX >= localBase);
+        assert(a.gatheredInputScale >= a.gatheredInputX + recv * h);
+    } else {
+        assert(a.gatheredInputX == 0);
+    }
     const bool target = (k == 25 || k == 32) && h == 4096 && i == 1536;
     assert(ReserveUrmaGeluLookup(a) == target);
     assert(a.geluLookupWords == 0 && (a.geluLookup != 0) == target);
@@ -95,6 +102,9 @@ int main()
             auto w64 = check(world, 64, k), w128 = check(world, 128, k), w256 = check(world, 256, k);
             assert(w64 < w128 && w128 < w256);
         }
+    }
+    for (int tokens : {64, 128, 256}) {
+        assert(check(16, tokens, 25, 4096, 1536, true) == check(16, tokens, 25) + 16ULL * tokens * 25 * 4096);
     }
     assert(check(32, 256, 32, 8192, 16384) > (4ULL << 30));
     for (auto shape : {std::vector<int>{4, 256, 1}, {32, 257, 25}, {32, 0, 25}, {32, 128, 33}}) {

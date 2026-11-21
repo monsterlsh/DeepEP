@@ -70,7 +70,8 @@ torch::Tensor allocate_timer(torch::Tensor example, const std::string& backend =
 void validate_timer(const torch::Tensor& timer, const std::string& backend);
 
 std::tuple<int64_t, int64_t> urma_window_bytes(int64_t world, int64_t experts, int64_t tokens, int64_t topk,
-                                                int64_t hidden, int64_t intermediate);
+                                               int64_t hidden, int64_t intermediate,
+                                               const std::string& mma_type = "fp8xfp4");
 
 int64_t mte_plan_bytes(int64_t world, int64_t experts, int64_t tokens, int64_t capacity, int64_t topk,
                        int64_t hidden, int64_t intermediate, const std::string& activation, const std::string& mma_type,

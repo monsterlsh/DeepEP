@@ -51,6 +51,7 @@ __aicore__ inline uint32_t FragmentGmm2Tiles(const Arguments& args, const Fragme
     return ComputeTileCount(fragment.rows, args.config.hidden);
 }
 
+template <bool Fp8Weights = false>
 __aicore__ inline UrmaMegaMoeImpl::GMMAddrInfo Gmm1Addresses(const Arguments& args, const Fragment& fragment)
 {
     const uint64_t h = args.config.hidden;
@@ -59,17 +60,20 @@ __aicore__ inline UrmaMegaMoeImpl::GMMAddrInfo Gmm1Addresses(const Arguments& ar
     const uint64_t scaleH = h / 32U;
     const uint64_t expert = fragment.expert;
     UrmaMegaMoeImpl::GMMAddrInfo addr{};
-    // X is gathered directly from source-major receive rows. MX scale rows
-    // have been packed once by AIV1 to preserve the normal aligned L1 loader.
-    addr.aGlobal = reinterpret_cast<GM_ADDR>(args.symmetric + args.config.receiveXOffset);
+    // AIV1 packs MX scale rows for both modes. It also packs FP8 input rows
+    // for CATLASS's contiguous MX loader; the W4 pipeline gathers X in L1.
+    const uint64_t input = Fp8Weights ? args.gatheredInputX + fragment.rowBegin * h
+                                     : args.symmetric + args.config.receiveXOffset;
+    addr.aGlobal = reinterpret_cast<GM_ADDR>(input);
     addr.aScaleGlobal = reinterpret_cast<GM_ADDR>(args.gatheredInputScale + fragment.rowBegin * scaleH);
-    addr.bGlobal = reinterpret_cast<GM_ADDR>(args.weight1 + expert * h * n / 2U);
+    addr.bGlobal = reinterpret_cast<GM_ADDR>(args.weight1 + expert * h * n / (Fp8Weights ? 1U : 2U));
     addr.bScaleGlobal = reinterpret_cast<GM_ADDR>(args.weightScale1 + expert * scaleH * n);
     addr.gmm1OutGlobal = reinterpret_cast<GM_ADDR>((args.gmm1Output ? args.gmm1Output : args.activation) +
                                                    fragment.rowBegin * n * sizeof(bfloat16_t));
     return addr;
 }
 
+template <bool Fp8Weights = false>
 __aicore__ inline UrmaMegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& args, const Fragment& fragment)
 {
     const uint64_t h = args.config.hidden;
@@ -79,7 +83,7 @@ __aicore__ inline UrmaMegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& ar
     UrmaMegaMoeImpl::GMMAddrInfo addr{};
     addr.aGlobal = reinterpret_cast<GM_ADDR>(args.activation + fragment.rowBegin * i);
     addr.aScaleGlobal = reinterpret_cast<GM_ADDR>(args.activationScale + fragment.rowBegin * scaleI);
-    addr.bGlobal = reinterpret_cast<GM_ADDR>(args.weight2 + expert * i * h / 2U);
+    addr.bGlobal = reinterpret_cast<GM_ADDR>(args.weight2 + expert * i * h / (Fp8Weights ? 1U : 2U));
     addr.bScaleGlobal = reinterpret_cast<GM_ADDR>(args.weightScale2 + expert * scaleI * h);
     // The peer's communication AIV1 copies full rows after all group N tiles finish.
     addr.gmm2OutGlobal = reinterpret_cast<GM_ADDR>(args.gmm2Output + fragment.rowBegin * h * sizeof(bfloat16_t));
@@ -255,12 +259,48 @@ __aicore__ inline ComputeBatchTask LoadComputeTask(const Arguments& args, uint32
     return {gm->stage, gm->batchIndex};
 }
 
+template <class TimerT>
+__aicore__ inline void RunRoutedMxCompute(const Arguments& args, uint32_t block, TimerT& timer)
+{
+    RoutedMxMatmul pipeline;
+    RoutedCompletionProducer completion(args, block);
+    OwnedRouteTileCursor tiles(args, block);
+    RoutedCompletionItem item;
+    while (tiles.Next(item)) {
+        const auto& fragment = item.fragment;
+        if (item.gmm1)
+            WaitComputeFlag(args.inputScaleDone, item.group, 1U);
+        else
+            WaitComputeFlag(args.activationDone, item.group, FragmentGmm1Tiles(args, fragment));
+        const uint32_t n = item.gmm1 ? args.config.intermediate : args.config.hidden;
+        const uint32_t k = item.gmm1 ? args.config.hidden : args.config.intermediate;
+        const uint32_t column = item.tile * kComputeTileN;
+        const uint32_t columns = n - column < kComputeTileN ? n - column : kComputeTileN;
+        const auto addresses = item.gmm1 ? Gmm1Addresses<true>(args, fragment) : Gmm2Addresses<true>(args, fragment);
+        const auto meta = ComputeTileTraceMeta(FragmentTraceMeta(fragment, item.group), 0U, column, fragment.rows, columns);
+        const auto phase = item.gmm1 ? Phase::Gmm1 : Phase::Gmm2;
+        timer.Begin(phase);
+        const auto start = timer.TraceBegin();
+        completion.Acquire();
+        pipeline.Compute(addresses, fragment.rows, n, k, column, columns);
+        timer.TraceEnd(item.gmm1 ? TraceEvent::Gmm1Tile : TraceEvent::Gmm2Tile, start, meta);
+        completion.Commit();
+        timer.End(phase);
+    }
+    completion.Finish(timer);
+}
+
 // Only an AIC and its paired AIV0 enter this routine. They use the identical
 // host-planned expert schedule and global tile ownership. SwiGLU remains
 // independent; the GMM1 M-group window covers earlier activation latency.
 template <class TimerT>
 __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, TimerT& timer)
 {
+    if (args.config.fp8Weights) {
+        // The AIC loads native FP8 weights directly. AIV0 can proceed to Reduce.
+        if constexpr (g_coreType == AIC) RunRoutedMxCompute(args, block, timer);
+        return;
+    }
     UrmaContinuousGmm pipeline;
     RoutedCompletionProducer completion(args, block);
     bool hasWork = false;
@@ -314,6 +354,37 @@ __aicore__ inline bool AreGroupInputsReady(const Arguments& args, const Fragment
     return true;
 }
 
+__aicore__ inline void GatherMxInput(const Arguments& args, const Fragment& fragment)
+{
+    // FIX may own low 128KiB while this worker gathers. Temporarily use the
+    // scale-gather range and finish each copy before reusing it or gathering scales.
+    constexpr uint32_t scratchBytes = 64U * 1024U;
+    constexpr uint32_t scratchOffset = ActivationUbContract::inputEnd;
+    static_assert(scratchOffset + scratchBytes <= WindowGeluUb::tableOffset);
+    LocalTensor<uint8_t> scratch(TPosition::VECCALC, scratchOffset, scratchBytes);
+    GlobalTensor<uint8_t> source, destination;
+    source.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.symmetric + args.config.receiveXOffset));
+    source.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+    destination.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.gatheredInputX));
+    const uint32_t width = args.config.hidden;
+    const uint32_t rowsPerCopy = scratchBytes / width;
+    auto cursor = RuntimeSegments(args, fragment).MakeCursor();
+    RowSegment segment{};
+    while (cursor.Next(segment)) {
+        for (uint32_t first = 0; first < segment.rows; first += rowsPerCopy) {
+            const uint32_t remaining = segment.rows - first;
+            const uint32_t rows = remaining < rowsPerCopy ? remaining : rowsPerCopy;
+            const uint32_t bytes = rows * width;
+            DataCopy(scratch, source[(segment.receiveRow + first) * width], bytes);
+            SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+            DataCopy(destination[(fragment.rowBegin + segment.tileRow + first) * width], scratch, bytes);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        }
+    }
+}
+
 // A single worker owns a whole group's scales. Arbitrary segment row offsets
 // cannot be represented safely by the MX zZ L1 copy, so gather just this small
 // plane in aligned UB rows, then store compact GM rows for the original loader.
@@ -332,6 +403,7 @@ __aicore__ inline void GatherInputScaleImpl(const Arguments& args, const Fragmen
     // ends at192KiB, below the persistent counters at240KiB.
     static_assert(128U * 1024U + kComputeTileM * (8192U / 32U) <= kAiv1PersistentUbBase);
     const uint64_t start = timer.TraceBegin();
+    if (args.config.fp8Weights) GatherMxInput(args, fragment);
     auto cursor = RuntimeSegments(args, fragment).MakeCursor();
     RowSegment segment{};
     while (cursor.Next(segment)) {
@@ -365,7 +437,8 @@ __aicore__ inline void GatherInputScaleImpl(const Arguments& args, const Fragmen
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     WriteGmByPassDCache(ComputeFlag(args.inputScaleDone, index), 1);
     auto meta = FragmentTraceMeta(fragment, index);
-    meta.bytes = static_cast<uint64_t>(fragment.rows) * (scaleBytes + (args.config.topkWeightsType ? 4U : 0U));
+    meta.bytes = static_cast<uint64_t>(fragment.rows) * (scaleBytes + (args.config.topkWeightsType ? 4U : 0U) +
+                                                         (args.config.fp8Weights ? args.config.hidden : 0U));
     timer.TraceEnd(TraceEvent::InputScaleGather, start, meta);
 }
 

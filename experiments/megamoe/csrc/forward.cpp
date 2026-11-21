@@ -371,13 +371,14 @@ struct UrmaWorkspace {
     UrmaWorkspace(torch::Tensor example, int64_t world, int64_t intermediate, int64_t topk, int64_t cv_rows,
                   int64_t max_tokens, int64_t rank, uint64_t ffts, uint64_t symmetric_address, int64_t shared_experts,
                   int64_t shared_intermediate, int64_t num_experts, const PlatformInfo& platform, int64_t topk_weights_type,
-                  const std::string& activation, bool windowed, int64_t timeoutSeconds)
+                  const std::string& activation, bool windowed, int64_t timeoutSeconds, bool fp8Weights)
     {
         const auto layout = MakeUrmaSymmetricLayout(world, max_tokens, topk, example.size(1), cv_rows, topk_weights_type, windowed);
         args_.config = layout.config;
         args_.config.timeoutCycles = uint64_t(timeoutSeconds) * 1000000000ULL;
         args_.config.windowedTransport = windowed ? 1U : 0U;
         auto& config = args_.config;
+        config.fp8Weights = fp8Weights;
         config.activationMode = activation == "gelu"
                                     ? static_cast<uint32_t>(DEEPEP_MEGAMOE_IMPL_NAMESPACE::MegaMoeActMode::GELU)
                                     : static_cast<uint32_t>(DEEPEP_MEGAMOE_IMPL_NAMESPACE::MegaMoeActMode::SWIGLU);
@@ -451,14 +452,16 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
                 "ranks_per_node must divide EP");
     const bool urma = backend_ == Backend::Urma;
     TORCH_CHECK(!windowed_ ||
-                    (urma && activation_ == "gelu" && shared_experts == 0 && is_a8w4_ && topk_weights_type == 1),
-                "Windowed MegaMoE requires URMA, GELU, S0, FP8xFP4 and topk_weights_type=1");
+                    (urma && activation_ == "gelu" && shared_experts == 0 && topk_weights_type == 1),
+                "Windowed MegaMoE requires URMA, GELU, S0 and topk_weights_type=1");
     TORCH_CHECK(timeout_seconds_ > 0 && timeout_seconds_ <= 3600, "Plan timeout_seconds must be in [1,3600]");
     TORCH_CHECK(!windowed_ || (world == 32 ? ranks_per_node == 16 : (ranks_per_node == 0 || ranks_per_node == world)),
                 "Windowed MegaMoE requires one host for EP8/16 or two contiguous 16-rank hosts for EP32");
     if (urma) {
-        TORCH_CHECK(is_a8w4_ && !is_a4w4_ && intermediate >= 256 && intermediate <= 16384 && intermediate % 256 == 0,
-                    "URMA supports FP8xFP4 with I256..16384 aligned256");
+        TORCH_CHECK(is_a8w4_ || (windowed_ && world == 16),
+                    "URMA routed FP8xFP8 requires windowed EP16 GELU without shared experts");
+        TORCH_CHECK(intermediate >= 256 && intermediate <= 16384 && intermediate % 256 == 0,
+                    "URMA intermediate width must be divisible by 256, in [256,16384]");
         TORCH_CHECK(shared_experts == 0 || shared_experts == 1, "URMA supports S0/S1");
     } else {
         TORCH_CHECK(intermediate >= 256 && intermediate <= 4096 && intermediate % 128 == 0,
@@ -522,7 +525,8 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
         // S0 fixes all workspace dimensions at prepare, before any peer enters the wave.
         urma_ = std::make_unique<UrmaWorkspace>(example_, world_, intermediate_, topk_, UrmaCvRows(world_, max_tokens_),
                                                max_tokens_, rank, ffts_, symmetric_address_, shared_experts_, 0,
-                                               world_ * experts_, platform_, topk_weights_type_, activation_, windowed_, timeout_seconds_);
+                                               world_ * experts_, platform_, topk_weights_type_, activation_, windowed_,
+                                               timeout_seconds_, !is_a8w4_);
     }
     // Other URMA plans still need the shared tensor dimensions from forward.
 }
@@ -661,7 +665,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
             urma_ = std::make_unique<UrmaWorkspace>(example_, world_, intermediate_, topk_, UrmaCvRows(world_, bs),
                                                     max_tokens_, aclshmem_my_pe(), ffts_, symmetric_address_,
                                                     shared_experts_, shared_i, world_ * experts_, platform_, topk_weights_type_,
-                                                    activation_, windowed_, timeout_seconds_);
+                                                    activation_, windowed_, timeout_seconds_, !is_a8w4_);
             shared_intermediate_ = shared_i;
         }
         urma_->args_.config.bs = bs;
@@ -772,8 +776,10 @@ void validate_timer(const torch::Tensor& timer, const std::string& backend)
 }
 
 std::tuple<int64_t, int64_t> urma_window_bytes(int64_t world, int64_t experts, int64_t tokens, int64_t topk,
-                                                int64_t hidden, int64_t intermediate)
+                                               int64_t hidden, int64_t intermediate, const std::string& mma_type)
 {
+    TORCH_CHECK(mma_type == "fp8xfp4" || (mma_type == "fp8xfp8" && world == 16),
+                "URMA window supports routed FP8xFP4 or EP16 FP8xFP8");
     const auto layout = MakeUrmaSymmetricLayout(world, tokens, topk, hidden, UrmaCvRows(world, tokens), 1, true);
     TORCH_CHECK(experts >= 1 && experts <= 128 && topk <= world * experts, "Invalid URMA local expert count");
     TORCH_CHECK(intermediate >= 256 && intermediate <= 16384 && intermediate % 256 == 0,
@@ -783,6 +789,7 @@ std::tuple<int64_t, int64_t> urma_window_bytes(int64_t world, int64_t experts, i
     args.config.localExperts = experts;
     args.config.windowedTransport = 1U;
     args.config.intermediate = intermediate;
+    args.config.fp8Weights = mma_type == "fp8xfp8";
     uint64_t scratch = 0;
     BindUrmaScratch(args, layout, tokens, GetPlatformInfo().system_workspace, [&](uint64_t bytes) {
         scratch += bytes;
@@ -830,7 +837,8 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
                 "mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4");
     TORCH_CHECK(resolved_mma_type != "fp4xfp4", "A4W4 (mma_type=fp4xfp4) is not enabled");
     if (backend == "urma") {
-        TORCH_CHECK(resolved_mma_type == "fp8xfp4", "URMA requires routed FP8xFP4");
+        TORCH_CHECK(resolved_mma_type == "fp8xfp4" || (mma_type == "fp8xfp8" && windowed && world == 16),
+                    "URMA requires routed FP8xFP4 or windowed EP16 FP8xFP8");
         const auto layout = MakeUrmaSymmetricLayout(world, tokens, topk, hidden, 128, topk_weights_type, windowed);
         TORCH_CHECK(experts >= 1 && experts <= 128 && topk <= world * experts, "Invalid URMA expert count");
         return layout.config.symmetricBytes;

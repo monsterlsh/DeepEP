@@ -10,7 +10,9 @@ Modified by Joyce_An 2026
 
 ## GELU / TopK32 工作清单
 
-手动编译、准备 Golden、单机及多机精度和性能命令见[从构建到实机验收](../../docs/megamoe-gelu-validation.md)。非 UBX 950 沿用 MTE 后端，UBX 窗口内的同机流量走 MTE，跨机流量走 RoCE。
+`feat/megamoe-topk` 的 SwiGLU 和 GELU 共用一个 wheel。手动构建、Golden 生成、双参考精度检查和性能测试的命令见 [GELU 专项验证手册](../../docs/megamoe-gelu-validation.md)。
+
+非 UBX 950 沿用 MTE 后端，UBX 窗口内的同机流量走 MTE，跨机流量走 RoCE。
 
 阶段 A 使用同一台 UBX 上的 8 个 rank、URMA、预量化 FP8 输入、FP4 路由专家和零共享专家。构造 `SymmBuffer`、准备 W1 和调用 `fp8_fp4_mega_moe` 时均传 `activation="gelu"`。各 rank 的实际 B 相同。
 
@@ -42,6 +44,18 @@ torchrun --standalone --nproc-per-node=8 -m deep_ep_experimental.megamoe.benchma
 ```
 
 性能报告按一次逻辑 forward 汇总各窗 kernel 耗时。该指标不含输入预检、主机协调及窗口间的计数累加。可选设备 timer 只采首窗。
+
+### 单机 UBX EP16 GELU 精度
+
+用本次源码构建并安装 MegaMoE wheel 后运行以下命令。两种精度均调用 UBX URMA 融合算子，默认按 `feat/roce-support` 的批量精度流程与 CPU Golden 做全量数值比对，并检查全量输出有限值和逐专家接收计数。W8A8 的两层路由权重使用独立生成的 FP8 E4M3 数据与 E8M0 scale。
+
+```bash
+python3 experiments/megamoe/scripts/run_ubx_ep16_gelu.py accuracy
+python3 experiments/megamoe/scripts/run_ubx_ep16_gelu.py accuracy w8a8
+python3 experiments/megamoe/scripts/run_ubx_ep16_gelu.py perf
+```
+
+`accuracy w4a8` 或 `accuracy w8a8` 可单独运行。设置 `CHECK_TOKENS=8` 可每卡抽查 8 个 token，设置 `DUAL_REFERENCE=1` 可加入独立 NPU 级联并使用 `accuracy.py` 中的双参考判据。性能入口测 W4A8。
 
 ## 1. 输入、输出与公开接口
 
@@ -115,7 +129,7 @@ buffer = SymmBuffer(
 MTE 约束：EP=2～128，E 可被 EP 整除且每卡最多 128 个路由专家；S=0～8；B=1～65536；
 H=1024～8192 且为64的倍数，I=256～4096 且为128的倍数，1≤K≤min(32,E)。
 各 rank 必须同序、同 B 调用；仅推理，不支持反向、空/不等长 B 或图捕获。
-`mma_type="fp8xfp8"` 是保留入口，不支持共享专家/timer；**下文 benchmark 固定测试 W4A8，不提供权重 dtype 开关**。
+`mma_type="fp8xfp8"` 使用 FP8 E4M3 路由权重，不支持共享专家或 timer。UBX 上该精度限于单机 EP16 的分窗 GELU，传入连续 ND 权重 `[L,N,K]` 及 E8M0 scale `[L,N,K/64,2]`。benchmark 从配置文件的 `model.mma_type` 读取矩阵乘精度。
 
 兼容入口 `mega_moe(x, ids, weights, w1, w2, buffer, ...)` 返回 `(y, per_call_counts)`。
 接口签名参照 DeepGEMM `78b6900`。本实现使用 int32 路由 ID、E8M0 输入 scale，

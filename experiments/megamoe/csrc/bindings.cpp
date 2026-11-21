@@ -15,6 +15,7 @@ PYBIND11_MODULE(_C, module)
     module.attr("api_protocol") = 13;
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.attr("urma_ep8_window_tokens") = MegaMoeUrma::kWindowTokens;
+    module.attr("urma_w8a8_enabled") = true;
     module.def("buffer_size", &deepep::megamoe::buffer_size, py::arg("world"), py::arg("experts"), py::arg("tokens"),
                py::arg("topk"), py::arg("hidden"), py::arg("backend") = "mte", py::arg("topk_weights_type") = 0,
                py::arg("mma_type") = "", py::arg("windowed") = false);
@@ -23,7 +24,8 @@ PYBIND11_MODULE(_C, module)
                py::arg("hidden"), py::arg("intermediate"), py::arg("activation"), py::arg("mma_type"),
                py::arg("shared_experts") = 0, py::arg("topk_weights_type") = 0);
     module.def("urma_window_bytes", &deepep::megamoe::urma_window_bytes, py::arg("world"), py::arg("local_experts"),
-               py::arg("tokens"), py::arg("topk"), py::arg("hidden"), py::arg("intermediate"));
+               py::arg("tokens"), py::arg("topk"), py::arg("hidden"), py::arg("intermediate"),
+               py::arg("mma_type") = "fp8xfp4");
     module.def("allocate_timer", &deepep::megamoe::allocate_timer, py::arg("example"), py::arg("backend") = "mte");
     module.def("validate_timer", &deepep::megamoe::validate_timer, py::arg("timer"), py::arg("backend"));
     py::class_<Plan>(module, "Plan")

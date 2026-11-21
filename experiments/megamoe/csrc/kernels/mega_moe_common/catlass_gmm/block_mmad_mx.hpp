@@ -219,6 +219,7 @@ public:
             }
         } else {
             l0CTensorList[0] = resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(0);
+            l0CEventList[0] = 0;  // Unit flags release L0C; MMAD still uses its MTE1_M event.
         }
         if constexpr (HAS_BIAS) {
             l1BiasTensor = resource.l1Buf.template GetBufferByByte<uint8_t>(l1Offset);

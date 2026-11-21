@@ -256,6 +256,7 @@ struct Config {
     uint64_t timeoutCycles = 120000000000ULL;
     uint32_t windowedTransport = 0U;  // UBX local MTE and optional inter-host RoCE.
     uint32_t routeSegmentCount, routeLinkCount;
+    uint32_t fp8Weights = 0U;  // Routed ND MXFP8 weights instead of packed MXFP4.
 };
 
 // This POD is copied as kernel launch arguments; every address is device GM.
@@ -318,6 +319,7 @@ struct Arguments {
     uint64_t gmmIssued;           // per-AIC monotonic routed output submission count
     uint64_t expertRoutes;        // int32 [384, sourceRowCapacity], one owner per expert
     uint64_t geluLookup;          // Device address of the Plan's calibrated FP32 factor pages.
+    uint64_t gatheredInputX;      // Expert-major FP8 input rows for the routed MXFP8 GMM1.
 };
 static_assert(sizeof(Fragment) == 40);
 static_assert(sizeof(RowSegment) == 40);
