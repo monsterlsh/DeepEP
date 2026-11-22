@@ -240,7 +240,8 @@ __aicore__ inline void CopyTokensAndMetaForDispatch(const TokenDispatchConfig& c
     remoteRankGlobalTensor.SetGlobalBuffer(reinterpret_cast<__gm__ ActivationType*>(payload));
     const uint32_t slot = static_cast<uint32_t>(remoteRankIdx) % HIERARCHICAL_RANKS_PER_HOST;
     for (int32_t begin = 0; begin < copyNum; begin += 8) {
-        const int32_t count = Min(8, copyNum - begin);
+        const int32_t remaining = copyNum - begin;
+        const int32_t count = remaining < 8 ? remaining : 8;
         uint32_t pending = (1U << count) - 1U;
         while (pending) {
             uint32_t ready = pending;

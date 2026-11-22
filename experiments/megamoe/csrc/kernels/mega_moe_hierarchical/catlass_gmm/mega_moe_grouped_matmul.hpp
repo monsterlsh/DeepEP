@@ -238,7 +238,10 @@ class DirectMxMatmulPipeline {
     Catlass::Gemm::Block::MegaMoeResource resource_;
     Block block_;
     uint32_t m_ = 0, n_ = 0, k_ = 0, scaleK_ = 0;
-    GM_ADDR activation_ = nullptr, weight_ = nullptr, activationScale_ = nullptr, weightScale_ = nullptr;
+    GM_ADDR activation_ = nullptr;
+    GM_ADDR weight_ = nullptr;
+    GM_ADDR activationScale_ = nullptr;
+    GM_ADDR weightScale_ = nullptr;
     GM_ADDR output_ = nullptr;
 
     template <class Element, class Layout>
@@ -314,7 +317,7 @@ public:
     template <class ProblemConfig>
     __aicore__ inline void UpdateProblem(const ProblemConfig& config, const GMMAddrInfo& addr)
     {
-        Pipeline::UpdateProblem(config, addr, addr.gmm1OutGlobal);
+        this->Pipeline::UpdateProblem(config, addr, addr.gmm1OutGlobal);
         fused_ = ProblemConfig::FUSED_GATE_UP;
         planarSingle_ = config.sharedPolicy.decode || config.activationFactor == ACTIVATION_N_SINGLE;
         halfN_ = config.outputN;
@@ -323,22 +326,22 @@ public:
     {
         // Logical activation columns map to contiguous gate/up pairs in GM.
         if (fused_) {
-            Pipeline::ComputeProjection(m, n * 2U, rows, cols * 2U, n * 2U);
+            this->ComputeProjection(m, n * 2U, rows, cols * 2U, n * 2U);
         } else {
-            Pipeline::ComputeProjection(m, n, rows, cols, n);
+            this->ComputeProjection(m, n, rows, cols, n);
             if (!planarSingle_) {
-                Pipeline::ComputeProjection(m, n + halfN_, rows, cols, n + halfN_);
+                this->ComputeProjection(m, n + halfN_, rows, cols, n + halfN_);
             }
         }
     }
     __aicore__ inline void Dequantize(uint32_t n, uint32_t rows, uint32_t cols)
     {
         if (fused_) {
-            Pipeline::DequantizeWeight(n * 2U, rows, cols * 2U);
+            this->DequantizeWeight(n * 2U, rows, cols * 2U);
         } else {
-            Pipeline::DequantizeWeight(n, rows, cols);
+            this->DequantizeWeight(n, rows, cols);
             if (!planarSingle_) {
-                Pipeline::DequantizeWeight(n + halfN_, rows, cols);
+                this->DequantizeWeight(n + halfN_, rows, cols);
             }
         }
     }
@@ -357,11 +360,11 @@ public:
 
     __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols)
     {
-        Pipeline::ComputeProjection(m, n, rows, cols, n);
+        this->ComputeProjection(m, n, rows, cols, n);
     }
     __aicore__ inline void Dequantize(uint32_t n, uint32_t rows, uint32_t cols)
     {
-        Pipeline::DequantizeWeight(n, rows, cols);
+        this->DequantizeWeight(n, rows, cols);
     }
 };
 

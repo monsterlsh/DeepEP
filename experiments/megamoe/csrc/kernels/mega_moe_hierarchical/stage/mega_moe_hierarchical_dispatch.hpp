@@ -150,9 +150,9 @@ __aicore__ inline void BuildCompactPlan(const MoeStageCommonConfig& common, cons
                 mask |= 1U << slot;
         }
         WriteGmByPassDCache(plan + 1 + t, static_cast<int32_t>(mask));
-        if (mask) WriteGmByPassDCache(plan + 1 + common.tokenNum + count++, t);
+        if (mask) WriteGmByPassDCache(plan + 1 + common.tokenNum + count++, static_cast<int32_t>(t));
     }
-    WriteGmByPassDCache(plan, count);
+    WriteGmByPassDCache(plan, static_cast<int32_t>(count));
 }
 
 __aicore__ inline void GatherRouteStripes(const AivJobContext& job, const MoeStageCommonConfig& common,
@@ -346,12 +346,13 @@ __aicore__ inline void PublishCoreClosure(const Params& params, uint32_t block, 
 {
     PipeBarrier<PIPE_ALL>();
     DataSyncBarrier<MemDsbT::DDR>();
-    WriteGmByPassDCache(ClosureSlot(params, block + (producers ? 32U : 0U)), params.tilingData->hierarchicalSequence);
+    WriteGmByPassDCache(ClosureSlot(params, block + (producers ? 32U : 0U)),
+                        static_cast<int32_t>(params.tilingData->hierarchicalSequence));
 }
 
 __aicore__ inline void CloseHost(const Params& params, uint32_t rank, bool producers)
 {
-    const uint32_t seq = params.tilingData->hierarchicalSequence;
+    const int32_t seq = static_cast<int32_t>(params.tilingData->hierarchicalSequence);
     for (uint32_t block = 0; block < params.tilingData->aicNum; ++block)
         WaitUntilGmFlagEquals(ClosureSlot(params, block + (producers ? 32U : 0U)), seq);
     DataSyncBarrier<MemDsbT::DDR>();

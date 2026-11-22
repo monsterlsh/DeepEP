@@ -96,7 +96,7 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_hierarchical_ker
                                weight_scales2, shared_weight1, shared_weight2, shared_weight_scales1,
                                shared_weight_scales2, y, expert_token_nums, workspace, timer};
     if (is_a8w4) {
-        if (ActivationFactor(tiling.actMode) == ACTIVATION_N_HALF) {
+        if (tiling.actMode != static_cast<uint8_t>(MegaMoeActMode::GELU)) {
             SelectWeighting<GROUPED_MATMUL_MODE_A8W4, true>(block_dim, ub_bytes, stream, args, tiling, ffts_addr);
         } else {
             SelectWeighting<GROUPED_MATMUL_MODE_A8W4>(block_dim, ub_bytes, stream, args, tiling, ffts_addr);

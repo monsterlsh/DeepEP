@@ -551,15 +551,18 @@ template <TemplateMegaMoeTypeClass>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::SharedActivationTile(const ProblemShape& shape,
                                                                               GMMAddrInfo& addr, uint32_t tile)
 {
-    if (params_.tilingData->sharedFp8) {
-        RunReadyGmm1ActivationTileA8W4<QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
-                                       GMM1_TILE_M, false, true>(
-            sharedEpilogueOp_, shape, addr, gmmExecutionConfig_.blockJob, tile, 0U, HierarchicalAscendTimer::AIV_SHARED_SWIGLU);
-    } else {
-        RunReadyGmm1ActivationTileA8W4<QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
-                                       GMM1_TILE_M, false>(sharedEpilogueOp_, shape, addr, gmmExecutionConfig_.blockJob,
-                                                           tile, 0U, HierarchicalAscendTimer::AIV_SHARED_SWIGLU);
+    if constexpr (ENABLE_A8W4) {
+        if (params_.tilingData->sharedFp8) {
+            RunReadyGmm1ActivationTileA8W4<QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType,
+                                           QuantScaleOutType, GMM1_TILE_M, false, true>(
+                sharedEpilogueOp_, shape, addr, gmmExecutionConfig_.blockJob, tile, 0U,
+                HierarchicalAscendTimer::AIV_SHARED_SWIGLU);
+            return;
+        }
     }
+    RunReadyGmm1ActivationTileA8W4<QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
+                                   GMM1_TILE_M, false>(sharedEpilogueOp_, shape, addr, gmmExecutionConfig_.blockJob,
+                                                       tile, 0U, HierarchicalAscendTimer::AIV_SHARED_SWIGLU);
 }
 
 template <TemplateMegaMoeTypeClass>
