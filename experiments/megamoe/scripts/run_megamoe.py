@@ -796,11 +796,11 @@ def main(argv=None, run_config=None):
     env = os.environ | args.run_environment
     python = env.get("PYTHON")
     cann_env = env.get("UBX_CANN_SETUP")
-    if args.node_rank is not None and (not python or cann_env and cann_env != env.get("UBX_CANN_LOADED")):
-        environment_script = cann_env if python else str(ENV_SCRIPT)
-        command = 'set -e; source "$1"; export UBX_CANN_LOADED="${UBX_CANN_SETUP:-$1}"; shift; exec "$PYTHON" "$@"'
+    loaded_cann = env.get("UBX_CANN_LOADED")
+    if not python or not loaded_cann or (cann_env and cann_env != loaded_cann):
+        command = 'set -e; source "$1" --preserve-python; shift; exec "$PYTHON" "$@"'
         worker = ["--worker"] if args.run_config is None else []
-        os.execvpe("bash", ["bash", "-c", command, "ubx-env", environment_script, str(SCRIPT), *worker, *argv], env)
+        os.execvpe("bash", ["bash", "-c", command, "ubx-env", str(ENV_SCRIPT), str(SCRIPT), *worker, *argv], env)
     env.pop("PYTHON_EXEC", None)  # Probe, torchrun and its workers must use the same Python.
     env["PYTHONSAFEPATH"] = "1"
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS"):

@@ -17,6 +17,7 @@ def clean_launcher_environment(monkeypatch):
     for name in (*launcher.FORWARDED_ENV, "UBX_CANN_LOADED", "MASTER_ADDR", "MASTER_PORT", "REMOTE_USER", "REMOTE_PORT"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("PYTHON", sys.executable)
+    monkeypatch.setenv("UBX_CANN_LOADED", "test-cann")
 
 
 def test_default_urma_timer_ranks_cover_four_per_node():
@@ -480,7 +481,8 @@ def test_run_json_sources_requested_cann_before_selected_python(tmp_path, monkey
 
     def execute(executable, command, env):
         assert executable == "bash" and 'source "$1"' in command[2]
-        assert command[4] == expected
+        assert command[4] == str(launcher.ENV_SCRIPT)
+        assert "--preserve-python" in command[2]
         assert env["UBX_CANN_SETUP"] == expected and env["PYTHON"] == sys.executable
         assert command[-2:] == ["--run-config", str(source)]
         raise ExecAttempt
@@ -488,6 +490,33 @@ def test_run_json_sources_requested_cann_before_selected_python(tmp_path, monkey
     monkeypatch.setattr(launcher.os, "execvpe", execute)
     with pytest.raises(ExecAttempt):
         launcher.main(["--run-config", str(source)])
+
+
+@pytest.mark.parametrize("selected_python", [None, sys.executable])
+def test_ep32_controller_loads_ubx_environment_before_launch(tmp_path, monkeypatch, selected_python):
+    source = tmp_path / "run.json"
+    preset = launcher.SCRIPT.parent / "configs/ubx_ep32_target.json"
+    data = json.loads(preset.read_text(encoding="utf-8"))
+    data.update(mode="perf", precision="a8w4", output_dir="run")
+    source.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.delenv("UBX_CANN_LOADED")
+    if selected_python is None:
+        monkeypatch.delenv("PYTHON")
+
+    class ExecAttempt(Exception):
+        pass
+
+    def execute(executable, command, env):
+        assert executable == "bash"
+        assert command[4:] == [str(launcher.ENV_SCRIPT), str(launcher.SCRIPT), "--run-config", str(source)]
+        assert env.get("PYTHON") == selected_python
+        raise ExecAttempt
+
+    monkeypatch.setattr(launcher.os, "execvpe", execute)
+    monkeypatch.setattr(launcher, "orchestrate", lambda *_: pytest.fail("launched before environment bootstrap"))
+    with pytest.raises(ExecAttempt):
+        launcher.entrypoint(["--run-config", str(source)])
+    assert not (tmp_path / "run").exists()
 
 
 @pytest.mark.parametrize("machine,preset", [("950pod", "950pod_target.json"), ("ubx", "ubx_ep16_target.json")])

@@ -66,6 +66,8 @@ URMA 的 `compare` 支持 EP16/EP32 的 A8W4、A8W8。A 为 GELU 提前加权，
 
 ### UBX 设备 timer 与通信掩盖率
 
+在 UBX 上对照 GELU 提前加权与 SwiGLU 后加权，按[UBX 掩盖率 A/B 快速开始](scripts/ubx_overlap_quickstart.md)生成运行 JSON、采集两组打点并读取结果。指南分别说明 EP16 MTE、EP32 MTE+RoCE 的本地阶段指标和 URMA 的通信完成指标。
+
 要在 MTE+RoCE 上采集设备 timer，在两台 UBX 安装同一份开启 `DEEPEP_MEGAMOE_TIMER` 的新 wheel。复制 EP32 预设，设置 `backend=mte_roce`、`mode=perf`、`precision=a8w4`、`timer: true`，填写 `output_dir`，从节点 0 启动。正式的 `profiling.json` 和同步端到端耗时先按关闭 timer 测量。随后独立诊断轮为默认采样 rank 记录首窗。
 
 MTE+RoCE trace 位于 `perf-<精度>/rank_<R>/bs_<B>/roce_trace.json`，可在 Perfetto 查看。每个采样 rank 同时保存 `roce_timer.bin` 原始缓冲区和 `roce_timer.json` 事件计数、token 范围和时钟单位。各 rank 的 trace 使用各自的设备时间起点。MTE+RoCE 的 trace 包含分层通信事件，现有 URMA 掩盖率汇总使用 URMA 的完成事件。

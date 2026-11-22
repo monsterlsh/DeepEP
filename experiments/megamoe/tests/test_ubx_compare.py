@@ -28,6 +28,7 @@ def clean_environment(monkeypatch):
     for name in (*launcher.FORWARDED_ENV, "MASTER_ADDR", "MASTER_PORT", "REMOTE_USER", "REMOTE_PORT"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("PYTHON", sys.executable)
+    monkeypatch.setenv("UBX_CANN_LOADED", "test-cann")
 
 
 def test_ep16_compare_runs_ab_then_ba_before_separate_timers(tmp_path, monkeypatch):

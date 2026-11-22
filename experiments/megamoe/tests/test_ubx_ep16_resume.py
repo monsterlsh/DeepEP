@@ -27,6 +27,7 @@ def ubx(tmp_path, monkeypatch):
     monkeypatch.setenv("GOLDEN_DIR", str(golden))
     monkeypatch.setenv("GOLDEN_WORKERS", "2")
     monkeypatch.setenv("PYTHON", sys.executable)
+    monkeypatch.setenv("UBX_CANN_LOADED", "test-cann")
     monkeypatch.setenv("PYTHON_EXEC", "unexpected-worker-python")
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(map(str, (launcher.SCRIPT.parents[1] / "python", launcher.REPO_ROOT))))
     for name in ("CHECK_TOKENS", "DUAL_REFERENCE", "ROUTING"):

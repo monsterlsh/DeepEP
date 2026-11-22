@@ -47,12 +47,13 @@ wait "$child"
 
 
 def node_script(work_dir, env, environment_script, argv):
-    """Build the node command, using an explicitly supplied Python if present."""
+    """Load the runtime on the current node before executing its worker."""
     lines = ["set -e", f"cd -- {shlex.quote(str(work_dir))}"]
     lines.extend(f"export {shlex.quote(f'{name}={value}')}" for name, value in env.items())
     lines.extend([
-        'if [[ -z ${PYTHON:-} ]]; then',
-        f"    source {shlex.quote(str(environment_script))}",
+        'if [[ -z ${PYTHON:-} || -z ${UBX_CANN_LOADED:-} || '
+        '( -n ${UBX_CANN_SETUP:-} && $UBX_CANN_SETUP != "$UBX_CANN_LOADED" ) ]]; then',
+        f"    source {shlex.quote(str(environment_script))} --preserve-python",
         "fi",
         'exec "$PYTHON" ' + shlex.join(map(str, argv)),
     ])

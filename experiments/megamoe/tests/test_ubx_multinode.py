@@ -51,7 +51,9 @@ def test_stage_failure_cancels_peer(tmp_path, monkeypatch, bash):
     assert "unexpected" not in peer_log
 
 
-def test_node_script_respects_explicit_python(tmp_path, bash):
+def test_node_script_reuses_initialized_environment(tmp_path, bash, monkeypatch):
+    monkeypatch.delenv("UBX_CANN_SETUP", raising=False)
+    monkeypatch.setenv("UBX_CANN_LOADED", "test-cann")
     fallback = tmp_path / "environment fallback.sh"
     fallback.write_text("return 19\n", encoding="utf-8")
     script = ubx_multinode.node_script(
@@ -60,3 +62,23 @@ def test_node_script_respects_explicit_python(tmp_path, bash):
     )
     result = subprocess.run([bash, "-c", script], check=True, capture_output=True, text=True)
     assert result.stdout.strip() == "explicit interpreter"
+
+
+@pytest.mark.parametrize("loaded_cann", [None, "different-cann"])
+def test_node_script_loads_local_cann_with_forwarded_python(tmp_path, bash, monkeypatch, loaded_cann):
+    if loaded_cann is None:
+        monkeypatch.delenv("UBX_CANN_LOADED", raising=False)
+    else:
+        monkeypatch.setenv("UBX_CANN_LOADED", loaded_cann)
+    monkeypatch.delenv("TEST_UBX_CANN", raising=False)
+    cann = tmp_path / "fake cann.sh"
+    cann.write_text("export TEST_UBX_CANN=loaded\n", encoding="utf-8")
+    environment = Path(ubx_multinode.__file__).with_name("ubx_env.sh")
+    script = ubx_multinode.node_script(
+        tmp_path.as_posix(),
+        {"PYTHON": Path(sys.executable).as_posix(), "UBX_CANN_SETUP": cann.as_posix()},
+        environment.as_posix(),
+        ["-c", "import os; print(os.environ['TEST_UBX_CANN']); print(os.environ['UBX_CANN_LOADED'])"],
+    )
+    result = subprocess.run([bash, "-c", script], check=True, capture_output=True, text=True)
+    assert result.stdout.splitlines() == ["loaded", cann.as_posix()]
