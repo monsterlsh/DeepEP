@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import shlex
+import subprocess
 import sys
 
 import pytest
@@ -487,3 +488,62 @@ def test_run_json_sources_requested_cann_before_selected_python(tmp_path, monkey
     monkeypatch.setattr(launcher.os, "execvpe", execute)
     with pytest.raises(ExecAttempt):
         launcher.main(["--run-config", str(source)])
+
+
+@pytest.mark.parametrize("machine,preset", [("950pod", "950pod_target.json"), ("ubx", "ubx_ep16_target.json")])
+@pytest.mark.parametrize("kind", ["relative", "absolute", "command"])
+def test_bootstrap_preserves_python_entrypoint(tmp_path, monkeypatch, machine, preset, kind):
+    if kind == "command":
+        configured = expected = "python3-selected"
+    else:
+        base = tmp_path / "base" / "bin" / "python"
+        base.parent.mkdir(parents=True)
+        base.touch()
+        executable = tmp_path / "selected venv" / "bin" / "python"
+        executable.parent.mkdir(parents=True)
+        try:
+            executable.symlink_to(base)
+        except OSError:
+            if sys.platform != "win32":
+                raise
+            # A junction exercises dereferencing a linked directory on Windows hosts
+            # where creating a symlink to a file requires additional privileges.
+            executable.parent.rmdir()
+            subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(executable.parent), str(base.parent)],
+                           check=True, capture_output=True)
+        assert executable.is_file() and executable.resolve() == base.resolve()
+        assert executable != executable.resolve()
+        expected = str(executable)
+        configured = str(executable.relative_to(tmp_path)) if kind == "relative" else expected
+
+    data = json.loads((launcher.SCRIPT.parent / "configs" / preset).read_text(encoding="utf-8"))
+    data.update(mode="perf", precision="a8w4", python=configured, master_addr="127.0.0.1", cann_env="sdk/set_env.sh")
+    expected_base = expected
+    if machine == "950pod":
+        data["base_python"] = data.pop("python")
+        data["python"] = ""
+    source = tmp_path / "run.json"
+    source.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.delenv("DEEPEP_950POD_BOOTSTRAPPED", raising=False)
+
+    class ExecAttempt(Exception):
+        pass
+
+    def execute(executable, command, env):
+        assert executable == "bash"
+        if machine == "950pod":
+            assert command[5] == expected
+            assert command[6] == str(Path(expected_base).parent.parent / "lib")
+        else:
+            assert env["PYTHON"] == expected
+        raise ExecAttempt
+
+    monkeypatch.setattr(launcher.os, "execvpe", execute)
+    with pytest.raises(ExecAttempt):
+        launcher.entrypoint(["--run-config", str(source)])
+    if machine == "950pod":
+        data["python"] = configured
+        expected_base = data["base_python"] = "python3-base"
+        source.write_text(json.dumps(data), encoding="utf-8")
+        with pytest.raises(ExecAttempt):
+            launcher.entrypoint(["--run-config", str(source)])

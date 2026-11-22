@@ -157,6 +157,13 @@ def read_run_config(path):
     return data
 
 
+def python_command(value, directory):
+    if "/" not in value and "\\" not in value:
+        return value
+    # A venv may symlink bin/python to its base interpreter. Exec must use the venv path.
+    return os.path.abspath(directory / Path(value).expanduser())
+
+
 def run_config_arguments(path, parser, argv, cli, data=None):
     """Use the command parser for JSON options and keep explicit CLI overrides."""
     strings = {"mode", "precision", "backend", "activation", "weighting", "input", "stage", "master_addr",
@@ -189,8 +196,8 @@ def run_config_arguments(path, parser, argv, cli, data=None):
                     raise ValueError(f"{key} 必须为 {env_types[key].__name__}")
                 if key in {"cann_env", "golden_dir", "run_base"}:
                     value = local_path(value)
-                if key == "python" and ("/" in value or "\\" in value):
-                    value = os.path.abspath(path.parent / Path(value).expanduser())
+                if key == "python":
+                    value = python_command(value, path.parent)
                 env_name = "UBX_CANN_SETUP" if key == "cann_env" else key.upper()
                 environment[env_name] = str(int(value)) if type(value) is bool else str(value)
             elif option in present or key in ("mode", "precision") and getattr(cli, key) is not None:
@@ -874,8 +881,9 @@ def pod_settings(path, data):
             value = data[name]
             if type(value) is not type(default):
                 raise ValueError(f"{name} 必须为 {type(default).__name__}")
-            if value and (name in {"golden_dir", "run_base", "output_dir", "cann_env"} or
-                          name in {"python", "base_python"} and ("/" in value or "\\" in value)):
+            if name in {"python", "base_python"}:
+                value = python_command(value, path.parent)
+            elif value and name in {"golden_dir", "run_base", "output_dir", "cann_env"}:
                 value = str((path.parent / Path(value).expanduser()).resolve())
             settings[name] = value
     args = argparse.Namespace(**settings)
