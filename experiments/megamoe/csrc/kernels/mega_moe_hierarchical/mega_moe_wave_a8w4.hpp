@@ -10,6 +10,7 @@
 #define MEGA_MOE_WAVE_A8W4_H
 
 #include "common/mega_moe_utils.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_wave_window.hpp"
 #include "mega_moe_arch35.hpp"
 
 namespace HierarchicalMegaMoeImpl {
@@ -366,6 +367,12 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     bool hasCombine = NextAivSlice(combine, false);
     SharedActivationCursor shared{};
     shared.done = sharedExpertNum_ == 0U;
+    const auto* tiling = params_.tilingData;
+    const bool interleaveCombine = TopkWeightsPrefetch && shared.done && UseHierarchicalRoce(tiling) &&
+        tiling->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 &&
+        tiling->actMode == static_cast<uint8_t>(MegaMoeActMode::GELU);
+    const uint64_t dispatchLead = static_cast<uint64_t>(mGroupsPerWave_) * GMM1_TILE_M;
+    bool dispatchAfterCombine = false;
     while (hasActivation || hasCombine || !shared.done || dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
         if (hasActivation && IsActivationReady(activation, readySequence)) {
             combinePipeline_.Drain(timer_);
@@ -377,12 +384,22 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
             continue;
         }
         if (dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
+            // GMM2-ready rows have their own gateway/return storage. Issue one slice
+            // while Dispatch is ahead, then drain its ring before reusing the local UB.
+            if (interleaveCombine && hasCombine &&
+                CanScheduleReadyCombine(dispatch.globalTokenIndex, combine.slice.end.globalTokenIndex,
+                                        dispatchLead, dispatchAfterCombine) && TryRunReadyCombine(combine)) {
+                hasCombine = NextAivSlice(combine, false);
+                dispatchAfterCombine = true;
+                continue;
+            }
             if (dispatchGroups >= mGroupsPerWave_) {
                 dispatchGroups = 0U;
                 ++dispatchWave;
             }
             combinePipeline_.Drain(timer_);
             DispatchNextExpertSlice(dispatch, dispatchGroups, dispatchWave);
+            dispatchAfterCombine = false;
             if (early && !readersDone && dispatch.expertIdx >= commonConfig_.moeExpertPerRank) {
                 PublishCoreClosure(params_, countWorkspace_.blockIdx, false);
                 readersDone = true;

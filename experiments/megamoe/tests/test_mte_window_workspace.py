@@ -52,8 +52,9 @@ struct BlockWorkspaceContext { unsigned blockIdx, blockNum; };
 int32_t *publishedPrefix;
 uint8_t *publishedFlag;
 unsigned readyWaits, prefixReads;
+unsigned expectedBlocks = 28;
 void WaitForMoeExpertTokenCountReady(uint8_t* flag, BlockWorkspaceContext owner, unsigned expert) {
-    assert(flag == publishedFlag && owner.blockIdx == 0 && owner.blockNum == 28 && expert == 0);
+    assert(flag == publishedFlag && owner.blockIdx == 0 && owner.blockNum == expectedBlocks && expert == 0);
     ++readyWaits;
 }
 namespace AscendC {
@@ -78,6 +79,12 @@ struct StoragePolicy {
 };
 int main() {
     using namespace MegaMoeImpl;
+    static_assert(!CanScheduleReadyCombine(2047, 2048, 1, false));
+    static_assert(!CanScheduleReadyCombine(7679, 2048, 5632, false));
+    static_assert(CanScheduleReadyCombine(7680, 2048, 5632, false));
+    static_assert(!CanScheduleReadyCombine(7680, 2048, 5632, true));
+    static_assert(!CanScheduleReadyCombine(349, 350, UINT64_MAX, false));
+    static_assert(!CanScheduleReadyCombine(UINT64_MAX, UINT64_MAX - 1U, 2, false));
     // Six GMM1 N256 tiles per GELU M group and four rounds on 28 cores give 19 groups.
     const PlatformInfo platform{28, 56, 248*1024, 0, 0};
     for (int bs : {255, 256, 257, 4095, 4096}) {
@@ -152,6 +159,74 @@ int main() {
     t.maxOutputSize = capacity;
     sw.SelectWaveStorage();
     assert(!sw.reuseWaveSlots_ && readyWaits == 0 && prefixReads == 0);
+    for (unsigned aic : {28U, 32U}) {
+        const PlatformInfo prefill{aic, aic * 2, 248 * 1024, 0, 0};
+        const unsigned geluGroups = aic == 28 ? 19 : 22;
+        const unsigned swigluGroups = aic == 28 ? 10 : 11;
+        const auto checkStorage = [&](const MegaMoeTilingData& tile, unsigned rows) {
+            const bool reuse = rows > MteWorkspaceRowCapacity(tile);
+            *publishedPrefix = rows;
+            StoragePolicy<true> policy{{&tile, {&ready, reinterpret_cast<uint8_t*>(counts)}},
+                                       {tile.epWorldSize, tile.moeExpertPerRank, 1}, 0, {12, aic}};
+            readyWaits = prefixReads = 0;
+            expectedBlocks = aic;
+            policy.SelectWaveStorage();
+            assert(readyWaits == 1 && prefixReads == 1 && policy.reuseWaveSlots_ == reuse);
+            const uint64_t start = 36127;
+            auto mapping = policy.WaveStorage(5, start);
+            assert(MapWaveRow(mapping, start + 17) == (reuse ? 2 * tile.mGroupsPerWave * 256 : start) + 17);
+        };
+        auto full = MakeTiling(2048, 4096, 1536, 25, 25, 32, 2048, 0, true, false, 0, prefill, 1, "gelu");
+        auto tail = MakeTiling(368, 4096, 1536, 25, 25, 32, 2048, 0, true, false, 0, prefill, 1, "gelu");
+        const auto linear = MteWorkspaceRowCapacity(full);
+        assert(full.mGroupsPerWave == geluGroups);
+        assert(linear == 51200 && MteWorkspaceWindowSlots(full) == 3 && MteWorkspaceWindowed(full));
+        assert(MteWorkspaceRowCapacity(tail) == 3 * geluGroups * 256);
+        assert(MteGeluLinearWindowEligible(full));
+        assert(MteTokenCombineRowBufferCount(full, true) == 6 && MteTokenCombineRowBufferCount(full, false) == 2);
+        auto narrowerSlots = full;
+        narrowerSlots.h = 6144;
+        assert(MteTokenCombineRowBufferCount(narrowerSlots, true) == 6);
+        narrowerSlots.h = 6400;
+        assert(MteTokenCombineRowBufferCount(narrowerSlots, true) == 2);
+        const WorkspaceInfo fullWorkspace(nullptr, &full);
+        const WorkspaceInfo tailWorkspace(nullptr, &tail);
+        assert(fullWorkspace.workspaceSize > tailWorkspace.workspaceSize);
+        assert(fullWorkspace.dispatchRevScalePtr - fullWorkspace.dispatchRevDataPtr == linear * 4096);
+
+        for (unsigned rows : {51200U, 51201U, full.maxOutputSize}) {
+            checkStorage(full, rows);
+        }
+        auto late = MakeTiling(2048, 4096, 3072, 25, 25, 32, 2048, 0, true, false, 0, prefill, 0, "swiglu");
+        assert(MteWorkspaceRowCapacity(late) == 3 * swigluGroups * 256);
+        assert(!MteGeluLinearWindowEligible(late) && MteTokenCombineRowBufferCount(late, true) == 2);
+        auto local = MakeTiling(2048, 4096, 1536, 25, 50, 16, 2048, 0, true, false, 0, prefill, 1, "gelu");
+        assert(MteWorkspaceRowCapacity(local) == 3 * geluGroups * 256);
+        auto large = MakeTiling(4096, 4096, 1536, 25, 25, 32, 4096, 0, true, false, 0, prefill, 1, "gelu");
+        assert(MteWorkspaceRowCapacity(large) == 3 * geluGroups * 256);
+
+        // UBX EP16 W256 already has enough ring-sized rows at I1536/K25.
+        const auto ubx = MakeTiling(256, 4096, 1536, 25, 50, 16, 256, 0, true, false, 0, prefill, 1, "gelu");
+        assert(MteWorkspaceRowCapacity(ubx) == 3 * geluGroups * 256);
+        assert(MteGeluLinearWindowEligible(ubx) && MteTokenCombineRowBufferCount(ubx, true) == 6);
+        checkStorage(ubx, 6400U);
+
+        // The same EP16 topology needs 8,192 rows at I4096/K32 and retains the
+        // original wave stride on skew. The 112-row tail needs no expansion.
+        const auto wide = MakeTiling(256, 4096, 4096, 32, 50, 16, 256, 0, true, false, 0, prefill, 1, "gelu");
+        const auto wideTail = MakeTiling(112, 4096, 4096, 32, 50, 16, 256, 0, true, false, 0, prefill, 1, "gelu");
+        const unsigned wideRing = aic == 28 ? 5376 : 6144;
+        assert(wide.mGroupsPerWave * 3 * 256 == wideRing && MteWorkspaceWindowSlots(wide) == 3);
+        assert(MteWorkspaceRowCapacity(wide) == 8192 && MteWorkspaceRowCapacity(wideTail) == wideRing);
+        const WorkspaceInfo wideWorkspace(nullptr, &wide);
+        const WorkspaceInfo wideTailWorkspace(nullptr, &wideTail);
+        assert(wideWorkspace.workspaceSize > wideTailWorkspace.workspaceSize);
+        assert(wideWorkspace.dispatchRevScalePtr - wideWorkspace.dispatchRevDataPtr == 8192 * 4096);
+        for (unsigned rows : {8192U, 8193U, wide.maxOutputSize}) {
+            checkStorage(wide, rows);
+        }
+        checkStorage(wideTail, 3584U);
+    }
     // The public 39,280 rows include a 112-row tail at W256. Both GMM inputs
     // are nibble-packed in A4W4, including the output of GELU/SwiGLU.
     for (int topk : {25, 32}) for (int rows : {256, 39280 % 256}) for (int early : {0, 1}) {

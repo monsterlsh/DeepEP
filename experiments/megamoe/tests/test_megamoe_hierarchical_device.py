@@ -100,3 +100,14 @@ def test_hierarchical_target_host_tiling_and_arena(compiler, tmp_path):
         [FIXTURES / "layout_stubs"],
         [],
     )
+
+
+def test_hierarchical_ready_combine_during_dispatch(compiler, tmp_path):
+    wave = (KERNEL / "mega_moe_wave_a8w4.hpp").read_text(encoding="utf-8")
+    name = "MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessAiv1PriorityStages"
+    scheduler = device_function(wave, name).replace(name, "Scheduler::Run")
+    fixture = (FIXTURES / "hierarchical_scheduler_test.cpp").read_text(encoding="utf-8")
+    source = tmp_path / "scheduler.cpp"
+    source.write_text(fixture.replace("/* DEVICE SCHEDULER */", scheduler), encoding="utf-8")
+    compile_and_run(compiler, source, tmp_path / "scheduler.exe", [KERNEL.parent.parent],
+                    ["-DDEEPEP_MEGAMOE_HIERARCHICAL_IMPL=1"])

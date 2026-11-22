@@ -45,6 +45,12 @@ MEGA_MOE_WAVE_WINDOW_INLINE constexpr uint64_t MapWaveRow(const WaveRowMapping& 
 {
     return mapping.storageStart + logicalRow - mapping.logicalStart;
 }
+
+MEGA_MOE_WAVE_WINDOW_INLINE constexpr bool CanScheduleReadyCombine(uint64_t dispatchedRows, uint64_t combineEndRow,
+                                                                     uint64_t requiredLeadRows, bool dispatchAfterCombine)
+{
+    return !dispatchAfterCombine && dispatchedRows >= combineEndRow && dispatchedRows - combineEndRow >= requiredLeadRows;
+}
 }  // namespace DEEPEP_MEGAMOE_IMPL_NAMESPACE
 
 #undef MEGA_MOE_WAVE_WINDOW_INLINE

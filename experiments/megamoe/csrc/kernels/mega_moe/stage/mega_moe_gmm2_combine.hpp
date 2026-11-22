@@ -1195,9 +1195,9 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
     if (owned.count == 0U) {
         return;
     }
-    // 按实际单卡 BS 选择，不能用专家 slice 行数：Prefill 恢复两槽以限制并发搬运，Decode 保留六槽。
-    // AIV1 任务不抢占；Dispatch/Combine 均排空后才交还 UB 和事件 0..5。
-    auto buffers = common.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS
+    // The linear GELU path can use six rows below the persistent LUT. Both
+    // Dispatch and Combine drain before yielding their UB and events 0..5.
+    auto buffers = MteTokenCombineRowBufferCount(*params.tilingData, InputReadyChecked) == WAVE_COMBINE_MAX_ROW_BUFFER_COUNT
                        ? InitWaveCombineBuffers<COMBINE_NO_QUANT>(common, scratch)
                        : InitWaveCombineBuffers<COMBINE_NO_QUANT, false, WAVE_COMBINE_PREFILL_ROW_BUFFER_COUNT>(common, scratch);
     GM_ADDR sliceOutput =

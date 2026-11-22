@@ -351,6 +351,9 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     ExpertTokenPosition dispatch{};
     uint32_t dispatchGroups = 0U;
     uint64_t dispatchWave = 0U;
+    const bool interleaveCombine = MteGeluLinearWindowEligible(*params_.tilingData);
+    const uint64_t dispatchLead = static_cast<uint64_t>(mGroupsPerWave_) * GMM1_TILE_M;
+    bool dispatchAfterCombine = false;
     while (hasActivation || hasCombine || !shared.done || dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
         if (hasActivation && TryRunReadyActivation(activation, readySequence)) {
             activation.nextTile += gmmExecutionConfig_.blockJob.totalJobs;
@@ -360,11 +363,23 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
             continue;
         }
         if (dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
+            // With one wave of prefetched input, allow a ready Combine slice to
+            // retire before Dispatch completes. Always advance Dispatch before
+            // accepting another Combine slice to keep GMM1 fed.
+            if (interleaveCombine && hasCombine &&
+                CanScheduleReadyCombine(dispatch.globalTokenIndex, combine.slice.end.globalTokenIndex,
+                                        dispatchLead, dispatchAfterCombine) &&
+                TryRunReadyCombine(combine)) {
+                hasCombine = NextAivSlice(combine, false);
+                dispatchAfterCombine = true;
+                continue;
+            }
             if (dispatchGroups >= mGroupsPerWave_) {
                 dispatchGroups = 0U;
                 ++dispatchWave;
             }
             DispatchNextExpertSlice(dispatch, dispatchGroups, dispatchWave);
+            dispatchAfterCombine = false;
             continue;
         }
         if (!shared.done && TryRunSharedExpertActivation(shared)) {

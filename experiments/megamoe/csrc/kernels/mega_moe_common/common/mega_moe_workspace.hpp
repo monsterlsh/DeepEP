@@ -24,10 +24,28 @@ HOST_DEVICE uint32_t MteWorkspaceWindowSlots(const MegaMoeTilingData& tilingData
     return WaveWindowSlotCount(!unsupported, tilingData.groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4);
 }
 
+HOST_DEVICE bool MteGeluLinearWindowEligible(const MegaMoeTilingData& tilingData)
+{
+    const bool supportedWindow = (tilingData.epWorldSize == 32U && tilingData.bs <= 2048U) ||
+        (tilingData.epWorldSize == 16U && tilingData.bs <= W4A8_SMALL_BATCH_MAX_TOKENS);
+    return supportedWindow && tilingData.topoType == TOPO_TYPE_MTE &&
+        tilingData.groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 && tilingData.combineQuantMode == COMBINE_NO_QUANT &&
+        tilingData.sharedExpertNum == 0U && tilingData.topkWeightsPrefetch == 1U &&
+        tilingData.actMode == static_cast<uint8_t>(MegaMoeActMode::GELU);
+}
+
 HOST_DEVICE uint64_t MteWorkspaceRowCapacity(const MegaMoeTilingData& tilingData)
 {
-    return WaveWindowRowCapacity(tilingData.maxOutputSize, tilingData.mGroupsPerWave,
-                                 MteWorkspaceWindowSlots(tilingData));
+    const auto ringRows = WaveWindowRowCapacity(tilingData.maxOutputSize, tilingData.mGroupsPerWave,
+                                                MteWorkspaceWindowSlots(tilingData));
+    // Balanced GELU windows can use linear storage and independent AIV1 scheduling.
+    // The actual receive count still selects the original ring under skew.
+    if (!MteGeluLinearWindowEligible(tilingData)) {
+        return ringRows;
+    }
+    const auto balancedRows = static_cast<uint64_t>(tilingData.bs) * tilingData.topK;
+    const auto linearRows = balancedRows < tilingData.maxOutputSize ? balancedRows : tilingData.maxOutputSize;
+    return linearRows > ringRows ? linearRows : ringRows;
 }
 
 HOST_DEVICE bool MteWorkspaceWindowed(const MegaMoeTilingData& tilingData)
@@ -47,6 +65,17 @@ constexpr int64_t SIZE_INT_8 = 1U;
 constexpr int64_t SIZE_INT_32 = 4U;
 constexpr int64_t SIZE_BF_16 = 2U;
 
+HOST_DEVICE uint32_t MteTokenCombineRowBufferCount(const MegaMoeTilingData& t, bool linear)
+{
+    if (t.bs <= W4A8_SMALL_BATCH_MAX_TOKENS) {
+        return WAVE_COMBINE_MAX_ROW_BUFFER_COUNT;
+    }
+    const auto rowBytes = Ops::Base::CeilAlign(uint64_t{t.h} * 2U, uint64_t{32});
+    const auto ringEnd = WAVE_COMBINE_UB_BASE + WAVE_COMBINE_MAX_ROW_BUFFER_COUNT * rowBytes;
+    return linear && MteGeluLinearWindowEligible(t) && ringEnd <= MTE_GELU_LUT_UB_BEGIN
+        ? WAVE_COMBINE_MAX_ROW_BUFFER_COUNT : WAVE_COMBINE_PREFILL_ROW_BUFFER_COUNT;
+}
+
 // The table is loaded after quant/route/reset, and expires before Unpermute. Only the
 // Dispatch rings, no-quant Combine and the M128 GELU epilogue reuse AIV1 UB in its lifetime.
 HOST_DEVICE bool MteGeluLutFits(const MegaMoeTilingData& t, uint32_t ubBytes)
@@ -60,8 +89,7 @@ HOST_DEVICE bool MteGeluLutFits(const MegaMoeTilingData& t, uint32_t ubBytes)
     const uint64_t counts = Ops::Base::CeilAlign(uint64_t{t.moeExpertPerRank} * 4, uint64_t{32});
     const uint64_t dispatchEnd = prefix + indices + counts + static_cast<uint64_t>(d.bufferCount) *
         (static_cast<uint64_t>(d.copyBufferBytes) + INT32_PER_256B * sizeof(int32_t));
-    const uint32_t slots = t.bs <= W4A8_SMALL_BATCH_MAX_TOKENS ? WAVE_COMBINE_MAX_ROW_BUFFER_COUNT :
-                                                                WAVE_COMBINE_PREFILL_ROW_BUFFER_COUNT;
+    const uint32_t slots = MteTokenCombineRowBufferCount(t, true);
     const uint64_t combineEnd = WAVE_COMBINE_UB_BASE + slots * Ops::Base::CeilAlign(uint64_t{t.h} * 2, uint64_t{32});
     constexpr uint64_t metadataEnd = META_INFO_TENSOR_ADDR + WAVE_COMBINE_META_INFO_TOKEN_CAPACITY *
                                       META_INFO_SIZE * sizeof(int32_t);
