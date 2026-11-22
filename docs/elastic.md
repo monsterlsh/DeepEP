@@ -92,7 +92,7 @@ LL 按容量上限 M 选择传输路径：M≤32 不执行 server 级去重，32
 | 调度 | 默认固定调度，`num_sms=0`、`num_qps=0` |
 | 流与复用 | 默认流选项；不支持 cached dispatch、previous/epilogue event 或异步请求 |
 
-构造时 `hidden` 接受 0～7168（非零值按 BF16 的 16 或 FP8 的 128 对齐），`num_topk` 接受 0～16；0 表示不预绑定该维度，dispatch 仍执行实际 shape 校验。
+构造时 `hidden` 接受 0～7168（非零值按 BF16 的 16 或 FP8 的 128 对齐），`num_topk` 接受 0～32，设为 0 时由 dispatch 校验实际 shape。
 
 FP8 scales 为连续 `[B,ceil(H/128)]`：INT32 存放四个 per-32 E8M0 scale 的打包值，FP32 表示一个 per-128 scale。dispatch 按位搬运并保留 scales dtype，不转换量化分组。调用方保证 payload、scale 和下游专家计算格式匹配。
 
@@ -134,7 +134,7 @@ Dispatch 的接口与流选项不因本次 Combine 接入而变化。
 
 ## 工作区与输出所有权
 
-HT 的 `num_bytes` 包含 Notify/dispatch 和 combine 两个固定半区，按 2 MiB 对齐。size hint 的 `server_partial` 按 `next_pow2(P*T)` 行（token 级上界）预算，`gather_input`/`returned_partial` 按 `T*K` 平均路由行预算，不是最坏路由上界。严重热点需要更大的显式容量；超过实际容量时在 payload 启动前报错，不自动扩容。
+HT 的 `num_bytes` 包含 Notify/dispatch 和 combine 两个固定半区，每个半区按 2 MiB 对齐。每个 token 命中的每个专家都产生一行，即使多个专家在同一 rank 上。均衡路由下每个 rank 接收 `T*K` 行。容量提示为 dispatch 接收区和 combine 的 `server_partial` 至少预留这些行，并保留已有的 `next_pow2(P*T)` 行预算，两者均受全组 `P*T*K` 行上限约束。`gather_input` 按 `T*K` 行预算。热点路由可以显式增大 `num_bytes`，实际容量不足时在 payload 启动前报错。
 
 `get_buffer_size_hint()` 同时估算 Notify、dispatch 和 combine 的容量；实际可分配大小还取决于设备内存和 SHMEM 的虚拟地址空间。
 

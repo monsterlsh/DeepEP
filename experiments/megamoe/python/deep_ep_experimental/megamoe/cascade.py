@@ -122,14 +122,12 @@ class CascadeReference:
         if type(self.topk_weights_type) is not int or self.topk_weights_type not in (0, 1):
             raise ValueError("topk_weights_type must be 0 or 1")
         self.mma_type = model.get("mma_type", "fp8xfp4")
-        if self.mma_type == "fp4xfp4":
-            raise ValueError("A4W4 (mma_type='fp4xfp4') is not enabled")
-        if self.mma_type not in ("fp8xfp4", "fp8xfp8"):
-            raise ValueError("mma_type must be fp8xfp4 or fp8xfp8")
+        if self.mma_type not in ("fp8xfp4", "fp8xfp8", "fp4xfp4"):
+            raise ValueError("mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4")
         if self.activation == "gelu" and "activation_clamp" in model:
             raise ValueError("activation_clamp is only defined for SwiGLU")
-        if self.mma_type == "fp8xfp8" and self.shared_experts:
-            raise ValueError("FP8xFP8 cascade does not accept shared experts")
+        if self.mma_type != "fp8xfp4" and self.shared_experts:
+            raise ValueError("Shared experts in the cascade require FP8xFP4")
         self._situ_glu = None
         if self.activation == "situglu":
             # aclnnSituGlu multiplies by FP32 reciprocals internally; reject
@@ -150,7 +148,7 @@ class CascadeReference:
         self.e8m0_operator = self._operator_dtype("float8_e8m0fnu")
         self.fp4 = None if self.mma_type == "fp8xfp8" else self._operator_dtype("float4_e2m1fn_x2")
         if self.mma_type == "fp4xfp4":
-            self.activation_storage_dtype = self.fp4 if isinstance(self.fp4, self.torch.dtype) else self.torch.uint8
+            self.activation_storage_dtype = self.torch.uint8
         else:
             self.activation_storage_dtype = self.fp8
         self.weights = self._prepare_weights(raw, self.local_experts, "routed")
@@ -206,9 +204,11 @@ class CascadeReference:
             # The raw GMM1 rows are [gate | up], including at decode batch sizes.
             if fp8_weights:
                 data = data.view(self.fp8)
-            else:
+            elif self.mma_type == "fp8xfp4":
                 data = self.npu.npu_format_cast(data, 29, customize_dtype=self.fp8, input_dtype=self.fp4)
                 scale = scale.view(self.e8m0)
+            # Native MXFP4 grouped matmul accepts E2M1 weights in ND format,
+            # with x_dtype and weight_dtype describing the packed uint8 storage.
             prepared.append((data.transpose(1, 2), scale.transpose(1, 2)))
         return tuple(prepared)
 
@@ -222,6 +222,8 @@ class CascadeReference:
     def _quantize(self, x):
         destination = self.fp4 if self.mma_type == "fp4xfp4" else self.fp8
         data, scale = self.npu.npu_dynamic_mx_quant(x, axis=-1, dst_type=destination, block_size=32)
+        if self.mma_type == "fp4xfp4" and data.element_size() == 1:
+            data = data.view(self.torch.uint8)
         expected_shape = (x.shape[0], x.shape[1] // (2 if self.mma_type == "fp4xfp4" else 1))
         if data.dtype != self.activation_storage_dtype or tuple(data.shape) != expected_shape:
             raise RuntimeError("npu_dynamic_mx_quant returned an unexpected MX activation representation")
@@ -272,10 +274,12 @@ class CascadeReference:
         return expanded.view(self.activation_storage_dtype), expanded_scale, row_idx, counts
 
     def _gmm(self, data, scale, counts, weight):
-        if self.mma_type == "fp8xfp8":
-            # MXFP8 is fully quantized. The operator takes the two E8M0
+        if self.mma_type in ("fp8xfp8", "fp4xfp4"):
+            # Both MX operands are quantized. The operator takes the two E8M0
             # payloads as scale and per_token_scale with explicit dtype enums.
             weight_options = dict(scale=[weight[1]], scale_dtype=self.e8m0_operator)
+            if self.mma_type == "fp4xfp4":
+                weight_options.update(x_dtype=self.fp4, weight_dtype=self.fp4)
             scale = scale.view(self.torch.uint8)
         else:
             weight_options = dict(antiquant_scale=[weight[1]], weight_dtype=self.fp4)

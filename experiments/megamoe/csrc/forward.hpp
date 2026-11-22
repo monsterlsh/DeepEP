@@ -8,19 +8,13 @@
 #include <memory>
 #include <string>
 #include <limits>
+#include "host_platform.hpp"
 #include "kernel_launch.hpp"
+#include "timer.hpp"
 #include <torch/extension.h>
 #include "kernels/mega_moe_common/mega_moe_tiling.hpp"
 
 namespace deepep::megamoe {
-
-struct PlatformInfo {
-    uint32_t aic;
-    uint32_t aiv;
-    uint32_t ub;
-    uint32_t block_dim;
-    uint32_t system_workspace;
-};
 
 struct UrmaWorkspace;
 
@@ -29,7 +23,7 @@ class Plan {
 public:
     Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world, int64_t max_tokens,
          bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts, uint64_t symmetric_address,
-         int64_t symmetric_bytes, const std::string& backend = "mte", int64_t topk_weights_type = 0,
+         int64_t symmetric_bytes, const std::string& backend = "mte", int64_t topk_weights_type = -1,
          const std::string& activation = "swiglu", const std::string& mma_type = "", bool windowed = false,
          int64_t timeout_seconds = 120);
     ~Plan();
@@ -65,9 +59,6 @@ private:
     int64_t last_generation_ = 0;
     int64_t shared_intermediate_ = 0;
 };
-
-torch::Tensor allocate_timer(torch::Tensor example, const std::string& backend = "mte");
-void validate_timer(const torch::Tensor& timer, const std::string& backend);
 
 std::tuple<int64_t, int64_t> urma_window_bytes(int64_t world, int64_t experts, int64_t tokens, int64_t topk,
                                                int64_t hidden, int64_t intermediate,

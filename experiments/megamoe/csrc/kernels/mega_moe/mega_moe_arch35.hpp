@@ -19,7 +19,7 @@
 
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
-#include "mc2_common/mc2_kernel_utils.hpp"
+#include "kernels/mega_moe_common/mc2_common/mc2_kernel_utils.hpp"
 #include "kernel_operator_list_tensor_intf.h"
 #include "kernels/mega_moe_common/common/mega_moe_types.hpp"
 #include "kernels/mega_moe_common/common/mega_moe_workspace.hpp"
@@ -35,7 +35,7 @@
 #include "kernels/mega_moe_common/stage/mega_moe_gmm1_activation.hpp"
 #include "stage/mega_moe_gmm2_combine.hpp"
 #include "stage/mega_moe_unpermute.hpp"
-#include "mc2_common/quantize_functions.hpp"
+#include "kernels/mega_moe_common/mc2_common/quantize_functions.hpp"
 
 namespace MegaMoeImpl {
 

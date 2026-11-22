@@ -13,6 +13,14 @@
 #define DEEPEP_MEGAMOE_TIMER_SPAN_SCOPE UrmaAscendTimerSpanScope
 #define DEEPEP_MEGAMOE_TIMER_WAIT_SCOPE UrmaAscendTimerWaitScope
 
+#elif defined(DEEPEP_MEGAMOE_HIERARCHICAL_IMPL)
+#define DEEPEP_MEGAMOE_IMPL_NAMESPACE HierarchicalMegaMoeImpl
+#define DEEPEP_MEGAMOE_TIMER_NAMESPACE HierarchicalAscendTimer
+#define DEEPEP_MEGAMOE_TIMER_DEVICE HierarchicalAscendTimerDevice
+#define DEEPEP_MEGAMOE_TIMER_TILE_SCOPE HierarchicalAscendTimerTileScope
+#define DEEPEP_MEGAMOE_TIMER_SPAN_SCOPE HierarchicalAscendTimerSpanScope
+#define DEEPEP_MEGAMOE_TIMER_WAIT_SCOPE HierarchicalAscendTimerWaitScope
+
 #else
 #define DEEPEP_MEGAMOE_IMPL_NAMESPACE MegaMoeImpl
 #define DEEPEP_MEGAMOE_TIMER_NAMESPACE AscendTimer

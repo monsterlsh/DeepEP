@@ -5,6 +5,21 @@
 from typing import List, Tuple
 
 
+_MAX_EP_SIZE = 8
+_MAX_LOCAL_EXPERTS = 128
+
+
+def _local_expert_count(ep_size: int, expert_num: int) -> int:
+    if not 1 <= ep_size <= _MAX_EP_SIZE:
+        raise ValueError(f"ep_size must be in [1, {_MAX_EP_SIZE}]")
+    if expert_num <= 0 or expert_num % ep_size:
+        raise ValueError("expert_num must be positive and divisible by ep_size")
+    local_experts = expert_num // ep_size
+    if local_experts > _MAX_LOCAL_EXPERTS:
+        raise ValueError(f"local expert count must not exceed {_MAX_LOCAL_EXPERTS}")
+    return local_experts
+
+
 def _tokens_for(
     m: int,
     ep_size: int,
@@ -24,16 +39,9 @@ def _tokens_for(
 
 def build_global_route_matrix(m: int, ep_size: int, expert_num: int) -> List[List[int]]:
     """Build ``[source rank][global expert]`` token counts for balanced TP=1 routing."""
-    if m <= 0 or ep_size <= 0 or expert_num <= 0:
-        raise ValueError("m, ep_size, and expert_num must be positive")
-    if ep_size > 8:
-        raise ValueError("ep_size must not exceed 8")
-    if expert_num % ep_size:
-        raise ValueError("expert_num must be divisible by ep_size")
-
-    local_expert_num = expert_num // ep_size
-    if local_expert_num > 64:
-        raise ValueError("local expert count must not exceed 64")
+    if m <= 0:
+        raise ValueError("m must be positive")
+    local_expert_num = _local_expert_count(ep_size, expert_num)
     matrix = [
         [
             _tokens_for(m, ep_size, local_expert_num, src_rank, dst_ep, local_expert)

@@ -7,6 +7,7 @@
 #define DEEPEP_EP_GMM_FUSED_GROUPED_MAT_MUL_ALL_TO_ALLV_UDMA_DEVICE_HPP
 
 #include "info.h"
+#include "../../expert_capacity.hpp"
 #include "../../tiling_validation.hpp"
 
 #include "catlass/arch/arch.hpp"
@@ -34,7 +35,7 @@
 namespace deepep::ep_gmm_fused {
 
 template <class ElementA, class LayoutA, class ElementB, class LayoutB, class ElementC, class LayoutC, uint32_t M0,
-          uint32_t N0, uint32_t K0, uint32_t WorkspaceStages = 2>
+          uint32_t N0, uint32_t K0, uint32_t WorkspaceStages = 2, uint32_t LocalExpertCapacity = kInverseSmallLocalExperts>
 struct GroupedMatMulAllToAllVUdmaConfig {
     static_assert(WorkspaceStages == 2 || WorkspaceStages == 3,
                   "Ascend950 BF16 UDMA MoE supports two or three workspace stages");
@@ -52,11 +53,15 @@ struct GroupedMatMulAllToAllVUdmaConfig {
     using BlockMmad = Catlass::Gemm::Block::BlockMmadTla<MmadDispatchPolicy, L1TileShape, L0TileShape, ElementA,
                                                          ElementB, ElementC, void, TileCopy>;
 
-    using MoeConstraints = Catccos::DGemm::MoeConstraints<1, 8, 32>;
+    template <uint32_t Capacity>
+    using WithExpertCapacity = GroupedMatMulAllToAllVUdmaConfig<ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,
+                                                                M0, N0, K0, WorkspaceStages, Capacity>;
+    using MoeConstraints = Catccos::DGemm::MoeConstraints<1, 8, LocalExpertCapacity>;
     static constexpr bool kIsDynamic = true;
     static constexpr uint32_t kUbStages = 2;
     static constexpr uint64_t kSymmetricDataBytes = 200UL * 1024 * 1024 * sizeof(uint16_t);
-    using BlockMmadScheduler = Catccos::DGemm::Block::BlockMmadSchedulerGmmAllToAllVTargetOrder<MoeConstraints>;
+    using BlockMmadScheduler = Catccos::DGemm::Block::BlockMmadSchedulerGmmAllToAllVTargetOrder<
+        MoeConstraints, (LocalExpertCapacity > kInverseSmallLocalExperts)>;
     using BlockCommScheduler =
         Catccos::CommEpilogue::Block::BlockCommSchedulerGmmAllToAllVTargetOrder<MoeConstraints, kIsDynamic>;
     using CType = Catlass::Gemm::GemmType<ElementC, LayoutC>;

@@ -9,6 +9,12 @@
 
 namespace py = pybind11;
 
+#ifdef DEEPEP_MEGAMOE_MTE_ROCE
+namespace deepep::megamoe::roce {
+void bind(pybind11::module_& module);
+}
+#endif
+
 PYBIND11_MODULE(_C, module)
 {
     using deepep::megamoe::Plan;
@@ -16,15 +22,21 @@ PYBIND11_MODULE(_C, module)
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.attr("urma_ep8_window_tokens") = MegaMoeUrma::kWindowTokens;
     module.attr("urma_w8a8_enabled") = true;
+    module.attr("mte_a4w4_enabled") = true;
     module.attr("urma_w8a8_swiglu_enabled") = true;
     module.attr("urma_windowed_swiglu_enabled") = true;
+#ifdef DEEPEP_MEGAMOE_MTE_ROCE
+    deepep::megamoe::roce::bind(module);
+#else
+    module.attr("mte_roce_enabled") = false;
+#endif
     module.def("buffer_size", &deepep::megamoe::buffer_size, py::arg("world"), py::arg("experts"), py::arg("tokens"),
                py::arg("topk"), py::arg("hidden"), py::arg("backend") = "mte", py::arg("topk_weights_type") = 0,
                py::arg("mma_type") = "", py::arg("windowed") = false);
     module.def("mte_plan_bytes", &deepep::megamoe::mte_plan_bytes,
                py::arg("world"), py::arg("experts"), py::arg("tokens"), py::arg("capacity"), py::arg("topk"),
                py::arg("hidden"), py::arg("intermediate"), py::arg("activation"), py::arg("mma_type"),
-               py::arg("shared_experts") = 0, py::arg("topk_weights_type") = 0);
+               py::arg("shared_experts") = 0, py::arg("topk_weights_type") = -1);
     module.def("urma_window_bytes", &deepep::megamoe::urma_window_bytes, py::arg("world"), py::arg("local_experts"),
                py::arg("tokens"), py::arg("topk"), py::arg("hidden"), py::arg("intermediate"),
                py::arg("mma_type") = "fp8xfp4");
@@ -36,7 +48,7 @@ PYBIND11_MODULE(_C, module)
              py::arg("example"), py::arg("intermediate"), py::arg("topk"), py::arg("experts"), py::arg("world"),
              py::arg("max_tokens"), py::arg("is_a8w4"), py::arg("shared_experts"), py::arg("ranks_per_node"),
              py::arg("ffts"), py::arg("symmetric_address"), py::arg("symmetric_bytes"), py::arg("backend") = "mte",
-             py::arg("topk_weights_type") = 0, py::arg("activation") = "swiglu", py::arg("mma_type") = "",
+             py::arg("topk_weights_type") = -1, py::arg("activation") = "swiglu", py::arg("mma_type") = "",
              py::arg("windowed") = false, py::arg("timeout_seconds") = 120)
         .def("forward", &Plan::forward, py::arg("x"), py::arg("x_scales"), py::arg("topk_ids"), py::arg("topk_weights"),
              py::arg("weight1"), py::arg("weight2"), py::arg("weight_scales1"), py::arg("weight_scales2"),

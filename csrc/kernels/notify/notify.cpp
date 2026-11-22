@@ -7,6 +7,7 @@
 #include "launch.hpp"
 #include "tiling.hpp"
 #include "profile.hpp"
+#include "route_encoding.hpp"
 #include "../dispatch/tiling.hpp"
 #include "../dispatch/peer_order.hpp"
 
@@ -18,13 +19,8 @@ constexpr uint32_t kSimtThreads = 128U;
 constexpr uint32_t kSimtCores = ascend_deepep::kNotifyCores;
 constexpr uint32_t kTileTokens = ascend_deepep::kNotifyLocalTopkTileTokens;
 constexpr uint32_t kMetaFields = ascend_deepep::kNotifyLocalTopkRouteMetaFields;
-// Wire fields pack rank <= 511 and top-k positions <= 15.
 // Forward column 0 stores token_end; source rank is the partition index.
 // Weight return IDs encode (src_rank * tokens + token_id) * topk + topk_id.
-constexpr uint32_t kWireRankMask = 0x1ffU;
-constexpr uint32_t kWireTopkMask = 0xfU;
-constexpr uint32_t kWirePrimaryTopkShift = 9U;
-constexpr uint32_t kWireSecondaryTopkShift = 13U;
 
 template <uint32_t CoreCount = kSimtCores, bool RankDedup = false>
 __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkTokensVf(__gm__ ascend_deepep::topk_idx_t* topk_idx,
@@ -43,9 +39,9 @@ __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkTokensVf(__gm__ asc
         if (token >= tokens) {
             continue;
         }
-        int32_t expert_ids[16];
-        int32_t rank_primary[16];
-        int32_t rank_slot[16];
+        int32_t expert_ids[ascend_deepep::kHtMaxTopk];
+        int32_t rank_primary[ascend_deepep::kHtMaxTopk];
+        int32_t rank_slot[ascend_deepep::kHtMaxTopk];
         int32_t first_slot[64];
         for (uint32_t server = 0; server < 64U; ++server) {
             first_slot[server] = -1;
@@ -97,7 +93,7 @@ __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkTokensVf(__gm__ asc
             }
             auto* cached = routes_ub + (uint64_t(local_token) * topk + k) * 2U;
             cached[0] = expert;
-            cached[1] = expert >= 0 ? gateway * 16 + primary : -1;
+            cached[1] = expert >= 0 ? gateway * ascend_deepep::kHtMaxTopk + primary : -1;
             auto* row = route_meta + (base + k) * kMetaFields;
             asc_stcg(row, expert);
             asc_stcg(row + 1U, gateway);
@@ -131,8 +127,8 @@ __simt_vf__ __launch_bounds__(128) inline void CountLocalTopkTilesVf(__gm__ int3
                 ordinal = counts[expert];
                 counts[expert] = ordinal + 1;
                 const uint32_t packed = uint32_t(cached[route * 2U + 1U]);
-                if (route % topk == packed % 16U) {
-                    ++counts[experts + packed / 16U];
+                if (route % topk == packed % ascend_deepep::kHtMaxTopk) {
+                    ++counts[experts + packed / ascend_deepep::kHtMaxTopk];
                 }
             }
             asc_stcg(route_meta + (uint64_t(begin) * topk + route) * kMetaFields + 4U, ordinal);
@@ -170,9 +166,9 @@ __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkVf(__gm__ ascend_de
         const uint32_t begin = tile * kTileTokens;
         const uint32_t end = tokens - begin < kTileTokens ? tokens : begin + kTileTokens;
         for (uint32_t token = begin; token < end; ++token) {
-            int32_t expert_ids[16];
-            int32_t rank_primary[16];
-            int32_t rank_slot[16];
+            int32_t expert_ids[ascend_deepep::kHtMaxTopk];
+            int32_t rank_primary[ascend_deepep::kHtMaxTopk];
+            int32_t rank_slot[ascend_deepep::kHtMaxTopk];
             int32_t first_slot_per_server[64];
             for (uint32_t server = 0; server < 64U; ++server) {
                 first_slot_per_server[server] = -1;
@@ -529,9 +525,9 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardTilesVf(
         for (uint32_t token = begin; token < end; ++token) {
             // 本核的 tile 为 core、core+CoreCount……，UB 紧凑存放，保留完整 tile 步长。
             const uint64_t ub_token = (uint64_t(tile / CoreCount) * kForwardTile + token - begin) * topk * 6U;
-            int32_t gateways[16];
-            int32_t primaries[16];
-            int32_t hits[16];
+            int32_t gateways[ascend_deepep::kHtMaxTopk];
+            int32_t primaries[ascend_deepep::kHtMaxTopk];
+            int32_t hits[ascend_deepep::kHtMaxTopk];
             for (uint32_t k = 0; k < topk; ++k) {
                 hits[k] = 0;
             }
@@ -605,7 +601,7 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardTilesVf(
                         }
                     }
                     auto* out = packets + uint64_t(gateway) * packet_words + 16U + uint64_t(index) * 6U;
-                    asc_stcg(out, int32_t(rank | (primary << kWirePrimaryTopkShift) | (k << kWireSecondaryTopkShift)));
+                    asc_stcg(out, int32_t(ascend_deepep::PackNotifyRoute(rank, primary, k)));
                     asc_stcg(out + 1U, int32_t(token));
                     asc_stcg(out + 2U, primary_row);
                     asc_stcg(out + 3U, direct ? -1 : expert / int32_t(experts / world));
@@ -654,7 +650,7 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardTokensVf(uint32_t to
         if (token >= tokens) {
             continue;
         }
-        int32_t hits[16];
+        int32_t hits[ascend_deepep::kHtMaxTopk];
         for (uint32_t k = 0; k < topk; ++k) {
             hits[k] = 0;
         }
@@ -745,8 +741,7 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardRowsVf(
                                      local_token % kForwardTile];
         }
         auto* out = packets + uint64_t(gateway) * packet_words + 16U + uint64_t(index) * 6U;
-        asc_stcg(out, int32_t(rank | (uint32_t(row[2]) << kWirePrimaryTopkShift) |
-                              (uint32_t(route % topk) << kWireSecondaryTopkShift)));
+        asc_stcg(out, int32_t(ascend_deepep::PackNotifyRoute(rank, uint32_t(row[2]), uint32_t(route % topk))));
         asc_stcg(out + 1U, int32_t(token));
         asc_stcg(out + 2U, primary_row);
         asc_stcg(out + 3U, direct ? -1 : expert / int32_t(experts / world));
@@ -888,7 +883,7 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyBuildForwardRowsVf(
         auto* out = forward + (uint64_t(source) * capacity + i) * 6U;
         const int32_t local_gather = RankDedup ? -1 : asc_ldcg(out + 5U);
         const uint32_t wire_source = uint32_t(asc_ldcg(row));
-        const int32_t source_rank = int32_t(wire_source & kWireRankMask);
+        const int32_t source_rank = int32_t(wire_source & ascend_deepep::kNotifyWireRankMask);
         const int32_t token = asc_ldcg(row + 1U);
         // Column 0 is filled with token_end by NotifyChunkRangesVf.
         for (uint32_t field = 1; field < 5U; ++field) {
@@ -904,14 +899,14 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyBuildForwardRowsVf(
         // A primary is repeated in its token's secondary records. Only the
         // first record owns its metadata, including across thread/tile splits.
         if (i == 0U || asc_ldcg(row - 6U + 1U) != token) {
-            const uint32_t slot = (wire_source >> kWirePrimaryTopkShift) & kWireTopkMask;
+            const uint32_t slot = ascend_deepep::NotifyRoutePrimarySlot(wire_source);
             asc_stcg(weight_return_meta + asc_ldcg(row + 2U),
                      int32_t((uint64_t(source_rank) * tokens + token) * topk + slot));
         }
         // Local secondaries have no backward record. Remote secondaries are
         // written by NotifyCollectBackwardVf on their expert rank instead.
         if (asc_ldcg(row + 3U) == int32_t(rank)) {
-            const uint32_t slot = (wire_source >> kWireSecondaryTopkShift) & kWireTopkMask;
+            const uint32_t slot = ascend_deepep::NotifyRouteSecondarySlot(wire_source);
             asc_stcg(weight_return_meta + asc_ldcg(row + 4U),
                      int32_t((uint64_t(source_rank) * tokens + token) * topk + slot));
         }
@@ -1169,7 +1164,7 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyWriteBackwardTasksVf(
         // Prefix and stable lane ordinal give each row a unique output, including
         // the chunk-tail marker. The received wire slots remain immutable.
         const uint32_t wire_source = uint32_t(asc_ldcg(received + 16U + uint64_t(i) * 6U));
-        const uint32_t topk_id = (wire_source >> kWireSecondaryTopkShift) & kWireTopkMask;
+        const uint32_t topk_id = ascend_deepep::NotifyRouteSecondarySlot(wire_source);
         const uint32_t weight_offset = token * topk + topk_id;
         const uint64_t flag =
             output + 1U == uint32_t(asc_ldcg(bounds + 1U)) ? uint64_t(group * chunks + chunk + 1U) << 32U : 0U;

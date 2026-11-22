@@ -5,14 +5,17 @@ from datetime import datetime
 import json
 from pathlib import Path
 import statistics
+import sys
 
-from paired_benchmark import ARMS, order, paired_report
+if __package__:
+    from .paired_benchmark import ARMS, IDENTITY_FIELDS, order, paired_report
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from paired_benchmark import ARMS, IDENTITY_FIELDS, order, paired_report
+    sys.path.pop(0)
 
 
 def summarize(root, pairs):
-    identity_fields = ("config", "backend", "world", "ranks_per_node", "hosts_by_rank", "devices_by_rank", "bs", "routing",
-                       "warmup_pairs", "formal_pairs", "cache", "input", "routes", "weights", "torch", "torch_npu",
-                       "build")
     reference = None
     raw = []
     maxima = {}
@@ -33,7 +36,7 @@ def summarize(root, pairs):
             if arm in arm_layouts and arm_layouts[arm] != layout:
                 raise ValueError(f"{path}: layout or activation weight mode changed across jobs")
             arm_layouts[arm] = layout
-            identity = {field: entry[field] for field in identity_fields}
+            identity = {field: entry[field] for field in (*IDENTITY_FIELDS, "routing")}
             if reference is not None and identity != reference:
                 mismatch = [key for key in identity if identity[key] != reference[key]]
                 raise ValueError(f"{path}: incompatible jobs: {mismatch}")

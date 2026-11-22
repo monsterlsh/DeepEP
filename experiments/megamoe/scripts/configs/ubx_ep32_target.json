@@ -1,0 +1,91 @@
+{
+  "_comments": {
+    "启动命令": "在UBX 节点 0（node_ip 第一项）的仓库根目录运行 python3 experiments/megamoe/scripts/run_megamoe.py --run-config experiments/megamoe/scripts/configs/ubx_ep32_target.json",
+    "plan": "可在 JSON 外层加 plan: true，仅打印执行计划。正式启动时设为 false 或删除该字段。",
+    "可选值": {
+      "machine": ["ubx"],
+      "ep_size": [32],
+      "backend": ["mte_roce", "urma"],
+      "activation": ["gelu", "swiglu"],
+      "weighting": ["auto", "early", "late"],
+      "input": ["fp8", "fp4"],
+      "routing": ["balanced", "skewed", "random", "random-balanced"],
+      "config.model.topk_weights_type": [0, 1],
+      "按 backend 选择": {
+        "mte_roce": {
+          "mode": ["accuracy", "perf", "both"],
+          "precision": ["a8w4", "a8w8", "a4w4", "all"],
+          "timer": [false, true]
+        },
+        "urma": {
+          "mode": ["accuracy", "perf", "both", "compare"],
+          "precision": ["a8w4", "a8w8", "all"],
+          "timer": [false, true]
+        }
+      },
+      "URMA compare 可选窗口": {
+        "window_tokens": [64, 128, 256]
+      },
+      "手动启动": {
+        "node_rank": [0, 1],
+        "stage": ["prepare", "run"]
+      }
+    },
+    "组合约束": "URMA 的 SwiGLU 用 Finalize 加权。compare 由脚本选择两组激活与加权，设置 weighting: auto，并省略外层 activation。input 会由 precision 自动推导，手动指定时 a8w4/a8w8 对应 fp8、a4w4 对应 fp4。",
+    "schema_version / config.schema_version": "运行配置和内嵌模型配置的格式版本，均为 1。",
+    "machine / ep_size": "UBX 双机共 32 卡，每台 16 卡。",
+    "backend": "mte_roce 用于机内 MTE 和跨机 RoCE。urma 用于 URMA 通信，也支持 compare。",
+    "weighting": "auto 按模型或激活预设决定，early 在量化前加权，late 在 Finalize 加权。",
+    "mode": "accuracy 只测精度，perf 只测性能，both 先测精度再测性能。设备 timer A/B 对照使用 URMA 的 compare 模式。",
+    "precision / config.model.mma_type": "a8w4、a8w8、a4w4 分别表示 FP8×FP4、FP8×FP8、FP4×FP4，激活精度在前。all 跑所选后端支持的精度。脚本根据外层 precision 设置每轮的 mma_type。",
+    "node_ip / master_port / shmem_port": "node_ip 依次填节点 0、节点 1 的 IPv4。节点 0 通过 SSH 拉起节点 1，默认取第一项为 torchrun 和 SHMEM 主地址。两个端口应不同。",
+    "comparison.arms": "A 组 gelu 在量化前加权，B 组 swiglu 在 Finalize 加权。外层 activation 选其中一组，外层 mode 控制测精度、性能还是 A/B。",
+    "timer": "设为 true 时，MTE+RoCE 在正式测量后另跑一轮，采集首窗 trace。两台节点都需要安装开启 DEEPEP_MEGAMOE_TIMER 的新版 wheel。",
+    "config.bs_values": "每卡 token 数，填一个值，例如 [39280]。",
+    "config.model.hidden / intermediate_hidden": "输入和输出隐藏维度、激活后的专家中间维度。GMM2 K/N 为 intermediate_hidden/hidden。",
+    "config.model.num_experts / num_topk / num_shared_experts": "全局路由专家数、每个 token 选择的专家数、共享专家数。路由专家数应能被 EP 整除，TopK 范围为 1–32。",
+    "config.model.activation / topk_weights_type": "本预设使用 gelu 和 1，在激活后、量化前乘路由权重。想切换到 SwiGLU，在 JSON 外层加 activation: swiglu，脚本会自动选择 Finalize 加权。",
+    "config.warmup / iters / seed": "预热次数、测量迭代次数和数据生成随机种子。",
+    "config.alignment": "性能采集时用于起跑对齐的 Exp 前缀。rows 和 cols 控制矩阵尺寸，repeats 控制执行次数。",
+    "routing": "生成路由索引的分布。支持 balanced、skewed、random、random-balanced。",
+    "check_tokens / golden_workers / dual_reference": "精度测试使用的每卡抽样 token 数（0 为全量）、CPU Golden 并行进程数，以及是否增加 NPU 级联参考比对。"
+  },
+  "schema_version": 1,
+  "machine": "ubx",
+  "mode": "both",
+  "precision": "all",
+  "backend": "mte_roce",
+  "ep_size": 32,
+  "config": {
+    "schema_version": 1,
+    "model": {
+      "hidden": 4096,
+      "intermediate_hidden": 1536,
+      "num_experts": 800,
+      "num_topk": 25,
+      "num_shared_experts": 0,
+      "activation": "gelu",
+      "mma_type": "fp8xfp4",
+      "topk_weights_type": 1
+    },
+    "bs_values": [39280],
+    "alignment": {"rows": 1024, "cols": 1024, "repeats": 1},
+    "warmup": 1,
+    "iters": 3,
+    "seed": 1234
+  },
+  "comparison": {
+    "arms": {
+      "gelu": {"activation": "gelu", "topk_weights_type": 1},
+      "swiglu": {"activation": "swiglu", "topk_weights_type": 0}
+    }
+  },
+  "routing": "balanced",
+  "node_ip": ["90.90.93.84", "90.90.93.184"],
+  "master_port": 29500,
+  "shmem_port": 29180,
+  "check_tokens": 0,
+  "golden_workers": 2,
+  "dual_reference": false,
+  "timer": false
+}

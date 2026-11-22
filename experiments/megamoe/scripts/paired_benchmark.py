@@ -16,6 +16,10 @@ from unittest.mock import patch
 
 
 ARMS = ("gelu", "swiglu")
+IDENTITY_FIELDS = (
+    "config", "backend", "world", "ranks_per_node", "hosts_by_rank", "devices_by_rank", "bs",
+    "warmup_pairs", "formal_pairs", "cache", "input", "routes", "weights", "torch", "torch_npu", "build",
+)
 
 
 def order(pair):

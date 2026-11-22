@@ -10,6 +10,7 @@ import torch
 
 from .runtime import get_udma_config
 from ._tiling import TILING_FIELDS, validate_tiling
+from .routing import _local_expert_count
 
 
 RouteInput = Union[torch.Tensor, Sequence[int]]
@@ -31,6 +32,7 @@ def _tiling_arguments(operator, tiling, x, weight, ep_size, output_all_to_allv=F
 
 
 _MOE_ROUTE_MAX_RANKS = 8
+# The optional descriptor is an independent ABI, smaller than the kernel's route-table limit.
 _MOE_ROUTE_MAX_LOCAL_EXPERTS = 64
 _MOE_ROUTE_MAX_SEGMENTS = _MOE_ROUTE_MAX_RANKS * _MOE_ROUTE_MAX_LOCAL_EXPERTS
 _MOE_ROUTE_HEADER_SIZE = 4 * 4
@@ -63,6 +65,8 @@ def _host_route_values(route: RouteInput, name: str):
         value = int(value)
         if value < 0:
             raise ValueError("{}[{}] must be non-negative".format(name, index))
+        if value > 0xFFFFFFFF:
+            raise ValueError("{}[{}] must fit uint32".format(name, index))
         normalized.append(value)
     return normalized
 
@@ -205,10 +209,11 @@ def alltoallv_gmm(
     equals the sum of the global route table. Pass the host-known value to avoid
     a device-to-host synchronization when the global route is an NPU tensor.
     Host routes are a convenience path that performs a small host-to-device copy
-    on every call. When exporting AllToAllV, a host global route additionally
-    builds and copies CatCCOS route-prefix metadata so the kernel can select its
-    optimized metadata path. Reuse device route tensors for performance-critical
-    loops; their export path avoids D2H and uses the compatible kernel fallback.
+    on every call. When exporting AllToAllV with at most 64 local experts, a
+    host global route additionally builds and copies CatCCOS route-prefix
+    metadata. Export with up to 128 local experts can derive prefixes from the
+    route tensor on the device. Reuse device route tensors and pass
+    ``received_rows`` for performance-critical loops.
 
     When ``output_all_to_allv=True``, the call returns ``(output,
     all_to_allv_output)``. The second tensor is the exact BF16 activation consumed
@@ -223,8 +228,7 @@ def alltoallv_gmm(
     config = get_udma_config()
     if ep_size != config.world_size:
         raise ValueError("TP=1 requires ep_size == UDMA world_size")
-    if expert_num <= 0 or expert_num % ep_size:
-        raise ValueError("expert_num must be positive and divisible by ep_size")
+    local_expert_num = _local_expert_count(ep_size, expert_num)
     tiling_arguments = _tiling_arguments(
         "all_to_allv_grouped_mat_mul",
         tiling,
@@ -275,7 +279,7 @@ def alltoallv_gmm(
         raise ValueError("all_to_allv_out must have shape [sum(global_tokens_per_local_expert), x.shape[1]]")
     route_metadata = (
         _build_route_metadata(global_host_values, ep_size, expert_num, x.device)
-        if global_host_values is not None
+        if global_host_values is not None and local_expert_num <= _MOE_ROUTE_MAX_LOCAL_EXPERTS
         else None
     )
     if out is None:
@@ -321,8 +325,7 @@ def gmm_alltoallv(
     config = get_udma_config()
     if ep_size != config.world_size:
         raise ValueError("TP=1 requires ep_size == UDMA world_size")
-    if expert_num <= 0 or expert_num % ep_size:
-        raise ValueError("expert_num must be positive and divisible by ep_size")
+    _local_expert_count(ep_size, expert_num)
     tiling_arguments = _tiling_arguments(
         "grouped_mat_mul_all_to_allv",
         tiling,

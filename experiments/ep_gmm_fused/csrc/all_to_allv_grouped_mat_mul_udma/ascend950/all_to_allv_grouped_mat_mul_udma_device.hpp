@@ -6,6 +6,7 @@
 #ifndef DEEPEP_EP_GMM_FUSED_ALL_TO_ALLV_GROUPED_MAT_MUL_UDMA_DEVICE_HPP
 #define DEEPEP_EP_GMM_FUSED_ALL_TO_ALLV_GROUPED_MAT_MUL_UDMA_DEVICE_HPP
 
+#include "../../expert_capacity.hpp"
 #include "../../tiling_validation.hpp"
 
 #include "catlass/arch/arch.hpp"
@@ -34,7 +35,8 @@
 namespace deepep::ep_gmm_fused {
 
 template <class ElementA, class LayoutA, class ElementB, class LayoutB, class ElementC, class LayoutC, uint32_t M0,
-          uint32_t N0, uint32_t K0, bool ExportAllToAllV = false, uint32_t WorkspaceStages = 2, uint32_t MSplit = 1>
+          uint32_t N0, uint32_t K0, bool ExportAllToAllV = false, uint32_t WorkspaceStages = 2, uint32_t MSplit = 1,
+          uint32_t LocalExpertCapacity = kForwardSmallLocalExperts>
 struct AllToAllVGroupedMatMulUdmaConfig {
     static_assert(WorkspaceStages == 2 || WorkspaceStages == 3,
                   "Ascend950 BF16 UDMA MoE supports two or three workspace stages");
@@ -77,8 +79,13 @@ struct AllToAllVGroupedMatMulUdmaConfig {
     using BlockExport =
         Catccos::Comm::Block::CommBlock<ExportDispatch, AType, AType, void, TileExportCopy, TileScheduler>;
 
-    using MoeConstraints = Catccos::DGemm::MoeConstraints<1, 8, 64>;
-    using BlockMmadScheduler = Catccos::DGemm::Block::BlockMmadSchedulerAllToAllVAllGather<MoeConstraints, MSplit>;
+    template <uint32_t Capacity>
+    using WithExpertCapacity = AllToAllVGroupedMatMulUdmaConfig<ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,
+                                                                M0, N0, K0, ExportAllToAllV, WorkspaceStages, MSplit,
+                                                                Capacity>;
+    using MoeConstraints = Catccos::DGemm::MoeConstraints<1, 8, LocalExpertCapacity>;
+    using BlockMmadScheduler = Catccos::DGemm::Block::BlockMmadSchedulerAllToAllVAllGather<
+        MoeConstraints, MSplit, (LocalExpertCapacity > kForwardSmallLocalExperts)>;
     using BlockScheduler = Catccos::Comm::Block::BlockCommSchedulerAllToAllVAllGather<MoeConstraints>;
     using ProblemShape = Catccos::DGemm::AllToAllVAllGatherProblemShape;
     using Kernel =

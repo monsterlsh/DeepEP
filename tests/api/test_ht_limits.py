@@ -24,8 +24,8 @@ def _target(world=None):
     values = dict(TARGET)
     if world is not None:
         values["world"] = world
-    values["receive_rows"] = next_pow2(values["world"] * values["tokens"])
     values["route_rows"] = values["tokens"] * values["topk"]
+    values["receive_rows"] = max(next_pow2(values["world"] * values["tokens"]), values["route_rows"])
     return values
 
 
@@ -97,3 +97,16 @@ def test_buffer_size_hint_matches_the_layout_budget(monkeypatch):
     )
     # topk=1 keeps the power-of-two receive stride inside the route bound.
     assert elastic.ElasticBuffer.get_buffer_size_hint(None, 100, 4096, 1, world_size=8) > 0
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+def test_default_capacity_covers_multiple_experts_on_each_rank(monkeypatch, fp8):
+    from deep_ep.backends.mesh_clos import elastic
+
+    monkeypatch.setattr(elastic, "require_native", lambda *_: None)
+    # Every token on every source selects two distinct experts on each of the four ranks.
+    world, tokens, topk, hidden = 4, 1024, 8, 256
+    rows = world * tokens * 2
+    half = elastic.ElasticBuffer.get_buffer_size_hint(None, tokens, hidden, topk, fp8, world_size=world) // 2
+    assert dispatch_layout(world, tokens, topk, 1024, rows, fp8, weights=True, hidden=hidden)["workspace_bytes"] <= half
+    assert combine_layout(world, tokens, topk, rows, rows, hidden=hidden)["workspace_bytes"] <= half

@@ -106,7 +106,7 @@ class AccuracyCache:
 
     def _reports_digest(self, output):
         expected = {name: self.identity[name] for name in ("ep_size", "routing", "config", "dual_reference")}
-        expected.update(mode="accuracy", backend="urma", input="fp8")
+        expected.update(mode="accuracy", backend=self.identity.get("backend", "urma"), input=self.identity.get("input", "fp8"))
         if "build" in self.identity:
             expected["build"] = self.identity["build"]
         digest = hashlib.sha256()
@@ -117,7 +117,7 @@ class AccuracyCache:
             manifest_data = manifest_path.read_bytes()
             manifest = json.loads(manifest_data)
             if not isinstance(manifest, dict) or manifest.get("rank") != rank or any(
-                manifest.get(name) != value for name, value in expected.items()
+                manifest.get(name, False if name == "dual_reference" else None) != value for name, value in expected.items()
             ):
                 raise ValueError(f"Accuracy manifest does not match this run: {manifest_path}")
             report_path = directory / f"bs_{self.identity['bs']}" / "accuracy.json"

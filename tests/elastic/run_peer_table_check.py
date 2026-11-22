@@ -508,8 +508,9 @@ def main():
     parser.add_argument("--profile-warmup", type=int, default=5)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if not 1 <= args.tokens <= 10240 or not 1 <= args.topk <= 16 or args.ep_size**2 * args.tokens * args.topk >= 2**31:
-        parser.error("Require T1..10240, K1..16 and EP*EP*T*K < 2**31")
+    max_topk = helper["MAX_TOPK"]
+    if not 1 <= args.tokens <= 10240 or not 1 <= args.topk <= max_topk or args.ep_size**2 * args.tokens * args.topk >= 2**31:
+        parser.error(f"Require T1..10240, K1..{max_topk} and EP*EP*T*K < 2**31")
     if args.event_only and args.kernel_profile:
         parser.error("Choose event-only or kernel-profile, not both")
     if not __debug__ or args.iterations < 1 or args.warmup < 0:

@@ -82,7 +82,7 @@ def decode(rows, *, rank, world, tokens, topk, experts, chunk_tokens, sample=1):
         raise ValueError("Notify profile requires 32/64 AIV rows")
     if world not in (2, 4, 8, 16, 32, 64, 128, 256, 512) or not 0 <= rank < world:
         raise ValueError("Invalid Notify profile topology")
-    if not (1 <= tokens <= 16384 and 1 <= topk <= 16 and world <= experts <= 1024 and experts % world == 0):
+    if not (1 <= tokens <= 16384 and 1 <= topk <= 32 and world <= experts <= 1024 and experts % world == 0):
         raise ValueError("Invalid Notify profile shape")
     if chunk_tokens not in (256, 512, 1024) or type(sample) is not int or not 0 < sample < 2**63:
         raise ValueError("Invalid Notify chunk size or sample")

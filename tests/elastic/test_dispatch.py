@@ -373,6 +373,16 @@ def test_random_dispatch_cli(monkeypatch, tmp_path):
     assert (args.ep_size, args.node_rank, args.route, args.seed) == (256, 31, "random", 2026)
 
 
+def test_peer_table_cli_accepts_topk32(monkeypatch, tmp_path):
+    checker = runpy.run_path(str(Path(__file__).with_name("run_peer_table_check.py")))
+    calls = []
+    monkeypatch.setitem(checker["helper"], "_launch", lambda args, worker: calls.append(args))
+    monkeypatch.setattr(sys, "argv", ["run_peer_table_check.py", "--topk", "32", "--output", str(tmp_path)])
+    checker["main"]()
+    (args,) = calls
+    assert args.topk == 32 and args.backend == "peer-table"
+
+
 def check_handle(handle, golden, rank, routes, experts):
     import torch
 
@@ -2131,6 +2141,7 @@ def test_rank_notify_dispatch_device_plans(tmp_path):
 #include <cstdint>
 #include <climits>
 #include <vector>
+#include "kernels/notify/route_encoding.hpp"
 #define __simt_vf__
 #define __launch_bounds__(...)
 #define __gm__
@@ -2170,8 +2181,6 @@ using topk_idx_t = int64_t;
 }
 constexpr uint32_t kSimtCores = 32, kSimtThreads = 128, kTileTokens = 16, kMetaFields = 6;
 constexpr uint32_t kNotifySimtThreads = 128, kForwardTile = 32;
-constexpr uint32_t kWireRankMask = 511, kWireTopkMask = 15;
-constexpr uint32_t kWirePrimaryTopkShift = 9, kWireSecondaryTopkShift = 13;
 """
         + finalize
         + parse
@@ -2515,6 +2524,19 @@ int main()
         large_destination_check(cores);
     }
     return_check();
+    for (auto cores : {32U, 64U}) {
+        constexpr uint32_t world = 32, tokens = 35, topk = 32, stride = 200000;
+        std::vector<int64_t> dst(tokens * topk, INT64_MIN);
+        for (uint32_t token = 0; token < tokens; ++token) {
+            dst[token * topk + 16] = int64_t(30) * stride + token * 2;
+            dst[token * topk + 25] = ~(int64_t(30) * stride + token * 2 + 1);
+            dst[token * topk + 31] = int64_t(31) * stride + token;
+        }
+        for (auto group : {1U, 8U}) {
+            std::vector<int32_t> directory(world * 8), rows(tokens * topk * 2, -1);
+            build_plan_runtime(dst, stride, 0, world, tokens, topk, group, directory, rows, cores);
+        }
+    }
     for (auto cores : {32U, 64U})
         for (auto w : {8U, 16U, 32U, 128U, 256U})
             for (auto group : {1U, 8U})
@@ -2538,8 +2560,10 @@ int main()
     )
     source = tmp_path / "rank-server.cpp"
     source.write_text(code, encoding="utf-8")
-    binary = tmp_path / "rank-server"
-    subprocess.run([compiler, "-std=c++17", "-O2", str(source), "-o", str(binary)], check=True)
+    binary = tmp_path / ("rank-server.exe" if sys.platform == "win32" else "rank-server")
+    subprocess.run(
+        [compiler, "-std=c++17", "-O2", "-I", str(root / "csrc"), str(source), "-o", str(binary)], check=True
+    )
     subprocess.run([str(binary)], check=True, timeout=60)
 
 

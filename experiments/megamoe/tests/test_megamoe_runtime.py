@@ -124,7 +124,10 @@ def unified_runtime_environment(monkeypatch):
     monkeypatch.setattr(
         _runtime,
         "require_native",
-        lambda operation: SimpleNamespace(runtime_busy=lambda: False, Runtime=ordinary, create_megamoe_runtime=create),
+        lambda operation: SimpleNamespace(
+            runtime_busy=lambda: False, Runtime=ordinary, create_megamoe_runtime=create,
+            megamoe_mte_roce_enabled=getattr(state, "hierarchical_capability", False),
+        ),
     )
     monkeypatch.setattr(
         _runtime,
@@ -256,3 +259,44 @@ def test_ubx_ep32_requires_contiguous_hosts_before_shmem(unified_runtime_environ
     assert rt.host_coordinated and "windowed" in env.events
     rt.close()
     assert env.events[-2:] == ["device-sync", "host-close"]
+
+
+@pytest.mark.parametrize("failure", [None, "interleaved", "missing_capability", "gateway_unreachable"])
+def test_hierarchical_ep32_owns_distinct_roce_session(unified_runtime_environment, monkeypatch, failure):
+    env = unified_runtime_environment
+    env.state.hierarchical_capability = failure != "missing_capability"
+    if failure == "gateway_unreachable":
+        env.state.local_error = "no RoCE path to paired gateway"
+    group = StoreGroup(None, 0, 32, prefix="hierarchical-ep32-runtime")
+    monkeypatch.setenv("DEEPEP_LL_BACKEND", "rdma")
+
+    def gather(value, stage):
+        if stage == "runtime configuration":
+            rows = [list(value) for _ in range(32)]
+            for rank, row in enumerate(rows):
+                row[4] += rank // 16
+                row[6] = rank % 16
+            return rows
+        if stage == "ndr topology":
+            if failure == "interleaved":
+                return [(f"host{rank % 2}", (), rank // 2) for rank in range(32)]
+            return [(f"host{rank // 16}", (), rank % 16) for rank in range(32)]
+        return [value] * 32
+
+    monkeypatch.setattr(group, "all_gather", gather)
+    if failure in ("interleaved", "missing_capability"):
+        reason = "16 contiguous ranks" if failure == "interleaved" else "hierarchical HNS_1825 wheel"
+        with pytest.raises(ValueError, match=reason):
+            _MegaRuntime(group, 2 << 20, backend="mte_roce")
+        assert not env.calls
+    elif failure == "gateway_unreachable":
+        with pytest.raises(RuntimeError, match="no RoCE path"):
+            _MegaRuntime(group, 2 << 20, backend="mte_roce")
+        assert len(env.calls) == 1 and _runtime._OWNER is not None
+    else:
+        rt = _MegaRuntime(group, 2 << 20, backend="mte_roce")
+        assert rt.host_coordinated and rt.ll_backend == "mte"
+        assert env.calls == [(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 120, "mte_roce")]
+        assert "peer_access_error" in env.events and "windowed" not in env.events
+        rt.close()
+        assert env.events[-2:] == ["device-sync", "host-close"]

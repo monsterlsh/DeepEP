@@ -322,16 +322,21 @@ def test_paired_perf_weight_fixture_shares_swiglu_gate_and_gmm2(mma_type):
             np.testing.assert_array_equal(actual, array)
 
 
-@pytest.mark.parametrize("scope", ["host", "timer"])
-def test_benchmark_runs_separate_host_and_timer_scopes(tmp_path, monkeypatch, scope):
+@pytest.mark.parametrize(("scope", "roce"), [("host", False), ("timer", False), ("all", True)])
+def test_benchmark_runs_separate_host_and_timer_scopes(tmp_path, monkeypatch, scope, roce):
     from deep_ep import _machine, _runtime
-    from deep_ep_experimental.megamoe import api, backend, benchmark, urma_trace, validation
+    from deep_ep_experimental.megamoe import api, backend, benchmark, urma_trace
 
     config = load_config("gelu_smoke_k25", "4")
-    config["model"].update(num_experts=4, hidden=64, intermediate_hidden=64, num_topk=2)
+    world = 32 if roce else 2
+    config["model"].update(num_experts=world * 2, hidden=64, intermediate_hidden=64, num_topk=2)
     config.update(warmup=2, iters=3)
-    calls, exports = [], []
+    calls, exports, allocations = [], [], []
     timer = object()
+
+    def allocate_timer():
+        allocations.append(len(calls))
+        return timer
 
     class Tensor:
         def __getitem__(self, key):
@@ -352,40 +357,57 @@ def test_benchmark_runs_separate_host_and_timer_scopes(tmp_path, monkeypatch, sc
                             mem_get_info=lambda device: (500, 800), current_device=lambda: 0,
                             max_memory_allocated=lambda: 150, max_memory_reserved=lambda: 200),
         from_numpy=lambda value: tensor, empty=lambda *args, **kwargs: tensor,
-        float8_e4m3fn="fp8", float8_e8m0fnu="scale", bfloat16="bf16",
+        zeros=lambda *args, **kwargs: tensor, exp=lambda *args, **kwargs: tensor,
+        float8_e4m3fn="fp8", float8_e8m0fnu="scale", bfloat16="bf16", float32="fp32",
     )
     buffer = SimpleNamespace(
-        _urma_windowed=True, window_tokens=4, num_max_tokens_per_rank=4, num_forward_windows=lambda bs: 1,
-        timer_enabled=True, allocate_timer=lambda: timer, prepare=lambda bs: None, destroy=lambda: None,
+        _urma_windowed=not roce, window_tokens=4, num_max_tokens_per_rank=4, num_forward_windows=lambda bs: 1,
+        timer_enabled=True, allocate_timer=allocate_timer, prepare=lambda bs: None, destroy=lambda: None,
+        validate_inputs=lambda bs, **kwargs: None,
         workspace_bytes=16, symmetric_buffer_bytes=32, x=tensor, x_sf=tensor, topk_idx=tensor, topk_weights=tensor,
     )
-    group = SimpleNamespace(rank=lambda: 0, size=lambda: 2, all_gather=lambda value, stage: [value] * 2,
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: world, all_gather=lambda value, stage: [value] * world,
                             barrier=lambda stage: None, close=lambda: None)
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "16" if roce else "2")
     monkeypatch.setattr(api, "SymmBuffer", lambda *args, **kwargs: buffer)
     monkeypatch.setattr(api, "fp8_fp4_mega_moe", lambda *args, timer, **kwargs: calls.append(timer))
     monkeypatch.setattr(api, "transform_weights_for_mega_moe", lambda *args, **kwargs: args)
     monkeypatch.setattr(backend, "select_backend", lambda group: "urma")
     monkeypatch.setattr(_machine, "physical_device", lambda: 7)
     monkeypatch.setattr(_runtime, "_host_boot_id", lambda: "ab" * 16)
-    monkeypatch.setattr(validation, "collective_check", lambda *args: None)
+    monkeypatch.setattr(benchmark, "collective_check", lambda *args: None)
     monkeypatch.setattr(benchmark, "flush_l2_before_call", lambda: None)
     monkeypatch.setattr(performance, "flush_l2_before_call", lambda: None)
     monkeypatch.setattr(performance, "UrmaLaunchGuard", lambda *args: pytest.fail("unexpected profiler guard"))
     monkeypatch.setattr(urma_trace, "export_diagnostics", lambda group, trace, *args, **kw: exports.append(trace))
+    monkeypatch.setattr(benchmark, "_export_roce_timer", lambda group, trace, *args: exports.append(trace))
     (tmp_path / "_build_info.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(benchmark, "files", lambda package: tmp_path)
 
-    args = SimpleNamespace(mode="perf", perf_scope=scope, paired_weights=True, input="fp8", routing="balanced",
-                           timer=scope == "timer", timer_ranks=[0], check_tokens=0, relative_rmse=0.02,
+    def collect_profile(call, *args):
+        assert not allocations
+        for _ in range(config["iters"]):
+            call()
+        return [{"duration_us": 1.0}] * config["iters"]
+
+    monkeypatch.setattr(benchmark, "collect_profile", collect_profile)
+    args = SimpleNamespace(mode="perf", perf_scope=scope, paired_weights=not roce, input="fp8", routing="balanced",
+                           backend="mte_roce" if roce else None, timer=roce or scope == "timer",
+                           timer_ranks=[0], check_tokens=0, relative_rmse=0.02,
                            output_dir=tmp_path / "run")
     benchmark.run(args, config, group)
     rank_dir = args.output_dir / "rank_0"
     case = rank_dir / "bs_4"
     manifest = json.loads((rank_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["perf_scope"] == scope and manifest["paired_weights"] is True
+    assert manifest["perf_scope"] == scope and manifest["paired_weights"] is not roce
+    if roce:
+        assert manifest["backend"] == "mte_roce"
+        assert calls == [None] * 8 + [timer] and allocations == [8] and exports == [timer]
+        report = json.loads((case / "profiling.json").read_text(encoding="utf-8"))
+        assert report["host_e2e"]["rank_max_mean_us"] > 0
+        return
     assert manifest["device_identity"] == dict(host_boot_id="ab" * 16, physical_device=7)
     assert (case / "resources.json").is_file() and not (case / "kernel_samples.json").exists()
     report = case / "performance.json"

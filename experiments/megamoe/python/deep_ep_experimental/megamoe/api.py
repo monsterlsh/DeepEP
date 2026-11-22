@@ -53,16 +53,13 @@ def _urma_window_capacity(
     error, selected = None, 0
     try:
         free, _ = npu_api().mem_get_info(npu_api().current_device())
-        # Public FP8 input/scales, routing IDs/weights, BF16 output and both
-        # Expert weights with one E8M0 byte per 32 elements. SwiGLU uses two W1 projections.
+        # Public FP8 input/scales, routing IDs/weights and BF16 output.
         resident = tokens * (3 * hidden + hidden // 32 + 8 * topk)
-        projections = 3 if activation == "swiglu" else 2
+        # Budget both gate/up layouts and their scales. FP4 preparation retains
+        # both, and FP8 preparation can hold the raw W1 alongside the interleaved one.
+        projections = 5 if activation == "swiglu" else 2
         elements = projections * local_experts * hidden * intermediate
         resident += (elements // 2 if mma_type == "fp8xfp4" else elements) + elements // 32
-        if activation == "swiglu" and mma_type == "fp8xfp8":
-            # The raw W1 is still live while its packed gate/up copy is prepared.
-            w1 = 2 * local_experts * hidden * intermediate
-            resident += w1 + w1 // 32
         # sort() produces int32 values and int64 indices during route preflight.
         resident += tokens * topk * 12
         sizes = (window_tokens,) if window_tokens is not None else (256, 128, 64)
@@ -91,6 +88,61 @@ def _urma_window_capacity(
 # A build-time performance choice. Smaller candidates preserve the MTE SHMEM
 # layout and permit individual ranks to accommodate their available memory.
 _MTE_MAX_WINDOW_TOKENS = 2048
+
+
+def _ubx_mte_capacity(group, ext, backend, world, local_experts, tokens, topk, hidden,
+                      intermediate, activation, mma_type, weight_mode, shared):
+    """Select one physical window that fits the kernel tiling and HBM on every rank."""
+    eligible, error = [], None
+    try:
+        roce = backend == "mte_roce"
+        plan_size = ext.roce_plan_bytes if roce else ext.mte_plan_bytes
+        plan_options = dict(activation=activation, mma_type=mma_type, topk_weights_type=weight_mode, shared_experts=shared)
+        heap_size = ext.roce_buffer_size if roce else ext.buffer_size
+        heap_options = dict(topk_weights_type=weight_mode, mma_type=mma_type)
+        if not roce:
+            heap_options["backend"] = backend
+        free = npu_api().mem_get_info(npu_api().current_device())[0]
+        profile = _MEGAMOE_PROFILES[backend]
+        packed_x = mma_type == "fp4xfp4"
+        packed_w = mma_type != "fp8xfp8"
+        resident = tokens * (hidden // (2 if packed_x else 1) + hidden // 32 + hidden * 2 + topk * 20)
+        # W4A8 SwiGLU retains planar and interleaved copies of its gate/up projections.
+        w1_matrices = 1 if activation == "gelu" else (4 if mma_type == "fp8xfp4" else 2)
+        weight_elements = local_experts * hidden * intermediate * (w1_matrices + 1)
+        resident += weight_elements // (2 if packed_w else 1) + weight_elements // 32
+        resident += shared * 3 * hidden * intermediate * 33 // 32
+        rejected = "insufficient free HBM or symmetric heap capacity"
+        for width in dict.fromkeys(min(tokens, n) for n in (256, 128, 64, 32, 16, 8, 4, 2, 1)):
+            shape = (world, local_experts, width, topk, hidden)
+            try:
+                heap = heap_size(*shape, **heap_options)
+                if heap > profile.maximum_capacity:
+                    continue
+                plan_rows = [width]
+                if tokens > width and width > 1:
+                    # Both plans retain scratch and share the same fixed-capacity symmetric arena.
+                    plan_rows.append(tokens % width or width - 1)
+                plan_bytes = sum(plan_size(world, local_experts, rows, width, topk, hidden, intermediate,
+                                           **plan_options) for rows in plan_rows)
+            except (RuntimeError, ValueError) as exc:
+                # A smaller window may fit the route histogram or the per-core UB buffers.
+                rejected = str(exc)
+                continue
+            if resident + heap + plan_bytes <= free:
+                eligible.append(width)
+        if not eligible:
+            raise ValueError(f"no native window fits {backend} ({free} bytes available): {rejected}")
+    except Exception as exc:
+        error = str(exc) or type(exc).__name__
+    peers = gather_control(group, "UBX MTE window capacity", (error, tuple(eligible)))
+    failures = [f"rank={r}: {message}" for r, (message, _) in enumerate(peers) if message]
+    if failures:
+        raise ValueError("MegaMoE window selection failed: " + "; ".join(failures))
+    common = set(eligible).intersection(*(widths for _, widths in peers))
+    if not common:
+        raise ValueError(f"No common {backend} window capacity across ranks: {peers}")
+    return max(common)
 
 
 def _mte_window_capacity(group, ext, world, local_experts, tokens, topk, hidden, intermediate, mma_type):
@@ -164,6 +216,20 @@ def _check_fp4_weight_format(weight, name):
         )
 
 
+def _check_a4w4_weight_format(pair, name):
+    import torch_npu
+
+    weight, _ = pair
+    actual = torch_npu.get_npu_format(weight)
+    # Plain UINT8 format-cast gives 32 physical bytes per C0. Some runtimes
+    # label this NZ(29), which is ambiguous without the preparation marker.
+    if actual != 51 and not (actual == 29 and isinstance(pair, _NativeFp4WeightPair)):
+        raise ValueError(
+            f"{name}: A4W4 requires NZ with C0=64 FP4 values (32 packed bytes), got format={actual}; "
+            "prepare packed ND with transform_weights_for_mega_moe(..., mma_type='fp4xfp4')"
+        )
+
+
 class SymmBuffer:
     """Collective resource owner. All ranks construct/call/destroy in the same order.
 
@@ -187,6 +253,7 @@ class SymmBuffer:
         timeout: int = 120,
         topk_weights_type: int | None = None,
         urma_window_tokens: int | None = None,
+        backend: str | None = None,
     ):
         import torch
         import torch.distributed as dist
@@ -196,8 +263,10 @@ class SymmBuffer:
         size = group.size() if isinstance(group, StoreGroup) else dist.get_world_size(group)
         from .backend import select_backend
 
-        self._backend_name = select_backend(group)
+        self._backend_name = select_backend(group) if backend is None else backend
         urma = self._backend_name == "urma"
+        roce = self._backend_name == "mte_roce"
+        local_mte = self._backend_name == "mte" and (backend == "mte" or mma_type == "fp4xfp4")
         if topk_weights_type is None:
             topk_weights_type = int(activation == "gelu")
         urma_swiglu = (
@@ -211,6 +280,8 @@ class SymmBuffer:
         self._urma_windowed = self._windowed = urma_swiglu_windowed = False
         error = None
         try:
+            if backend not in (None, "mte", "mte_roce"):
+                raise ValueError("Explicit MegaMoE backend must be 'mte' or 'mte_roce'")
             integer("num_experts", num_experts, 1, 16384)
             integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 65536)
             integer("num_topk", num_topk, 1, min(32, num_experts))
@@ -238,6 +309,15 @@ class SymmBuffer:
             integer("ranks_per_node", ranks_per_node, 0, size)
             integer("timeout", timeout, 1, 300)
             integer("topk_weights_type", topk_weights_type, 0, 1)
+            if roce:
+                if size != 32 or ranks_per_node != 16:
+                    raise ValueError("MTE+RoCE requires EP32 on two 16-rank hosts")
+                if num_shared_experts and (mma_type, activation) != ("fp8xfp4", "swiglu"):
+                    raise ValueError("MTE+RoCE shared experts require W4A8 SwiGLU")
+            if local_mte:
+                if size != 16 or ranks_per_node not in (0, 16):
+                    raise ValueError("UBX local MTE requires all 16 ranks on one host")
+                ranks_per_node = 16
             if self._urma_windowed:
                 local_ranks = min(size, 16)
                 if ranks_per_node not in (0, local_ranks):
@@ -248,10 +328,10 @@ class SymmBuffer:
                 raise ValueError(f"hidden must be divisible by {h_align}; intermediate_hidden by {i_align}")
             if activation not in {"swiglu", "gelu"}:
                 raise ValueError("activation must be 'swiglu' or 'gelu'")
-            if mma_type == "fp4xfp4":
-                raise ValueError("A4W4 (mma_type='fp4xfp4') is not enabled")
-            if mma_type not in {"fp8xfp4", "fp8xfp8"}:
-                raise ValueError("mma_type must be fp8xfp4 or fp8xfp8")
+            if mma_type == "fp4xfp4" and not (local_mte or roce):
+                raise ValueError("A4W4 requires backend='mte' on EP16 or 'mte_roce' on EP32")
+            if mma_type not in {"fp8xfp4", "fp8xfp8", "fp4xfp4"}:
+                raise ValueError("mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4")
             if urma and size not in (4, 8, 16, 32):
                 raise ValueError("URMA supports EP4/EP8/EP16/EP32")
             if urma and mma_type == "fp8xfp8" and not urma_w8a8:
@@ -282,10 +362,17 @@ class SymmBuffer:
             timeout,
             topk_weights_type,
             urma_window_tokens,
-            _host_boot_id() if self._urma_windowed and size <= 16 else None,
+            backend,
+            _host_boot_id() if local_mte or (self._urma_windowed and size <= 16) else None,
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
+        if roce:
+            error = None if getattr(ext, "mte_roce_mx_enabled", False) else "install a MegaMoE wheel with MTE+RoCE MX support"
+            collective_check(group, "MTE+RoCE availability", error)
+        if local_mte and mma_type == "fp4xfp4":
+            error = None if getattr(ext, "mte_a4w4_enabled", False) else "install a MegaMoE wheel with MTE A4W4 support"
+            collective_check(group, "MTE A4W4 availability", error)
         if urma_w8a8:
             error = None if getattr(ext, "urma_w8a8_enabled", False) else "install a MegaMoE wheel with URMA W8A8 support"
             collective_check(group, "URMA W8A8 availability", error)
@@ -297,6 +384,9 @@ class SymmBuffer:
             collective_check(group, "Windowed URMA SwiGLU availability", error)
 
         def heap_bytes(tokens):
+            if roce:
+                return int(ext.roce_buffer_size(size, num_experts // size, tokens, num_topk, hidden,
+                                                topk_weights_type=topk_weights_type, mma_type=mma_type))
             return int(ext.buffer_size(
                 size,
                 num_experts // size,
@@ -310,13 +400,19 @@ class SymmBuffer:
             ))
 
         self._native_capacity = num_max_tokens_per_rank
-        if self._urma_windowed:
+        if roce or local_mte:
+            self._native_capacity = _ubx_mte_capacity(
+                group, ext, self._backend_name, size, num_experts // size, num_max_tokens_per_rank, num_topk,
+                hidden, intermediate_hidden, activation, mma_type, topk_weights_type, num_shared_experts,
+            )
+            self._windowed = self._native_capacity < num_max_tokens_per_rank
+        elif self._urma_windowed:
             self._native_capacity = _urma_window_capacity(
                 group, ext, size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
                 mma_type, activation=activation, window_tokens=urma_window_tokens,
             )
         capacity = heap_bytes(self._native_capacity)
-        if not urma and activation == "gelu" and not num_shared_experts and capacity > _MEGAMOE_PROFILES["mte"].maximum_capacity:
+        if self._backend_name == "mte" and not local_mte and activation == "gelu" and not num_shared_experts and capacity > _MEGAMOE_PROFILES["mte"].maximum_capacity:
             self._windowed = True
             self._native_capacity = _mte_window_capacity(
                 group, ext, size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, mma_type
@@ -375,7 +471,7 @@ class SymmBuffer:
         if self._plan_bs == bs:
             self._prepare_tail(logical_bs)
             return
-        if self._backend_name == "urma":
+        if self._backend_name in ("urma", "mte_roce"):
             # Resource changes retire prior network sources before reusing the
             # fixed control regions. Exchange shape metadata, never route data.
             error = None
@@ -386,13 +482,13 @@ class SymmBuffer:
             collective_check(self.group, "plan configuration", error, (bs, self._backend_name))
         # Publish a new window plan only after every rank has reserved its scratch.
         self._plan = self._plan_bs = None
-        if self._windowed:
+        if self._windowed or self._backend_name == "mte_roce":
             plan, error = None, None
             try:
                 plan = self._create_plan(bs)
             except Exception as failure:
                 error = str(failure) or type(failure).__name__
-            collective_check(self.group, "window plan", error)
+            collective_check(self.group, "window plan" if self._windowed else "MTE+RoCE plan", error)
         else:
             plan = self._create_plan(bs)
         self._plan, self._plan_bs = plan, bs
@@ -417,6 +513,13 @@ class SymmBuffer:
         runtime = self._runtime
         address = require_native("MegaMoE").megamoe_workspace_address(runtime.native)
         ext = _extension()
+        if self._backend_name == "mte_roce":
+            return ext.RocePlan(
+                self.x[:bs], self.intermediate_hidden, self.num_topk, self.num_experts // self._world_size,
+                self._world_size, self._native_capacity, self.num_shared_experts, ext.ffts_config(),
+                address, runtime.native.capacity, activation=self.activation, mma_type=self.mma_type,
+                topk_weights_type=self.topk_weights_type,
+            )
         return ext.Plan(
             self.x[:bs],
             self.intermediate_hidden,
@@ -480,6 +583,8 @@ class SymmBuffer:
 
     @property
     def timer_enabled(self) -> bool:
+        if self._backend_name == "mte_roce":
+            return bool(getattr(_extension(), "mte_roce_timer_enabled", False))
         supports_timer = self.mma_type == "fp8xfp4" or (self.mma_type == "fp8xfp8" and self._urma_windowed)
         return bool(_extension().timer_enabled and supports_timer)
 
@@ -487,6 +592,8 @@ class SymmBuffer:
         """Fresh zeroed device trace; pass only to a separate diagnostic invocation."""
         self._runtime.ensure_alive()
         if not self.timer_enabled:
+            if self._backend_name == "mte_roce":
+                raise RuntimeError("MTE+RoCE device timer requires a compatible wheel built with DEEPEP_MEGAMOE_TIMER=ON")
             raise RuntimeError(_TIMER_REQUIREMENTS)
         return _extension().allocate_timer(self.x, backend=self._backend_name)
 
@@ -573,18 +680,29 @@ class _UrmaMxSwiGluWeightPair(tuple):
     """Contiguous ND FP8 weights and scales packed in gate128/up128 pairs."""
 
 
+class _RoceFp8SharedWeightPair(tuple):
+    """FP8 shared GMM1 prepared in the MTE+RoCE fused layout."""
+
+
+class _NativeFp4WeightPair(tuple):
+    """Planar weights prepared in byte NZ, with 64 logical FP4 values per C0."""
+
+
 def transform_weights_for_mega_moe(
     l1_weights: WeightPair, l2_weights: WeightPair, activation: str = "swiglu", *,
-    shared: bool = False, backend: str | None = None,
+    shared: bool = False, backend: str | None = None, mma_type: str | None = None,
 ) -> tuple[WeightPair, WeightPair]:
     """Prepare raw Ascend weights once, without quantizing again.
 
     Raw inputs use [gate | up]. Routed FP4 GMM1 prepares both planar Prefill and
     [gate128, up128] Decode layouts. Keep the returned l1 pair intact and immutable;
     the API selects its layout by actual BS without a timed conversion. Pass shared=True for
-    shared experts, whose GMM1 remains planar. For routed URMA FP8 SwiGLU, pass
+    shared experts. MTE+RoCE FP8 shared GMM1 also uses the interleaved layout and
+    requires backend="mte_roce" when preparing weights. For routed URMA FP8 SwiGLU, pass
     backend="urma" to pack the same gate128/up128 tiles in ND, and keep the
     returned l1 pair intact. Other FP8 weights keep their original layout.
+    For native A4W4, pass mma_type="fp4xfp4" to prepare both projections in
+    planar NZ with 32 packed bytes per C0. Keep the returned pairs intact.
     This is not the CUDA UTCCP transform. Old prepared FP4 routed weights must
     be regenerated from raw ND inputs; do not transform prepared NZ twice.
     """
@@ -593,18 +711,25 @@ def transform_weights_for_mega_moe(
 
     if activation not in ("swiglu", "gelu"):
         raise ValueError("activation must be 'swiglu' or 'gelu'")
-    if backend not in (None, "mte", "urma"):
-        raise ValueError("backend must be 'mte' or 'urma'")
+    if backend not in (None, "mte", "urma", "mte_roce"):
+        raise ValueError("backend must be 'mte', 'urma' or 'mte_roce'")
+    if mma_type not in (None, "fp8xfp4", "fp8xfp8", "fp4xfp4"):
+        raise ValueError("mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4")
+    native_fp4 = mma_type == "fp4xfp4"
+    if native_fp4 and shared:
+        raise ValueError("Native A4W4 preparation requires routed FP4 weights")
     transformed = []
     for name, value in (("l1_weights", l1_weights), ("l2_weights", l2_weights)):
-        if isinstance(value, _UrmaMxSwiGluWeightPair):
+        if isinstance(value, (_UrmaMxSwiGluWeightPair, _RoceFp8SharedWeightPair)):
             raise ValueError(f"{name}: prepare from raw planar FP8 weights, not already packed gate/up weights")
+        if isinstance(value, _NativeFp4WeightPair):
+            raise ValueError(f"{name}: prepare A4W4 from raw packed ND weights")
         weight, scale = _pair(value, name)
         if weight.device.type != "npu" or scale.device != weight.device:
             raise ValueError("Move weights and scales to the same NPU before preparing")
         if weight.ndim != 3:
             raise ValueError(f"{name}: weights must be [E,N,K] or packed [E,N,K/2]")
-        if weight.dtype in {torch.int8, torch.uint8} and torch_npu.get_npu_format(weight) in (29, 50):
+        if weight.dtype in {torch.int8, torch.uint8} and torch_npu.get_npu_format(weight) in (29, 50, 51):
             raise ValueError(f"{name}: prepare from raw ND weights, not already converted NZ weights")
         if weight.dtype == torch.int8:
             weight = weight.view(torch.uint8)  # 重解释 FP4 的位模式，不能做数值类型转换。
@@ -620,6 +745,15 @@ def transform_weights_for_mega_moe(
         if scale.dtype != torch.float8_e8m0fnu or tuple(scale.shape) != expected:
             raise ValueError(f"{name}: expected E8M0 scales {expected} or raw packed int32 [E,N,K/128]")
         scale = scale.contiguous()
+        if native_fp4:
+            if weight.dtype != torch.uint8 or torch_npu.get_npu_format(weight) != 2:
+                raise ValueError(f"{name}: A4W4 requires packed FP4 ND weights")
+            # Cast packed bytes as UINT8, without the FP4 input-dtype override
+            # that selects the smaller C0 used by the A8W4 dequant prologue.
+            pair = _NativeFp4WeightPair((torch_npu.npu_format_cast(weight.contiguous(), 29), scale))
+            _check_a4w4_weight_format(pair, name)
+            transformed.append(pair)
+            continue
         routed_swiglu = name == "l1_weights" and not shared and activation == "swiglu"
         if weight.dtype == torch.uint8:
             if routed_swiglu:
@@ -648,6 +782,13 @@ def transform_weights_for_mega_moe(
                 input_dtype=torch_npu.float4_e2m1fn_x2,
             )
             _check_fp4_weight_format(weight, name)
+        elif shared and backend == "mte_roce" and name == "l1_weights" and activation == "swiglu":
+            if weight.shape[1] % 256 or torch_npu.get_npu_format(weight) != 2:
+                raise ValueError("MTE+RoCE FP8 shared GMM1 requires ND weights and aligned gate/up widths")
+            weight = _interleave_gate_up_128(weight.view(torch.uint8)).view(torch.float8_e4m3fn)
+            scale = _interleave_gate_up_128(scale.view(torch.uint8)).view(torch.float8_e8m0fnu)
+            transformed.append(_RoceFp8SharedWeightPair((weight, scale)))
+            continue
         elif routed_swiglu and backend == "urma":
             if weight.shape[1] % 256 or torch_npu.get_npu_format(weight) != 2:
                 raise ValueError("URMA FP8 SwiGLU GMM1 requires ND weights and gate/up widths divisible by 128")
@@ -695,6 +836,45 @@ def mega_moe(
     )
 
 
+def _check_roce_shared_weights(buffer, shared, l1_pair):
+    import torch
+
+    if any(tensor is None for tensor in shared):
+        raise ValueError("MTE+RoCE requires all four shared weights and scales together")
+    dtype = shared[0].dtype
+    if dtype not in (torch.uint8, torch.float8_e4m3fn):
+        raise ValueError("shared_l1_weights: MTE+RoCE shared weights must be packed FP4 or FP8 E4M3")
+    fp8 = dtype == torch.float8_e4m3fn
+    packing = 1 if fp8 else 2
+    experts, h, i = buffer.num_shared_experts, buffer.hidden, buffer.intermediate_hidden
+    if not experts:
+        raise ValueError("Shared expert count does not match the buffer configuration")
+    expected = (
+        ("shared_l1_weights", (experts, 2 * i, h // packing), dtype),
+        ("shared_l2_weights", (experts, h, i // packing), dtype),
+        ("shared_l1_scales", (experts, 2 * i, (h + 63) // 64, 2), torch.float8_e8m0fnu),
+        ("shared_l2_scales", (experts, h, (i + 63) // 64, 2), torch.float8_e8m0fnu),
+    )
+    for tensor, (name, shape, expected_dtype) in zip(shared, expected):
+        if (
+            tensor.device != buffer._device
+            or tensor.shape != shape
+            or tensor.dtype != expected_dtype
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(f"{name}: MTE+RoCE requires contiguous {expected_dtype} {shape} on {buffer._device}")
+    if fp8:
+        import torch_npu
+
+        if not isinstance(l1_pair, _RoceFp8SharedWeightPair):
+            raise ValueError("Prepare MTE+RoCE FP8 shared GMM1 with shared=True and backend='mte_roce'")
+        if any(torch_npu.get_npu_format(weight) != 2 for weight in shared[:2]):
+            raise ValueError("MTE+RoCE shared weights require contiguous ND FP8 E4M3")
+    else:
+        _check_fp4_weight_format(shared[0], "shared_l1_weights")
+        _check_fp4_weight_format(shared[1], "shared_l2_weights")
+
+
 def _forward_inputs(
     x, topk_idx, topk_weights, l1_weights, l2_weights, sym_buffer,
     shared_l1_weights, shared_l2_weights, out, timer, cumulative_stats, activation_clamp, buffered_options,
@@ -730,7 +910,14 @@ def _forward_inputs(
         sw2, ss2 = _pair(shared_l2_weights, "shared_l2_weights")
         shared = (sw1, sw2, ss1, ss2)
     b = sym_buffer
+    roce = b._backend_name == "mte_roce"
+    if isinstance(l1_weights, _RoceFp8SharedWeightPair) or (
+        isinstance(shared_l1_weights, _RoceFp8SharedWeightPair) and not roce
+    ):
+        raise ValueError("Prepared MTE+RoCE FP8 GMM1 weights require an MTE+RoCE shared expert")
     if timer is not None and not b.timer_enabled:
+        if roce:
+            raise RuntimeError("MTE+RoCE device timer requires a compatible wheel built with DEEPEP_MEGAMOE_TIMER=ON")
         raise RuntimeError(_TIMER_REQUIREMENTS)
     if b.activation == "gelu" and activation_clamp is not None:
         raise ValueError("activation_clamp is only defined for SwiGLU")
@@ -750,20 +937,28 @@ def _forward_inputs(
     expected = (b.num_experts // b.group.size(), b.intermediate_hidden * (1 if b.activation == "gelu" else 2))
     if tuple(w1.shape[:2]) != expected or tuple(topk_idx.shape) != (data.shape[0], b.num_topk):
         raise ValueError("Weight/routing shapes do not match the buffer configuration")
-    if (shared[0].shape[0] if shared[0] is not None else 0) != b.num_shared_experts:
+    if roce and shared_l1_weights is not None:
+        _check_roce_shared_weights(b, shared, shared_l1_weights)
+    elif (shared[0].shape[0] if shared[0] is not None else 0) != b.num_shared_experts:
         raise ValueError("Shared expert count does not match the buffer configuration")
     expected_dtype = torch.uint8 if b.mma_type in {"fp8xfp4", "fp4xfp4"} else torch.float8_e4m3fn
     if w1.dtype != expected_dtype or w2.dtype != expected_dtype:
         raise TypeError("Weight dtype differs from buffer mma_type")
+    native_fp4 = b.mma_type == "fp4xfp4"
+    if native_fp4:
+        _check_a4w4_weight_format(l1_weights, "l1_weights")
+        _check_a4w4_weight_format(l2_weights, "l2_weights")
+    elif isinstance(l1_weights, _NativeFp4WeightPair) or isinstance(l2_weights, _NativeFp4WeightPair):
+        raise ValueError("Prepared A4W4 weights require an A4W4 buffer")
     requires_packed_mx = urma and b.mma_type == "fp8xfp8" and b.activation == "swiglu"
     if requires_packed_mx and not isinstance(l1_weights, _UrmaMxSwiGluWeightPair):
         raise ValueError("Prepare URMA FP8 SwiGLU GMM1 with transform_weights_for_mega_moe(..., backend='urma')")
     if not requires_packed_mx and isinstance(l1_weights, _UrmaMxSwiGluWeightPair):
         raise ValueError("Packed FP8 SwiGLU GMM1 weights require the URMA FP8 SwiGLU buffer")
     prepared_inputs = ()
-    if w1.dtype == torch.uint8:
+    if w1.dtype == torch.uint8 and not native_fp4:
         fused = b.activation == "swiglu" and b.mma_type == "fp8xfp4" and (
-            urma or data.shape[0] <= _extension().small_batch_max_tokens
+            urma or min(data.shape[0], b.window_tokens) <= _extension().small_batch_max_tokens
         )
         if isinstance(l1_weights, _RoutedWeightPair):
             if b.activation != "swiglu":
@@ -785,15 +980,14 @@ def _forward_inputs(
         raise ValueError("out must not overlap any input or timer storage")
     if topk_idx.dtype != torch.int32:
         raise TypeError("topk_idx must be int32; convert explicitly before timing")
-    if w1.dtype == torch.uint8:
-        for name, weight in (
-            ("l1_weights", w1),
-            ("l2_weights", w2),
-            ("shared_l1_weights", shared[0]),
-            ("shared_l2_weights", shared[1]),
-        ):
-            if weight is not None:
-                if urma and name.startswith("shared_"):
+    if w1.dtype == torch.uint8 and not native_fp4:
+        _check_fp4_weight_format(w1, "l1_weights")
+        _check_fp4_weight_format(w2, "l2_weights")
+        if not roce:
+            for name, weight in zip(("shared_l1_weights", "shared_l2_weights"), shared[:2]):
+                if weight is None:
+                    continue
+                if urma:
                     import torch_npu
 
                     if (
@@ -804,12 +998,12 @@ def _forward_inputs(
                         raise ValueError("URMA shared weights require contiguous ND FP8 E4M3")
                 else:
                     _check_fp4_weight_format(weight, name)
-    elif urma:
+    elif not native_fp4 and (urma or roce):
         import torch_npu
 
         for weight in (w1, w2):
             if not weight.is_contiguous() or torch_npu.get_npu_format(weight) != 2:
-                raise ValueError("URMA W8A8 routed weights require contiguous ND FP8 E4M3")
+                raise ValueError("UBX W8A8 routed weights require contiguous ND FP8 E4M3")
     if cumulative_stats is not None:
         stats = cumulative_stats
         if (
@@ -825,14 +1019,14 @@ def _forward_inputs(
             if t is not None
         ):
             raise ValueError("Cumulative stats must not alias inputs, output or timer")
-    if b._windowed:
+    if b._windowed or roce:
         bs, h, i = data.shape[0], b.hidden, b.intermediate_hidden
         local = b.num_experts // b._world_size
         w1_columns = 2 * i if b.activation == "swiglu" else i
         tensors = [
             (topk_idx, (bs, b.num_topk), torch.int32),
             (topk_weights, (bs, b.num_topk), torch.float32),
-            (data, (bs, h), expected_x_dtype),
+            (data, (bs, expected_width), expected_x_dtype),
             (w1, (local, w1_columns, h // (2 if w1.dtype == torch.uint8 else 1)), expected_dtype),
             (w2, (local, h, i // (2 if w1.dtype == torch.uint8 else 1)), expected_dtype),
             (s1, (local, w1_columns, h // 64, 2), torch.float8_e8m0fnu),
@@ -851,17 +1045,17 @@ def _forward_inputs(
                 or tensor.dtype != dtype
                 or not tensor.is_contiguous()
             ):
-                raise ValueError(f"Windowed URMA requires contiguous {dtype} {shape} on {b._device}")
+                raise ValueError(f"Windowed {b._backend_name.upper()} requires contiguous {dtype} {shape} on {b._device}")
         if timer is not None:
             if timer.device != b._device:
                 raise ValueError("timer must be on the buffer device")
             _extension().validate_timer(timer, b._backend_name)
             if any(
                 timer.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr()
-                for tensor in (data, scales, topk_idx, topk_weights, w1, w2, s1, s2)
+                for tensor in (data, scales, topk_idx, topk_weights, w1, w2, s1, s2, *shared, out)
                 if tensor is not None
             ):
-                raise ValueError("timer must not share storage with inputs or weights")
+                raise ValueError("timer must not share storage with inputs, weights or output")
         check_window_routes(topk_idx, topk_weights, b.num_experts)
     return data, scales, topk_idx, topk_weights, (w1, w2, s1, s2), shared, clamp
 
@@ -890,6 +1084,7 @@ def _run(
     runtime = b._runtime
     with b._lock:
         runtime.ensure_alive()
+        check_collectively = b._windowed or b._backend_name == "mte_roce"
         if b._failure is not None:
             raise RuntimeError(f"MegaMoE buffer failed; restart the distributed job: {b._failure}")
         error = None
@@ -900,17 +1095,22 @@ def _run(
                 shared_l2_weights, out, timer, cumulative_stats, activation_clamp, buffered_options
             )
             bs = data.shape[0]
-            if b._windowed:
-                signature = (bs, b._generation)
+            if check_collectively:
+                signature = (bs, b._generation, scales is not None, clamp)
+                if b._backend_name == "mte_roce":
+                    # The kernel's wave size depends on the shared weight precision.
+                    signature += (shared[0] is not None and shared[0].dtype == torch.float8_e4m3fn,)
                 if b._urma_windowed and b._generation + b.num_forward_windows(bs) >= 1 << 31:
                     raise ValueError("URMA generation exhausted; recreate the buffer")
+                if b._backend_name == "mte_roce" and b._generation + b.num_forward_windows(bs) >= (1 << 31) - 1:
+                    raise ValueError("MTE+RoCE sequence exhausted; recreate the buffer")
                 if out is None:
                     out = torch.empty((bs, b.hidden), dtype=torch.bfloat16, device=b._device)
         except Exception as exc:
-            if not b._windowed:
+            if not check_collectively:
                 raise
             error = str(exc) or type(exc).__name__
-        if b._windowed:
+        if check_collectively:
             collective_check(b.group, "window inputs", error, signature)
         caller = npu_api().current_stream(runtime.device)
         runtime.stream.wait_stream(caller)
@@ -941,7 +1141,10 @@ def _run(
             except Exception as exc:
                 # Window plan failures are collective and retryable. Once a launch
                 # starts, a peer may already be waiting on its generation.
-                if (b._backend_name == "urma" and not b._windowed) or (b._windowed and b._generation != start_generation):
+                launched = b._generation != start_generation
+                if (b._backend_name == "urma" and not b._windowed) or (
+                    launched and (b._windowed or b._backend_name == "mte_roce")
+                ):
                     b._failure = str(exc)
                     if isinstance(b.group, StoreGroup):
                         b.group.abort(b._failure)

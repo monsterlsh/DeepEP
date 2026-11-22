@@ -20,6 +20,7 @@ prune deep_ep/.libs
 recursive-exclude deep_ep *.so *.so.*
 exclude deep_ep/_build_info.json
 recursive-include experiments/megamoe *.sh *.py *.cpp *.hpp *.cmake CMakeLists.txt *.json *.md *.txt *.LICENSE
+recursive-include experiments/megamoe/tests/hierarchical_device *.h
 include experiments/__init__.py
 include experiments/ep_gmm_fused/tests/requirements.txt
 recursive-include experiments/ep_gmm_fused *.py *.cpp *.hpp *.h *.cmake CMakeLists.txt *.md *.json LICENSE

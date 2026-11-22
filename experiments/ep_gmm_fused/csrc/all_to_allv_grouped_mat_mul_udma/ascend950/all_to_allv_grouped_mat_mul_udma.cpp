@@ -29,22 +29,21 @@
 namespace deepep::ep_gmm_fused {
 namespace {
 
-// Capacity check only; 128 covers E/P up to 128 (for example 800 experts on EP8).
-constexpr uint32_t kMaxLocalExperts = 128;
 constexpr uint64_t kSymmetricDataBytes = 200UL * 1024 * 1024 * sizeof(uint16_t);
 constexpr uint32_t kMaxK0 = 256;
 static_assert(sizeof(Catccos::DGemm::MoeRouteSegment) == 24, "unexpected MoeRouteSegment ABI");
 static_assert(sizeof(Catccos::DGemm::MoeRouteMetadata) == 12880, "unexpected MoeRouteMetadata ABI");
 
+void CheckRouteMetadataCapacity(int64_t localExpertNum)
+{
+    TORCH_CHECK(localExpertNum <= Catccos::DGemm::MOE_ROUTE_MAX_LOCAL_EXPERTS,
+                "route_metadata supports at most ", Catccos::DGemm::MOE_ROUTE_MAX_LOCAL_EXPERTS, " local experts");
+}
+
 enum class KernelVariant {
     kM0_128,
     kM0_256,
     kM0_256N0_256,
-};
-
-template <class T>
-struct TypeTag {
-    using type = T;
 };
 
 struct TilingProfile {
@@ -367,6 +366,7 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
     if (routeMetadataOptional.has_value()) {
         const at::Tensor& routeMetadata = routeMetadataOptional.value();
         TORCH_CHECK(allToAllVOutputOptional.has_value(), "route_metadata is only valid when exporting AllToAllV");
+        CheckRouteMetadataCapacity(localExpertNum);
         CheckNpuTensor(routeMetadata, "route_metadata", at::kByte);
         TORCH_CHECK(routeMetadata.device() == x.device(), "route_metadata and x must be on the same NPU");
         TORCH_CHECK(routeMetadata.numel() == static_cast<int64_t>(sizeof(Catccos::DGemm::MoeRouteMetadata)),
@@ -385,7 +385,7 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
     TORCH_CHECK(tiling.selfCopyCores > 0 && static_cast<uint64_t>(worldSize) + tiling.selfCopyCores - 1 <= blockDim,
                 "self_copy_cores exceeds the available AIV worker pool");
     const uint64_t fftsAddress = runtime.FftsAddress();
-    auto launchWithConfig = [&](auto configTag) {
+    auto launch = [&](auto configTag) {
         using SelectedConfig = typename decltype(configTag)::type;
         InitializeAndLaunch<SelectedConfig>(
             tiling, shape, static_cast<uint32_t>(runtime.Rank()), static_cast<uint32_t>(worldSize),
@@ -398,6 +398,9 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
             routeMetadataOptional.has_value() ? reinterpret_cast<uint8_t*>(routeMetadataOptional.value().data_ptr())
                                               : nullptr,
             blockDim, stream, fftsAddress);
+    };
+    auto launchWithConfig = [&](auto configTag) {
+        LaunchWithExpertCapacity(configTag, static_cast<uint32_t>(localExpertNum), launch);
     };
     auto launchByMSplit = [&](auto mSplit1, auto mSplit2, auto mSplit4) {
         if (tiling.mSplit == 2) {
@@ -519,10 +522,15 @@ at::Tensor AllToAllVGroupedMatMulUdmaOutMeta(const at::Tensor& x, const at::Tens
 
 std::tuple<at::Tensor, at::Tensor> AllToAllVGroupedMatMulUdmaExportMeta(
     const at::Tensor& x, const at::Tensor& weight, const at::Tensor&, const at::Tensor&, int64_t epSize,
-    int64_t expertNum, int64_t receivedRows, const c10::optional<at::Tensor>&, const at::Tensor& allToAllVOutput,
-    at::IntArrayRef tiling)
+    int64_t expertNum, int64_t receivedRows, const c10::optional<at::Tensor>& routeMetadata,
+    const at::Tensor& allToAllVOutput, at::IntArrayRef tiling)
 {
     (void)ResolveTiling(kDefaultTiling, tiling, true);
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "expected x[m,k] and weight[e,k,n]");
+    TORCH_CHECK(epSize > 0 && expertNum > 0 && expertNum % epSize == 0, "invalid expert topology");
+    if (routeMetadata.has_value()) {
+        CheckRouteMetadataCapacity(expertNum / epSize);
+    }
     TORCH_CHECK(receivedRows >= 0 && receivedRows <= epSize * x.size(0), "invalid received_rows");
     TORCH_CHECK(
         allToAllVOutput.dim() == 2 && allToAllVOutput.size(0) == receivedRows && allToAllVOutput.size(1) == x.size(1),
@@ -532,12 +540,15 @@ std::tuple<at::Tensor, at::Tensor> AllToAllVGroupedMatMulUdmaExportMeta(
 
 std::tuple<at::Tensor, at::Tensor> AllToAllVGroupedMatMulUdmaOutExportMeta(
     const at::Tensor& x, const at::Tensor& weight, const at::Tensor&, const at::Tensor&, int64_t epSize,
-    int64_t expertNum, int64_t receivedRows, const c10::optional<at::Tensor>&, const at::Tensor& output,
+    int64_t expertNum, int64_t receivedRows, const c10::optional<at::Tensor>& routeMetadata, const at::Tensor& output,
     const at::Tensor& allToAllVOutput, at::IntArrayRef tiling)
 {
     (void)ResolveTiling(kDefaultTiling, tiling, true);
     TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "expected x[m,k] and weight[e,k,n]");
     TORCH_CHECK(epSize > 0 && expertNum > 0 && expertNum % epSize == 0, "invalid expert topology");
+    if (routeMetadata.has_value()) {
+        CheckRouteMetadataCapacity(expertNum / epSize);
+    }
     TORCH_CHECK(receivedRows >= 0 && receivedRows <= epSize * x.size(0), "invalid received_rows");
     TORCH_CHECK(output.dim() == 2 && output.size(0) == receivedRows && output.size(1) == weight.size(2),
                 "invalid out shape");

@@ -30,6 +30,7 @@ class _MegaMoEProfile(NamedTuple):
 
 _MEGAMOE_PROFILES = {
     "mte": _MegaMoEProfile(1 << 30, False, False, None),
+    "mte_roce": _MegaMoEProfile(1 << 30, False, True, (32,)),
     "urma": _MegaMoEProfile(32 << 30, True, True, (4, 8, 16, 32)),
 }
 
@@ -101,12 +102,15 @@ class Runtime:
     ):
         global _OWNER
         profile = None
+        megamoe_windowed = getattr(self, "_megamoe_windowed", False)
+        hierarchical_roce = self._megamoe and self._megamoe_backend == "mte_roce"
         if self._megamoe:
             if self._megamoe_backend not in _MEGAMOE_PROFILES:
-                raise ValueError("MegaMoE backend must be mte or urma")
+                raise ValueError("MegaMoE backend must be mte, mte_roce or urma")
             profile = _MEGAMOE_PROFILES[self._megamoe_backend]
         native = require_native("Runtime.__init__")
-        self.ll_backend = "mte" if getattr(self, "_megamoe_windowed", False) else os.environ.get("DEEPEP_LL_BACKEND", "mte")
+        hierarchical_supported = hierarchical_roce and bool(getattr(native, "megamoe_mte_roce_enabled", False))
+        self.ll_backend = "mte" if megamoe_windowed or hierarchical_roce else os.environ.get("DEEPEP_LL_BACKEND", "mte")
         if self.ll_backend not in ("mte", "rdma"):
             raise ValueError("DEEPEP_LL_BACKEND must be mte or rdma")
         integer("capacity", capacity, 2 << 20, profile.maximum_capacity if profile else (1 << 63) - 1)
@@ -155,12 +159,14 @@ class Runtime:
         if self._megamoe:
             integer("world_size", size, 2, 128)
             if profile.world_sizes is not None and size not in profile.world_sizes:
+                if hierarchical_roce:
+                    raise ValueError("MegaMoE MTE+RoCE requires EP32 (two contiguous 16-rank hosts)")
                 raise ValueError("Selected MegaMoE backend requires EP4/EP8/EP16/EP32")
             create = getattr(native, "create_megamoe_runtime", None)
             if create is None:
                 raise RuntimeError("Rebuild with DEEPEP_BUILD_MEGAMOE=ON")
             factory = partial(create, backend=self._megamoe_backend)
-            if getattr(self, "_megamoe_windowed", False):
+            if megamoe_windowed:
                 factory = partial(factory, windowed=True)
         else:
             from .buffers._elastic_layout import WORLD_SIZES
@@ -178,7 +184,7 @@ class Runtime:
         npu = npu_api()
         self.device = npu.current_device()
         self.group = group
-        self.host_coordinated = self.ll_backend == "rdma" or (
+        self.host_coordinated = self.ll_backend == "rdma" or hierarchical_roce or (
             self._megamoe and self._megamoe_backend == "urma" and size == 32
         )
         self.coordination_failed = False
@@ -217,7 +223,9 @@ class Runtime:
                     + 16 * int(debug_collectives)
                     + 32 * int(self.ll_backend == "rdma")
                     + 64 * int(profile is not None and profile.peer_access_check)
-                    + 128 * int(getattr(self, "_megamoe_windowed", False))
+                    + 128 * int(megamoe_windowed)
+                    + 256 * int(hierarchical_roce)
+                    + 512 * int(hierarchical_supported)
                 )
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")
@@ -240,8 +248,10 @@ class Runtime:
                 if any(value[-1] != values[0][-1] for value in values):
                     raise ValueError(
                         "Ranks disagree on MTE/URMA/RDMA runtime engines, QP configuration, page size, "
-                        "debug_collectives or MegaMoE backend profile"
+                        "debug_collectives or MegaMoE backend capability"
                     )
+                if hierarchical_roce and (not hierarchical_supported or megamoe_windowed):
+                    raise ValueError("MegaMoE MTE+RoCE requires the hierarchical HNS_1825 wheel and windowed=False")
                 if self._megamoe:
                     invalid_hosts = [i for i, value in enumerate(values) if value[4] == 0]
                     if invalid_hosts:
@@ -273,7 +283,7 @@ class Runtime:
                             [_host_boot_id(), list(mapping), self.device], "ndr topology")
                     else:
                         dist.all_gather_object(topology, (_host_boot_id(), mapping, self.device), group=group)
-                    validate_ndr_topology(topology)
+                    validate_ndr_topology(topology, "MegaMoE MTE+RoCE" if hierarchical_roce else "NDR")
             self.rank, self.world_size = rank, size
             self.capacity = capacity
             self.notify_lock = threading.RLock()
@@ -403,25 +413,25 @@ class Runtime:
         self.combine_window_layout = layout
 
 
-def validate_ndr_topology(topology):
+def validate_ndr_topology(topology, transport="NDR"):
     if not topology or len(topology) % 16:
-        raise ValueError("NDR requires 16 contiguous ranks per physical host")
+        raise ValueError(f"{transport} requires 16 contiguous ranks per physical host")
     hosts = {}
     devices = set()
     mappings = {}
     for rank, (host, mapping, device) in enumerate(topology):
         if not host:
-            raise ValueError("NDR cannot establish Linux host identity")
+            raise ValueError(f"{transport} cannot establish Linux host identity")
         hosts.setdefault(host, []).append(rank)
         if host in mappings and mappings[host] != mapping:
-            raise ValueError("NDR visible-device mappings differ within a host")
+            raise ValueError(f"{transport} visible-device mappings differ within a host")
         mappings[host] = mapping
         if (host, device) in devices:
-            raise ValueError("NDR ranks must use distinct local devices")
+            raise ValueError(f"{transport} ranks must use distinct local devices")
         devices.add((host, device))
     expected = [list(range(start, start + 16)) for start in range(0, len(topology), 16)]
     if sorted(hosts.values()) != expected:
-        raise ValueError("NDR requires 16 contiguous ranks per physical host")
+        raise ValueError(f"{transport} requires 16 contiguous ranks per physical host")
 
 
 def runtime_of(buffer):

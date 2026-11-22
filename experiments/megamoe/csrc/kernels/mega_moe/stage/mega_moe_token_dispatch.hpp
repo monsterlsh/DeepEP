@@ -19,9 +19,9 @@
  */
 
 #include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
-#include "../common/mega_moe_peer_rows.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_peer_rows.hpp"
 #include "mega_moe_token_quant.hpp"
-#include "mega_moe_count_arrival.hpp"
+#include "kernels/mega_moe_common/stage/mega_moe_count_arrival.hpp"
 
 namespace MegaMoeImpl {
 

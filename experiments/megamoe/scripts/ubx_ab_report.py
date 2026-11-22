@@ -47,7 +47,8 @@ def read_manifests(paths, world):
 
 
 def expected_config(plan, precision, arm):
-    model = dict(plan["config"]["model"], activation=arm, mma_type=PRECISIONS[precision], topk_weights_type=int(arm == "gelu"))
+    arm_model = plan["arms"][arm] if "arms" in plan else dict(activation=arm, topk_weights_type=int(arm == "gelu"))
+    model = dict(plan["config"]["model"], **arm_model, mma_type=PRECISIONS[precision])
     return dict(plan["config"], model=model, bs_values=[plan["bs"]])
 
 

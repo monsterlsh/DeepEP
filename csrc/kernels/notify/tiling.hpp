@@ -82,7 +82,7 @@ inline constexpr uint32_t NotifyForwardPlanOffsetWords(uint32_t tokens, uint32_t
                : 0U;
 }
 // uint16 矩阵 [local_tile, gateway, token_in_tile] 紧跟写入计划。
-// 每个 tile 最多 32*16 条路由，计数和排他前缀均可由 uint16 表示。
+// 每个 tile 最多 32*32 条路由，计数和排他前缀均可由 uint16 表示。
 inline constexpr uint32_t NotifyForwardTokenPrefixOffsetWords(uint32_t tokens, uint32_t topk, uint32_t experts,
                                                               uint32_t world, uint32_t num_cores = kNotifyCores)
 {
@@ -117,7 +117,7 @@ inline constexpr bool NotifyParseHistFitsUb(uint32_t tokens, uint32_t world, uin
     const uint64_t stride = (uint64_t(experts) + world + 15U) / 16U * 16U;
     return tokens > 0U && local_tiles * stride * sizeof(int32_t) <= kNotifyForwardMetaUbBytes;
 }
-// parse 阶段暂借 bases UB：每条 route 两个 int32，分别为 expert 和 gateway*16+primary。
+// parse 阶段暂借 bases UB：每条 route 两个 int32，分别为 expert 和 gateway*kHtMaxTopk+primary。
 inline constexpr bool NotifyParseRoutesFitUb(uint32_t tokens, uint32_t topk, uint32_t world, uint32_t experts,
                                              uint32_t num_cores = kNotifyCores)
 {

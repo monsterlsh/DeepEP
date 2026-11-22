@@ -120,13 +120,15 @@ def backend(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "torch.distributed", dist)
 
-    def format_cast(t, acl_format, *, customize_dtype, input_dtype):
+    def format_cast(t, acl_format, *, customize_dtype=None, input_dtype=None):
         # 检查实际传入的协议，不能把所有 format_cast 参数都静默忽略。
         assert t.dtype == "uint8" and acl_format == 29
-        assert customize_dtype == "float8_e4m3fn" and input_dtype == "float4_e2m1fn_x2"
+        typed = customize_dtype is not None or input_dtype is not None
+        if typed:
+            assert customize_dtype == "float8_e4m3fn" and input_dtype == "float4_e2m1fn_x2"
         events.append(("format_cast", t))
         t = Tensor(t.data.copy(), t.dtype, t.device)
-        t.npu_format = 50  # FP4 打包成 uint8 后，输出码与请求的29不同。
+        t.npu_format = 50 if typed else 51
         return t
 
     monkeypatch.setitem(
@@ -397,6 +399,26 @@ def test_shared_fp4_preparation_retains_planar_weights_and_scales(backend):
         np.testing.assert_array_equal(scale.data, sf)
 
 
+def test_a4w4_preparation_casts_planar_bytes_and_marks_generic_nz(backend, monkeypatch):
+    def cast_bytes(weight, acl_format):
+        assert weight.dtype == "uint8" and acl_format == 29
+        result = Tensor(weight.data.copy(), weight.dtype, weight.device)
+        result.npu_format = 29
+        return result
+
+    monkeypatch.setattr(sys.modules["torch_npu"], "npu_format_cast", cast_bytes)
+    weights, scales = np.arange(512 * 64, dtype=np.uint8).reshape(1, 512, 64), np.empty((1, 512, 2, 2), dtype=np.uint8)
+    weights[:, :, 0] = np.arange(512, dtype=np.uint16) % 251
+    scales[:] = np.arange(512, dtype=np.uint16)[None, :, None, None] % 251
+    raw = Tensor(weights, "uint8"), Tensor(scales, "float8_e8m0fnu")
+    for pair in api.transform_weights_for_mega_moe(raw, raw, mma_type="fp4xfp4"):
+        np.testing.assert_array_equal(pair[0].data, weights)
+        np.testing.assert_array_equal(pair[1].data, scales)
+        api._check_a4w4_weight_format(pair, "routed")
+        with pytest.raises(ValueError, match="got format=29"):
+            api._check_a4w4_weight_format(tuple(pair), "routed")
+
+
 @pytest.mark.parametrize("bf16", [False, True])
 def test_routed_layout_switches_with_actual_bs_without_hot_path_cast(backend, bf16, request):
     b = api.SymmBuffer(backend.group_type(), 4, 4096, 2, 1024, 256)
@@ -461,20 +483,21 @@ def test_fp8_weights_remain_nd_without_fp4_format_cast(backend):
     assert not any(isinstance(event, tuple) and event[0] == "format_cast" for event in backend.events)
 
 
-def test_urma_fp8_swiglu_interleaves_weight_and_scale_rows_once(backend):
+@pytest.mark.parametrize(("backend_name", "shared"), [("urma", False), ("mte_roce", True)])
+def test_fp8_swiglu_interleaves_weight_and_scale_rows_once(backend, backend_name, shared):
     rows = np.repeat(np.arange(4, dtype=np.uint8), 128)
     first = (Tensor(np.broadcast_to(rows[None, :, None], (1, 512, 64)).copy(), "float8_e4m3fn"),
              Tensor(np.broadcast_to((rows + 120)[None, :, None, None], (1, 512, 1, 2)).copy(), "float8_e8m0fnu"))
     second = (Tensor(np.zeros((1, 64, 256)), "float8_e4m3fn"),
               Tensor(np.full((1, 64, 4, 2), 127), "float8_e8m0fnu"))
-    packed, gmm2 = api.transform_weights_for_mega_moe(first, second, backend="urma")
+    packed, gmm2 = api.transform_weights_for_mega_moe(first, second, backend=backend_name, shared=shared)
     assert packed[0].npu_format == 2 and packed[0].is_contiguous() and packed[1].is_contiguous()
     np.testing.assert_array_equal(packed[0].data[0, ::128, 0], [0, 2, 1, 3])
     np.testing.assert_array_equal(packed[1].data[0, ::128, 0, 0], [120, 122, 121, 123])
     np.testing.assert_array_equal(first[0].data[0, :, 0], rows)
     assert gmm2[0] is second[0]
     with pytest.raises(ValueError, match="already packed"):
-        api.transform_weights_for_mega_moe(packed, gmm2, backend="urma")
+        api.transform_weights_for_mega_moe(packed, gmm2, backend=backend_name, shared=shared)
 
 
 @pytest.mark.parametrize("weight_format", [29, 50])
@@ -784,9 +807,71 @@ def test_a8w8_activation_modes_reach_native(backend, activation):
         b.destroy()
 
 
-def test_a4w4_public_configuration_remains_closed(backend):
-    with pytest.raises(ValueError, match="A4W4.*not enabled"):
+def test_a4w4_rejects_unsupported_topology(backend):
+    with pytest.raises(ValueError, match="16 ranks on one host"):
         api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, mma_type="fp4xfp4")
+
+
+@pytest.mark.parametrize("transport,world", [("mte", 16), ("mte_roce", 32)])
+@pytest.mark.parametrize("mma", ["fp8xfp4", "fp8xfp8", "fp4xfp4"])
+@pytest.mark.parametrize("activation,weight_mode", [("gelu", 1), ("swiglu", 0)])
+def test_ubx_mx_window_and_tail_forward(backend, monkeypatch, transport, world, mma, activation, weight_mode):
+    ext = backend.ext
+    def scratch(_world, _local, _rows, capacity, *args, **kwargs):
+        if capacity > 16:
+            raise RuntimeError("tiling exceeds UB")
+        return 4096
+
+    for name in ("mte_a4w4_enabled", "mte_roce_mx_enabled"):
+        monkeypatch.setattr(ext, name, True, raising=False)
+    for name in ("roce_plan_bytes", "mte_plan_bytes"):
+        monkeypatch.setattr(ext, name, scratch, raising=False)
+    monkeypatch.setattr(ext, "roce_buffer_size", ext.buffer_size, raising=False)
+    def roce_plan(example, intermediate, k, experts, ep, width, shared, ffts, address, capacity, **kwargs):
+        return ext.Plan(example, intermediate, k, experts, ep, width, mma == "fp8xfp4", shared,
+                        16, ffts, address, capacity, backend="mte_roce", **kwargs)
+    monkeypatch.setattr(ext, "RocePlan", roce_plan, raising=False)
+    local, tokens, topk, h, i = 2, 35, 32, 1024, 256
+    b = api.SymmBuffer(backend.group_type(world), local * world, tokens, topk, h, i, ranks_per_node=16,
+                       backend=transport, mma_type=mma, activation=activation)
+    try:
+        cols = i if activation == "gelu" else 2 * i
+        def raw(n, k):
+            wtype = "float8_e4m3fn" if mma == "fp8xfp8" else "uint8"
+            w = Tensor(np.zeros((local, n, k if mma == "fp8xfp8" else k // 2)), wtype)
+            w.npu_format = 2
+            return w, Tensor(np.full((local, n, k // 64, 2), 127), "float8_e8m0fnu")
+        wpairs = raw(cols, h), raw(h, i)
+        weights = api.transform_weights_for_mega_moe(*wpairs, activation, backend=transport, mma_type=mma)
+        assert b.window_tokens == 16 and b.num_forward_windows(tokens) == 3
+        assert b.x.shape == (tokens, h // (2 if mma == "fp4xfp4" else 1))
+        b.topk_idx.data[:] = np.arange(topk)
+        b.topk_weights.data[:] = np.linspace(-0.5, 0.5, topk)
+        y = Tensor(np.zeros((tokens, h)), "bfloat16")
+        stats = Tensor(np.zeros(local), "int32")
+        if mma == "fp4xfp4":
+            assert all(pair[0].npu_format == 51 for pair in weights)
+            wrong = api.transform_weights_for_mega_moe(*wpairs, activation, backend=transport)
+            with pytest.raises(ValueError, match="A4W4 requires NZ with C0=64 FP4"):
+                api.fp8_fp4_mega_moe(y, *wrong, b, activation=activation)
+            assert not native_launches(backend)
+        timer = None
+        if transport == "mte_roce":
+            assert not b.timer_enabled
+            monkeypatch.setattr(ext, "mte_roce_timer_enabled", True, raising=False)
+            timer = b.allocate_timer()
+        api.fp8_fp4_mega_moe(y, *weights, b, activation=activation, cumulative_local_expert_recv_stats=stats, timer=timer)
+        launches = native_launches(backend)
+        assert [(launch[0].shape[0], launch[-1]) for launch in launches] == [(16, 1), (16, 2), (3, 3)]
+        assert all(launch[8] is expected for launch, expected in zip(launches, (timer, None, None)))
+        if timer is not None:
+            assert ("validate_timer", timer, "mte_roce") in backend.events
+        assert b._plan.topk_weights_type == b._tail_plan.topk_weights_type == weight_mode
+        assert b._plan.mma_type == b._tail_plan.mma_type == mma
+        np.testing.assert_array_equal(stats.data, [6, 9])
+        assert np.all(y.data == 3)
+    finally:
+        b.destroy()
 
 
 @pytest.mark.parametrize("world", [8, 16, 32])
@@ -822,6 +907,131 @@ def test_mte_topk32_boundary_and_invalid_activation_precision(backend):
         api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, activation="tanh")
     with pytest.raises(ValueError, match="mma_type"):
         api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, mma_type="bf16xbf16")
+
+
+def test_mte_roce_routes_to_the_hierarchical_native_plan(backend, monkeypatch):
+    group = backend.group_type(32)
+    options = dict(ranks_per_node=16, backend="mte_roce")
+    with pytest.raises(ValueError, match=r"install a MegaMoE wheel with MTE\+RoCE MX support"):
+        api.SymmBuffer(group, 64, 17, 2, 1024, 256, **options)
+    with pytest.raises(ValueError, match="two 16-rank hosts"):
+        api.SymmBuffer(backend.group_type(16), 64, 17, 2, 1024, 256, **options)
+
+    monkeypatch.setattr(backend.ext, "mte_roce_mx_enabled", True, raising=False)
+    monkeypatch.setattr(backend.ext, "roce_plan_bytes", lambda *args, **kwargs: 4096, raising=False)
+
+    def roce_buffer_size(world, experts, tokens, topk, hidden, **kwargs):
+        assert (world, experts, topk, hidden) == (32, 2, 2, 1024) and tokens <= 17
+        return 4 << 20
+
+    def roce_plan(example, intermediate, topk, experts, world, max_tokens, shared, ffts, address, capacity, **kwargs):
+        assert (intermediate, topk, experts, world, max_tokens, shared, ffts, address, capacity) == (
+            256, 2, 2, 32, 17, 0, 123, 4096, 4 << 20
+        )
+        return backend.ext.Plan(
+            example, intermediate, topk, experts, world, max_tokens, True, shared, 16, ffts,
+            address, capacity, backend="mte_roce", **kwargs,
+        )
+
+    monkeypatch.setattr(backend.ext, "roce_buffer_size", roce_buffer_size, raising=False)
+    monkeypatch.setattr(backend.ext, "RocePlan", roce_plan, raising=False)
+    b = api.SymmBuffer(group, 64, 17, 2, 1024, 256, **options)
+    try:
+        assert b._runtime.backend == "mte_roce" and b.num_forward_windows(17) == 1
+        assert not b.timer_enabled
+        b.topk_idx.data[:] = [0, 1]
+        b.topk_weights.data[:] = [0.4, 0.6]
+        for bs in (17, 5, 5):
+            b.prepare(bs)
+            y = Tensor(np.zeros((bs, 1024)), "bfloat16")
+            api.fp8_fp4_mega_moe(y, *weights(), b, activation_clamp=10)
+            assert np.all(y.data == 3)
+        assert [entry[1] for entry in backend.events if isinstance(entry, tuple) and entry[0] == "prepare"] == [17, 5]
+        assert [launch[-1] for launch in native_launches(backend)] == [1, 2, 3]
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize("shared_dtype", ["uint8", "float8_e4m3fn"])
+def test_mte_roce_checks_all_shared_tensors_collectively_before_launch(backend, monkeypatch, shared_dtype):
+    from deep_ep._store import StoreGroup
+
+    group = StoreGroup(None, 0, 32, prefix="roce-shared-inputs")
+    remote_error = None
+    remote_precision_mismatch = False
+
+    def gather(value, stage):
+        peers = [value] * group.size()
+        if stage == "check:window inputs":
+            if remote_error:
+                peers[-1] = (remote_error, None)
+            elif remote_precision_mismatch:
+                peers[-1] = (None, (*value[1][:-1], not value[1][-1]))
+        return peers
+
+    group.all_gather = gather
+    ext = backend.ext
+    monkeypatch.setattr(ext, "mte_roce_mx_enabled", True, raising=False)
+    monkeypatch.setattr(ext, "roce_plan_bytes", lambda *args, **kwargs: 4096, raising=False)
+    monkeypatch.setattr(ext, "roce_buffer_size", ext.buffer_size, raising=False)
+
+    def roce_plan(example, intermediate, k, experts, ep, width, shared, ffts, address, capacity, **kwargs):
+        return ext.Plan(example, intermediate, k, experts, ep, width, True, shared, 16, ffts,
+                        address, capacity, backend="mte_roce", **kwargs)
+
+    monkeypatch.setattr(ext, "RocePlan", roce_plan, raising=False)
+    b = api.SymmBuffer(group, 64, 17, 2, 1024, 256, num_shared_experts=1, ranks_per_node=16, backend="mte_roce")
+
+    def raw_pair(n, k):
+        packing = 2 if shared_dtype == "uint8" else 1
+        return (Tensor(np.zeros((1, n, k // packing)), shared_dtype),
+                Tensor(np.full((1, n, k // 64, 2), 127), "float8_e8m0fnu"))
+
+    first, second = api.transform_weights_for_mega_moe(
+        raw_pair(512, 1024), raw_pair(1024, 256), shared=True, backend="mte_roce",
+    )
+    good = (first[0], second[0], first[1], second[1])
+    routed = weights()
+    y = Tensor(np.zeros((17, 1024)), "bfloat16")
+
+    def invoke(tensors):
+        api.fp8_fp4_mega_moe(
+            y, *routed, b,
+            shared_l1_weights=type(first)((tensors[0], tensors[2])),
+            shared_l2_weights=(tensors[1], tensors[3]),
+        )
+
+    try:
+        assert b.num_forward_windows(17) == 1
+        b.topk_idx.data[:] = [0, 1]
+        b.topk_weights.data[:] = [0.4, 0.6]
+        fields = ("shared_l1_weights", "shared_l2_weights", "shared_l1_scales", "shared_l2_scales")
+        for index, name in enumerate(fields):
+            tensor = good[index]
+            for bad in (tensor[..., :-1], Tensor(tensor.data, "int8"),
+                        Tensor(tensor.data, tensor.dtype, "npu:1"), tensor[..., ::-1]):
+                incorrect = list(good)
+                incorrect[index] = bad
+                with pytest.raises(ValueError, match=f"window inputs.*rank=0: {name}"):
+                    invoke(incorrect)
+        with pytest.raises(ValueError, match="window inputs.*rank=0.*all four shared"):
+            invoke((*good[:3], None))
+        remote_error = "invalid shared scale layout on peer"
+        with pytest.raises(ValueError, match="window inputs.*rank=31: invalid shared scale layout on peer"):
+            invoke(good)
+        remote_error = None
+        remote_precision_mismatch = True
+        with pytest.raises(ValueError, match="window inputs.*ranks disagree.*rank=31"):
+            invoke(good)
+        assert not native_launches(backend)
+        assert b._plan is None and b._generation == 0 and b._failure is None
+
+        remote_precision_mismatch = False
+        invoke(good)
+        assert native_launches(backend)[0][9:13] == good
+        assert np.all(y.data == 3)
+    finally:
+        b.destroy()
 
 
 def test_urma_gelu_uses_single_planar_projection_within_existing_limits(backend, monkeypatch):
@@ -1259,6 +1469,23 @@ def test_collective_window_memory_budget(backend, monkeypatch, local_limit, peer
     try:
         assert b.window_tokens == expected
         assert b.num_forward_windows(257) == 1 + 256 // expected
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize("margin,window", [(-1, 64), (0, 128)])
+def test_urma_w4a8_swiglu_reserves_both_weight_and_scale_layouts(backend, monkeypatch, margin, window):
+    from deep_ep_experimental.megamoe import backend as selector
+
+    tokens, topk, h, i, local_experts = 257, 25, 256, 256, 2
+    projection = local_experts * h * i
+    resident = tokens * (3 * h + h // 32 + 20 * topk) + 5 * (projection // 2 + projection // 32)
+    budget = resident + (130 << 20) + margin
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
+    monkeypatch.setattr(api.npu_api(), "mem_get_info", lambda _: (budget, 300 << 20))
+    b = api.SymmBuffer(backend.group_type(32), 32 * local_experts, tokens, topk, h, i, activation="swiglu")
+    try:
+        assert b.window_tokens == window
     finally:
         b.destroy()
 

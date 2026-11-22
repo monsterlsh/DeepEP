@@ -1173,12 +1173,12 @@ def test_notify_fused_chunk_metadata(tmp_path):
 #include <set>
 #include <vector>
 #include "kernels/common.hpp"
+#include "kernels/notify/route_encoding.hpp"
 #include "kernels/notify/tiling.hpp"
 #define __simt_vf__
 #define __launch_bounds__(...)
 #define __gm__
 constexpr uint32_t kSimtCores = 32, kNotifySimtThreads = 128;
-constexpr uint32_t kWireTopkMask = 15, kWireSecondaryTopkShift = 13;
 struct {
     uint32_t x;
 } threadIdx;
@@ -1201,10 +1201,11 @@ void asc_threadfence() {}
         + r"""
 
 template <uint32_t Cores>
-void check(uint32_t world, uint32_t tokens, uint32_t chunk_tokens, bool reverse, uint32_t capacity = 2048)
+void check(uint32_t world, uint32_t tokens, uint32_t chunk_tokens, bool reverse, uint32_t capacity = 2048,
+           uint32_t topk = 6)
 {
     const uint32_t rank = world - 1, lanes = std::min(world, 8U);
-    auto t = ascend_deepep::MakeNotifyTiling(rank, world, tokens, 6, world, chunk_tokens, 7168);
+    auto t = ascend_deepep::MakeNotifyTiling(rank, world, tokens, topk, world, chunk_tokens, 7168);
     const uint32_t chunks = t.chunks;
     const uint32_t groups = world / std::min(world, 64U);
     const auto source_groups = reference_groups(world);
@@ -1263,8 +1264,8 @@ void check(uint32_t world, uint32_t tokens, uint32_t chunk_tokens, bool reverse,
                         assert(row < capacity);
                         row_tokens.push_back(token);
                         auto* p = packet + 16 + row * 6;
-                        const uint32_t slot = row % 6, output_row = s * capacity + row, gather_row = output_row + 7;
-                        p[0] = s | (slot << 13);
+                        const uint32_t slot = row % topk, output_row = s * capacity + row, gather_row = output_row + 7;
+                        p[0] = s | ((slot % 16U) << 13U) | (slot >= 16U ? (1U << 18U) : 0U);
                         p[1] = token;
                         p[3] = peer;
                         // Gather condition from NotifyGatherCountTilesVf; packet field 5 is not a gather index.
@@ -1282,7 +1283,7 @@ void check(uint32_t world, uint32_t tokens, uint32_t chunk_tokens, bool reverse,
                             want_masks[s * chunks + c] |= 1 << (peer % 8);
                             want_ordinals[s * words + 16 + row] = want_counts[(peer % 8) * stride + s * chunks + c];
                             want_counts[(peer % 8) * stride + s * chunks + c]++;
-                            const uint64_t first = uint64_t(s) | (uint64_t(token * 6 + slot) << 32);
+                            const uint64_t first = uint64_t(s) | (uint64_t(token * topk + slot) << 32);
                             records[((peer % 8) * chunks + c) * groups + source_groups[s]].push_back(
                                 {int64_t(first), int64_t(output_row), int64_t(gather_row)});
                         }
@@ -1379,7 +1380,7 @@ void check(uint32_t world, uint32_t tokens, uint32_t chunk_tokens, bool reverse,
             for (threadIdx.x = 0; threadIdx.x < kNotifySimtThreads; ++threadIdx.x)
                 NotifyWriteBackwardTasksVf<Cores>(forward.data(), ordinals.data(), counts.data(), group_offsets.data(),
                                                   backward.data(), packets.data(), rank, world, chunks, chunk_tokens,
-                                                  tokens, 6, capacity, backward_words, words,
+                                                  tokens, topk, capacity, backward_words, words,
                                                   reverse ? Cores - 1 - step : step);
         assert(ordinals == want_ordinals);
         if (backward != want_backward) {
@@ -1403,6 +1404,7 @@ void check(uint32_t world, uint32_t tokens, uint32_t chunk_tokens, bool reverse,
 int main()
 {
     assert(ascend_deepep::NotifyChunkSegments(0, 0, 512) == 1);
+    check<32>(32, 517, 256, true, 2048, 32);
     assert(ascend_deepep::NotifyChunkSegments(193, 11, 512) == 1);
     assert(ascend_deepep::NotifyChunkSegments(194, 11, 512) == 8);
     assert(ascend_deepep::NotifyChunkSegments(UINT32_MAX, UINT32_MAX, UINT32_MAX) == 1);
@@ -1448,6 +1450,10 @@ def test_notify_forward_ub_paths(tmp_path):
         "NotifyForwardTokenPrefixVf",
         "NotifyForwardRowsVf",
         "NotifyForwardPrefixVf",
+        "NotifyBuildForwardRowsVf",
+        "ParseLocalTopkTokensVf",
+        "CountLocalTopkTilesVf",
+        "ParseLocalTopkVf",
     )
     code = (
         r"""
@@ -1457,13 +1463,15 @@ def test_notify_forward_ub_paths(tmp_path):
 #include <cassert>
 #include <cstdint>
 #include <vector>
+#include "kernels/notify/route_encoding.hpp"
 #include "kernels/notify/tiling.hpp"
 #define __simt_vf__
 #define __launch_bounds__(...)
 #define __gm__
 #define __ubuf__
 constexpr uint32_t kSimtCores = 32, kNotifySimtThreads = 128, kForwardTile = 32;
-constexpr uint32_t kWirePrimaryTopkShift = 9, kWireSecondaryTopkShift = 13;
+constexpr uint32_t kSimtThreads = 128, kTileTokens = ascend_deepep::kNotifyLocalTopkTileTokens;
+constexpr uint32_t kMetaFields = ascend_deepep::kNotifyLocalTopkRouteMetaFields;
 struct {
     uint32_t x;
 } threadIdx;
@@ -1504,6 +1512,7 @@ void check(uint32_t world, uint32_t tokens, uint32_t topk, uint32_t experts)
                 if (k == 1 && token % 5 == 0) e = es[0];  // duplicate expert
                 if (k == 2 && es[0] >= 0 && token % 7 == 0) e = (es[0] / (per_rank * 8) * (per_rank * 8) + 1) % experts;
                 if (empty || token % 11 == 0 || (token + k) % 19 == 0) e = -1;
+                if (!empty && token == 0 && topk > 16) e = k >= 16 ? 0 : -1;
                 es[k] = e;
                 auto* m = meta.data() + (token * topk + k) * 6;
                 std::fill(m, m + 6, -1);
@@ -1531,8 +1540,10 @@ void check(uint32_t world, uint32_t tokens, uint32_t topk, uint32_t experts)
                 m[2] = first;
                 const bool direct = slots.size() == 1;
                 if (!direct && k == first) continue;
+                const uint32_t wire = rank | ((first % 16U) << 9U) | ((k % 16U) << 13U) |
+                                      (first >= 16U ? (1U << 17U) : 0U) | (k >= 16U ? (1U << 18U) : 0U);
                 const std::array<int32_t, 6> row = {
-                    int32_t(rank | (first << 9) | (k << 13)), int32_t(token),        rows[first],
+                    int32_t(wire), int32_t(token), rows[first],
                     direct ? -1 : es[k] / int32_t(per_rank),  direct ? -1 : rows[k], -1};
                 expected[gateway].insert(expected[gateway].end(), row.begin(), row.end());
                 ++want_counts[gateway * tiles + token / 32];
@@ -1625,8 +1636,90 @@ void check(uint32_t world, uint32_t tokens, uint32_t topk, uint32_t experts)
         assert(corrupted != want_packets);
     }
 }
+
+void check_weight_meta()
+{
+    constexpr uint32_t world = 32, source = 20, rank = 5, tokens = 3, topk = 32, capacity = 3;
+    constexpr uint32_t words = 16 + capacity * 6;
+    std::vector<int32_t> packets(world * words, 0), forward(world * capacity * 6, -1);
+    std::vector<int32_t> prefix(world, 0), offsets(world, 0), counts(world, 0), weights(4, -1);
+    auto* packet = packets.data() + source * words;
+    packet[0] = 2;
+    const std::array<int32_t, 12> rows{
+        int32_t(source | (15U << 9U) | (1U << 13U) | (3U << 17U)), 1, 1, int32_t(rank), 2, -1,
+        int32_t(source | (15U << 9U) | (14U << 13U) | (3U << 17U)), 1, 1, 6, 3, -1,
+    };
+    std::copy(rows.begin(), rows.end(), packet + 16);
+    for (uint32_t core = 0; core < 32; ++core)
+        for (threadIdx.x = 0; threadIdx.x < 128; ++threadIdx.x)
+            NotifyBuildForwardRowsVf<32>(packets.data(), offsets.data(), prefix.data(), forward.data(),
+                                        counts.data(), weights.data(), rank, world, capacity, words, core, tokens,
+                                        topk);
+    assert(counts[source] == 2);
+    assert(weights[1] == int32_t((source * tokens + 1U) * topk + 31U));
+    assert(weights[2] == int32_t((source * tokens + 1U) * topk + 17U));
+    assert(weights[0] == -1 && weights[3] == -1);
+}
+
+template <bool RankDedup>
+void check_local_topk(uint32_t topk)
+{
+    constexpr uint32_t world = RankDedup ? 16U : 32U, rank = 3, tokens = 2, experts = world * 2U;
+    constexpr uint32_t remote = RankDedup ? 10U : 18U, remote_expert = remote * 2U;
+    const uint32_t last = topk - 1;
+    std::vector<int64_t> routes(tokens * topk, -1);
+    routes[0] = 2;                  // Peer 1, same server as the source.
+    routes[last] = 6;               // The source wins server primary at a high slot.
+    routes[topk + last - 1] = remote_expert;
+    routes[topk + last] = remote_expert;
+    std::vector<int32_t> expected(tokens * topk * 6, -1), hist(experts + world, 0);
+    for (uint32_t i = 0; i < tokens * topk; ++i) {
+        expected[i * 6 + 3] = RankDedup ? -1 : 0;
+        expected[i * 6 + 5] = 0;
+    }
+    const auto set_route = [&](uint32_t row, int32_t expert, int32_t gateway, int32_t primary, int32_t rank_slot,
+                               int32_t ordinal, int32_t flags) {
+        const std::array<int32_t, 6> fields{expert, gateway, primary, RankDedup ? rank_slot : 0, ordinal, flags};
+        std::copy(fields.begin(), fields.end(), expected.begin() + row * 6);
+    };
+    set_route(0, 2, RankDedup ? 1 : 3, RankDedup ? 0 : last, 0, 0, RankDedup ? 7 : 9);
+    set_route(last, 6, 3, last, 1, 0, 7);
+    set_route(topk + last - 1, remote_expert, remote, last - 1, 0, 0, 7);
+    set_route(topk + last, remote_expert, remote, last - 1, 0, 1, 9);
+    hist[2] = hist[6] = hist[experts + 3] = hist[experts + remote] = 1;
+    hist[remote_expert] = 2;
+    if (RankDedup) hist[experts + 1] = 1;
+    const std::vector<int64_t> expected_mask = RankDedup ? std::vector<int64_t>{3, 1} : std::vector<int64_t>{1, 4};
+
+    std::vector<int32_t> meta(expected.size(), -97), counts(hist.size(), 0);
+    std::vector<int64_t> mask(tokens, -97);
+    std::vector<int32_t> cached_routes(kTileTokens * topk * 2, -97), local_counts(hist.size(), 0);
+    for (threadIdx.x = 0; threadIdx.x < kSimtThreads; ++threadIdx.x) {
+        ParseLocalTopkVf<false, 1U, RankDedup>(routes.data(), mask.data(), meta.data(), counts.data(), rank, world,
+                                               tokens, topk, experts, 256, 0);
+    }
+    assert(meta == expected && mask == expected_mask && counts == hist);
+    std::fill(meta.begin(), meta.end(), -97);
+    for (threadIdx.x = 0; threadIdx.x < kSimtThreads; ++threadIdx.x) {
+        ParseLocalTopkVf<true, 1U, RankDedup>(routes.data(), mask.data(), meta.data(), counts.data(), rank, world,
+                                              tokens, topk, experts, 256, 0, local_counts.data());
+    }
+    assert(meta == expected && mask == expected_mask && local_counts == hist);
+    std::fill(meta.begin(), meta.end(), -97);
+    std::fill(local_counts.begin(), local_counts.end(), 0);
+    for (threadIdx.x = 0; threadIdx.x < kSimtThreads; ++threadIdx.x) {
+        ParseLocalTopkTokensVf<1U, RankDedup>(routes.data(), mask.data(), meta.data(), rank, world, tokens, topk,
+                                               experts, 256, 0, cached_routes.data());
+    }
+    for (threadIdx.x = 0; threadIdx.x < kSimtThreads; ++threadIdx.x) {
+        CountLocalTopkTilesVf<1U>(meta.data(), world, tokens, topk, experts, 0, local_counts.data(), cached_routes.data());
+    }
+    assert(meta == expected && mask == expected_mask && local_counts == hist);
+}
+
 int main()
 {
+    check_weight_meta();
     static_assert(kNotifyCores == 64U);
     static_assert(kNotifyDynamicUbBytes == 208U * 1024U);
     for (uint32_t world : {2U, 4U, 8U, 16U, 32U, 64U, 128U, 256U}) {
@@ -1664,6 +1757,12 @@ int main()
     for (uint32_t topk : {1U, 8U, 16U}) {
         check<32>(128, 16384, topk, 1024);  // Partial caches and GM fallback at large top-k.
         check<64>(256, 16384, topk, 512);
+    }
+    for (uint32_t topk : {17U, 25U, 32U}) {
+        check_local_topk<false>(topk);
+        check_local_topk<true>(topk);
+        check<32>(32, 33, topk, 512);   // Cached token-prefix path and a partial tile.
+        check<64>(128, 16384, topk, 512);
     }
 }
 """
@@ -1784,7 +1883,7 @@ _trace_DISPATCH = globals()
 _trace_CONFIG = dict(rank=1, world=128, tokens=4096, topk=6, experts=512, chunk_tokens=256, sample=3)
 
 
-def _trace_records(cores=32):
+def _trace_records(cores=32, *, topk=6):
     result = []
     for core in range(cores):
         header = [
@@ -1794,7 +1893,7 @@ def _trace_records(cores=32):
             core,
             128,
             4096,
-            6,
+            topk,
             512,
             256,
             3,
@@ -1813,12 +1912,14 @@ def _trace_records(cores=32):
 
 
 @pytest.mark.parametrize("cores", [32, 64])
-def test_trace_notify_trace_abi_and_views(tmp_path, cores):
+@pytest.mark.parametrize("topk", [6, 32])
+def test_trace_notify_trace_abi_and_views(tmp_path, cores, topk):
     text = (_trace_ROOT / "csrc/kernels/notify/profile.hpp").read_text(encoding="utf-8")
     phases = re.findall("^\\s+(\\w+) = (\\d+)U,", text, re.M)
     assert [name for name, _ in phases] == [*_trace_VIEW["PHASES"], "End"]
     assert [int(value) for _, value in phases] == list(range(len(phases)))
-    data = _trace_VIEW["decode"](_trace_records(cores), **_trace_CONFIG)
+    rows = _trace_records(cores, topk=topk)
+    data = _trace_VIEW["decode"](rows, **dict(_trace_CONFIG, topk=topk))
     skew_us = (cores - 1) * 0.1
     assert data["events"][0]["duration_us"] == 2.0
     assert data["span_us"] == pytest.approx(len(_trace_VIEW["PHASES"]) * 2 + skew_us)
@@ -1829,7 +1930,7 @@ def test_trace_notify_trace_abi_and_views(tmp_path, cores):
     paths = _trace_VIEW["write_timeline"](data, tmp_path / "rank-1.notify.json")
     ET.parse(paths["svg"])
     raw = json.loads(Path(paths["json"]).read_text())
-    assert raw["raw"] == _trace_records(cores)
+    assert raw["raw"] == rows
     trace = json.loads(Path(paths["perfetto"]).read_text())
     slices = [e for e in trace["traceEvents"] if e["ph"] == "X"]
     assert len(slices) == cores * len(_trace_VIEW["PHASES"])

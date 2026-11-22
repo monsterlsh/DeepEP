@@ -1,6 +1,10 @@
 // Copyright (c) 2026, Lu Lu
 
 #include "runtime/session.hpp"
+#ifdef DEEPEP_MEGAMOE_MTE_ROCE
+#include "common/megamoe_combine_config.hpp"
+#include <algorithm>
+#endif
 #ifdef DEEPEP_LL_RDMA
 #include "runtime/ll_core_config.hpp"
 #include "runtime/ll_rdma_qp_config.hpp"
@@ -62,7 +66,8 @@ void checked_barrier(int rank)
     check(destroy_status, "destroy SHMEM barrier stream");
 }
 
-std::string check_peer_access(int rank, int world, uint64_t required_transports, uint32_t roce_ranks_per_host)
+std::string check_peer_access(int rank, int world, uint64_t required_transports, uint32_t roce_ranks_per_host,
+                              bool hierarchical_roce)
 {
     const auto* state = static_cast<const aclshmem_device_host_state_t*>(dlsym(RTLD_DEFAULT, "g_state"));
     if (state == nullptr) return "Cannot verify peer access: SHMEM lacks the pinned SDK's g_state symbol";
@@ -72,6 +77,8 @@ std::string check_peer_access(int rank, int world, uint64_t required_transports,
     std::string missing_udma;
     for (int peer = 0; peer < world; ++peer) {
         if (roce_ranks_per_host && uint32_t(peer) / roce_ranks_per_host != uint32_t(rank) / roce_ranks_per_host) {
+            // The hierarchical Wave transports data only through its paired gateway.
+            if (hierarchical_roce && uint32_t(peer) != (uint32_t(rank) ^ roce_ranks_per_host)) continue;
             if ((state->topo_list[peer] & ACLSHMEM_TRANSPORT_ROCE) == 0)
                 return "MegaMoE rank=" + std::to_string(rank) + " has no RoCE path to remote peer=" + std::to_string(peer);
             continue;
@@ -124,15 +131,20 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     const std::string backend = backend_env ? backend_env : "mte";
     if (backend != "mte" && backend != "rdma") throw std::invalid_argument("DEEPEP_LL_BACKEND must be mte or rdma");
     const bool windowed = options.window_ranks_per_host != 0;
-    // The UBX window transport has its own peer policy and never creates
-    // the legacy LL staging area, independent of the LL environment setting.
-    ll_rdma_ = !windowed && backend == "rdma";
+    const bool hierarchical_roce = options.megamoe_hierarchical_roce;
+    // Explicit MegaMoE transports use their own peer and QP policies.
+    ll_rdma_ = !windowed && !hierarchical_roce && backend == "rdma";
     const bool udma = options.udma;
     const bool megamoe = options.megamoe;
-    megamoe_roce_ = windowed && size == 32;
+    megamoe_roce_ = hierarchical_roce || (windowed && size == 32);
     if (windowed && (!megamoe || udma || (size != 8 && size != 16 && size != 32) ||
                      options.window_ranks_per_host != uint32_t(size == 32 ? 16 : size)))
         throw std::invalid_argument("Invalid UBX window rank layout");
+    if (hierarchical_roce && (!megamoe || windowed || udma || size != 32))
+        throw std::invalid_argument("MegaMoE MTE+RoCE requires two contiguous 16-rank hosts");
+#ifndef DEEPEP_MEGAMOE_MTE_ROCE
+    if (hierarchical_roce) throw std::runtime_error("MegaMoE MTE+RoCE requires the HNS_1825 MegaMoE build");
+#endif
     const bool mpi = options.mpi;
     const bool combine_only = options.combine_only;
     const bool use_1g_huge_pages = options.use_1g_huge_pages;
@@ -224,8 +236,16 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     bool runtime_started = false;
     try {
 #ifdef DEEPEP_LL_RDMA
-        if (megamoe_roce_)
-            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, 2U), "MegaMoE RoCE data/mailbox QPs");
+        if (megamoe_roce_) {
+            uint32_t qps = 2U;  // Windowed URMA data and mailbox.
+#ifdef DEEPEP_MEGAMOE_MTE_ROCE
+            constexpr uint32_t hierarchical_qps =
+                1U + std::max(megamoe_config::COMBINE_QPS, megamoe_config::DISPATCH_QPS);
+            static_assert(hierarchical_qps <= ACLSHMEM_MAX_QP_NUM);
+            if (hierarchical_roce) qps = hierarchical_qps;  // QP0 belongs to the SDK.
+#endif
+            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, qps), "MegaMoE RoCE QP configuration");
+        }
         if (ll_rdma_ && size > int(DispatchDedup::kLlPhysicalRanksPerHost)) check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, ll_rdma_qps_), "ROCE QP configuration");
 #endif
         if (options.dedicated_peer_qp) {
@@ -278,14 +298,14 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
             runtime_started = true;
             // Peer-table aggregate packets require physical 512B boundaries.
             init_trace(rank, "workspace allocation enter");
-            workspace_ = (udma || ll_rdma_ || windowed) ? aclshmem_align(512U, allocation_bytes)
-                                                         : aclshmem_malloc(allocation_bytes);
+            workspace_ = (udma || ll_rdma_ || windowed || megamoe_roce_) ? aclshmem_align(512U, allocation_bytes)
+                                                                        : aclshmem_malloc(allocation_bytes);
             init_trace(rank, "workspace allocation return");
         }
         if (workspace_ == nullptr) {
             throw std::runtime_error("SHMEM workspace allocation or translation failed");
         }
-        if ((ll_rdma_ || windowed) && reinterpret_cast<uintptr_t>(workspace_) % 512U)
+        if ((ll_rdma_ || windowed || megamoe_roce_) && reinterpret_cast<uintptr_t>(workspace_) % 512U)
             throw std::runtime_error("RDMA workspace requires 512-byte alignment");
         init_trace(rank, "workspace memset enter");
         check(aclrtMemset(workspace_, allocation_bytes, 0, allocation_bytes), "aclrtMemset");
@@ -293,7 +313,8 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
         if (staging_bytes) ll_rdma_stage_ = static_cast<uint8_t*>(workspace_) + workspace_bytes;
         if (options.required_peer_transports) {
             peer_access_error_ = check_peer_access(rank, size, options.required_peer_transports,
-                                                  options.window_ranks_per_host);
+                                                  hierarchical_roce ? 16U : options.window_ranks_per_host,
+                                                  hierarchical_roce);
         }
         bytes_ = bytes;
         allocation_bytes_ = allocation_bytes;

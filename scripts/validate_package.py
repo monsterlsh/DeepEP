@@ -66,7 +66,8 @@ def inspect_wheel(path):
         if len([n for n in names if n.endswith("deepseek-deepep.LICENSE")]) != 1:
             raise RuntimeError("Wheel must include the adopted API's third-party license")
         info = json.loads(archive.read("deep_ep/_build_info.json"))
-        beta = info.get("megamoe", {}).get("enabled", False)
+        megamoe = info.get("megamoe", {})
+        beta = megamoe.get("enabled", False)
         beta_names = [name for name in names if name.startswith("deep_ep_experimental/megamoe/")]
         if beta:
             required = {
@@ -76,6 +77,8 @@ def inspect_wheel(path):
                 "deep_ep_experimental/megamoe/libmegamoe_kernel.so",
                 "deep_ep_experimental/megamoe/libmegamoe_urma_kernel.so",
             }
+            if megamoe.get("mte_roce"):
+                required.add("deep_ep_experimental/megamoe/libmegamoe_mte_roce_kernel.so")
             extensions = [
                 n for n in beta_names if n.startswith("deep_ep_experimental/megamoe/_C.") and n.endswith(".so")
             ]

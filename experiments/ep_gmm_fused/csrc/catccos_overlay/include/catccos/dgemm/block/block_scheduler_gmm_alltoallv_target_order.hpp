@@ -12,6 +12,8 @@
 #ifndef CATCCOS_DGEMM_BLOCK_SCHEDULER_GMM_ALLTOALLV_TARGET_ORDER_HPP
 #define CATCCOS_DGEMM_BLOCK_SCHEDULER_GMM_ALLTOALLV_TARGET_ORDER_HPP
 
+#include <type_traits>
+
 #include "catlass/catlass.hpp"
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
@@ -31,10 +33,12 @@ using Catlass::MatrixCoord;
 /// M block contributes every N tile, so the producer can store it into a
 /// row-major [rows, N] stage and the consumer can issue one contiguous UDMA Get.
 /// N tiles remain striped over all AICs; an M block is not pinned to one core.
-template <class MoeConstraints_ = DefaultMoeConstraints>
+template <class MoeConstraints_ = DefaultMoeConstraints, bool CompactShapes_ = false>
 struct BlockMmadSchedulerGmmAllToAllVTargetOrder {
     using MoeConstraints = MoeConstraints_;
     using ProblemShape = AllToAllVAllGatherProblemShape;
+    // N and K are constant for all segments. Cache only M in the large-expert scheduler.
+    using SegmentShape = std::conditional_t<CompactShapes_, uint32_t, GemmCoord>;
 
     struct CommContext {
         uint32_t groupNumList[MoeConstraints::RANK_SIZE_LIMIT][MoeConstraints::LOCAL_EXPERT_NUM_LIMIT]{};
@@ -74,7 +78,7 @@ struct BlockMmadSchedulerGmmAllToAllVTargetOrder {
     uint32_t outputGroupNum[MoeConstraints::RANK_SIZE_LIMIT]{};
     uint32_t outputGroupNumInLocalExpert[MoeConstraints::RANK_SIZE_LIMIT][MoeConstraints::LOCAL_EXPERT_NUM_LIMIT]{};
     uint32_t outputOffsetList[MoeConstraints::LOCAL_EXPERT_NUM_LIMIT][MoeConstraints::RANK_SIZE_LIMIT]{};
-    GemmCoord problemShapes[MoeConstraints::LOCAL_EXPERT_NUM_LIMIT][MoeConstraints::RANK_SIZE_LIMIT];
+    SegmentShape problemShapes[MoeConstraints::LOCAL_EXPERT_NUM_LIMIT][MoeConstraints::RANK_SIZE_LIMIT];
 
     CommContext commContext{};
     LocalExpertContext localExpertCtx{};
@@ -111,7 +115,11 @@ struct BlockMmadSchedulerGmmAllToAllVTargetOrder {
                 outputGroupNum[dstRankIdx] += groups;
                 outputOffsetList[localExpertIdx][dstRankIdx] = outputOffset;
                 outputOffset += tokens;
-                problemShapes[localExpertIdx][dstRankIdx] = {tokens, problemShape.n(), problemShape.k()};
+                if constexpr (CompactShapes_) {
+                    problemShapes[localExpertIdx][dstRankIdx] = tokens;
+                } else {
+                    problemShapes[localExpertIdx][dstRankIdx] = {tokens, problemShape.n(), problemShape.k()};
+                }
             }
         }
 
@@ -185,7 +193,7 @@ struct BlockMmadSchedulerGmmAllToAllVTargetOrder {
     }
 
     struct Iter {
-        using Scheduler = BlockMmadSchedulerGmmAllToAllVTargetOrder<MoeConstraints>;
+        using Scheduler = BlockMmadSchedulerGmmAllToAllVTargetOrder<MoeConstraints, CompactShapes_>;
         Scheduler* const scheduler;
         uint32_t taskIdx;
         uint32_t coreLoops;
@@ -229,7 +237,7 @@ struct BlockMmadSchedulerGmmAllToAllVTargetOrder {
     }
 
     struct RemapperA {
-        using Scheduler = BlockMmadSchedulerGmmAllToAllVTargetOrder<MoeConstraints>;
+        using Scheduler = BlockMmadSchedulerGmmAllToAllVTargetOrder<MoeConstraints, CompactShapes_>;
         Scheduler const* scheduler;
         uint32_t localExpertIdx;
 
@@ -243,8 +251,13 @@ struct BlockMmadSchedulerGmmAllToAllVTargetOrder {
         CATLASS_DEVICE
         GemmCoord GetResidueShape(DistGemmCoord const& blockOffset) const
         {
-            return ClipSub(scheduler->problemShapes[localExpertIdx][blockOffset.rank()],
-                           GemmCoord{blockOffset.GetCoordMNK()});
+            const auto& segment = scheduler->problemShapes[localExpertIdx][blockOffset.rank()];
+            if constexpr (CompactShapes_) {
+                return ClipSub(GemmCoord{segment, scheduler->problemShape.n(), scheduler->problemShape.k()},
+                               GemmCoord{blockOffset.GetCoordMNK()});
+            } else {
+                return ClipSub(segment, GemmCoord{blockOffset.GetCoordMNK()});
+            }
         }
     };
 
@@ -255,7 +268,7 @@ struct BlockMmadSchedulerGmmAllToAllVTargetOrder {
     }
 
     struct RemapperC {
-        using Scheduler = BlockMmadSchedulerGmmAllToAllVTargetOrder<MoeConstraints>;
+        using Scheduler = BlockMmadSchedulerGmmAllToAllVTargetOrder<MoeConstraints, CompactShapes_>;
         Scheduler const* scheduler;
         uint32_t localExpertIdx;
 

@@ -33,6 +33,21 @@ __aicore__
     const uint32_t servers = (world + 7U) / 8U;
     return servers < topk ? topk : servers;
 }
+inline constexpr uint32_t kCombineReturnMaskSlots = sizeof(uint64_t) * 8U;
+#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+__aicore__
+#endif
+inline uint32_t CollectCombineReturnSlots(uint64_t mask, uint32_t count, uint32_t (&slots)[kCombineReturnMaskSlots])
+{
+    uint32_t selected = 0;
+    for (uint32_t slot = 0; slot < count; ++slot) {
+        if (mask & (uint64_t{1} << slot)) {
+            slots[selected++] = slot;
+        }
+    }
+    return selected;
+}
+
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 __aicore__
 #endif

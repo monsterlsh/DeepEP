@@ -107,6 +107,22 @@ def test_only_complete_json_replaces_a_published_record(tmp_path):
     assert list(tmp_path.iterdir()) == [path]
 
 
+def test_mte_packed_fp4_cache_requires_matching_backend_and_input(tmp_path):
+    previous, output = case(tmp_path)
+    identity = dict(previous.identity, backend="mte", input="fp4")
+    cache = AccuracyCache(tmp_path, identity)
+    with pytest.raises(ValueError, match="manifest does not match"):
+        cache.publish(output)
+    for manifest_path in output.glob("rank_*/manifest.json"):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.update(backend="mte", input="fp4")
+        manifest.pop("dual_reference")
+        atomic_write_json(manifest_path, manifest)
+    cache.publish(output)
+    assert cache.lookup() == output
+    assert previous.lookup() is None
+
+
 def test_same_entry_lock_serializes_workers(tmp_path):
     path = tmp_path / "nested/entry.lock"
     waiting = Event()

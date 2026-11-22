@@ -117,7 +117,9 @@ def test_master_override_and_default(configuration):
         launcher.select_hosts({"hosts": hosts}, 32, "192.0.2.99")
 
 
-@pytest.mark.parametrize("entry", ["build.py", "batch_node.py", "batch_launch.py"])
+@pytest.mark.parametrize("entry", [
+    "build.py", "batch_node.py", "batch_launch.py", "stage_mte_windows.py", "summarize_isolated_pairs.py",
+])
 def test_relocated_entrypoints_work_in_isolated_python(entry):
     result = subprocess.run([sys.executable, "-I", str(SCRIPTS / entry), "--help"], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -148,7 +150,7 @@ def test_build_isolates_git_libraries_and_preserves_framework_environment(tmp_pa
     monkeypatch.setattr(builder.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(builder, "cann_version", lambda version: None)
     original_environment = dict(os.environ)
-    clones, queries, framework_checks = [], [], []
+    clones, framework_checks = [], []
 
     class DependenciesPrepared(Exception):
         pass
@@ -169,29 +171,22 @@ def test_build_isolates_git_libraries_and_preserves_framework_environment(tmp_pa
             assert command[1:6] == ["submodule", "update", "--init", "--recursive", "--"]
             clones.append(command[-1])
         elif command[1:4] == ["-m", "pip", "install"]:
-            # Stop before package installation or compilation; only dependency preparation is exercised.
-            raise DependenciesPrepared
+            assert command == [sys.executable, "-m", "pip", "install", "-r", str(tmp_path / "requirements-build.txt")]
         else:
             assert command[:2] == [sys.executable, "-c"]
             framework_checks.append(command)
 
-    def check_output(command, *, env, text):
-        check_environment(command, env)
-        assert command[:2] == ["git", "-C"] and text
-        queries.append(command)
-        if command[3:] == ["rev-parse", "HEAD"]:
-            return (
-                lock["shmem"]["revision"] if Path(command[2]).name == "shmem" else lock["megamoe"]["catlass_revision"]
-            )
-        assert command[3:] == ["status", "--porcelain", "--untracked-files=normal"]
-        return ""
+    def prepare(root, *, rebuild, if_needed):
+        assert (root, rebuild, if_needed) == (tmp_path.resolve(), False, True)
+        assert clones == ["third-party/shmem"]
+        # Stop before actual SDK preparation or wheel compilation.
+        raise DependenciesPrepared
 
     monkeypatch.setattr(builder.subprocess, "run", run)
-    monkeypatch.setattr(builder.subprocess, "check_output", check_output)
+    monkeypatch.setattr(builder, "prepare", prepare)
     with pytest.raises(DependenciesPrepared):
         builder.build(tmp_path)
     assert clones == ["third-party/shmem"]
-    assert len(queries) == 2
     assert len(framework_checks) == 1
     assert dict(os.environ) == original_environment
 

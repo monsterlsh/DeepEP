@@ -27,8 +27,7 @@ def test_mte_ep32_shape_windows(tmp_path):
     source = tmp_path / "mte.cpp"
     native = (csrc / "forward.cpp").read_text(encoding="utf-8")
     # Pull in the production tiler while keeping the probe independent of Torch, NPU streams and SHMEM.
-    helpers = native[native.index("template <typename T>") : native.index("PlatformInfo GetPlatformInfo")]
-    make_tiling = native[native.index("MegaMoeTilingData MakeTiling") : native.index("void CheckTensor")]
+    planner = native[native.index("template <typename T>") : native.index("uint64_t Address")]
     wave = (csrc / "kernels/mega_moe/mega_moe_wave_a8w4.hpp").read_text(encoding="utf-8")
     # Exercise the device storage decision, including which block's ready flag and prefix it reads.
     storage = wave[wave.index("    bool reuseWaveSlots_") : wave.index("    // 各任务流")]
@@ -40,11 +39,11 @@ def test_mte_ep32_shape_windows(tmp_path):
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "host_platform.hpp"
 #include "kernels/mega_moe_common/common/mega_moe_workspace.hpp"
-struct PlatformInfo { unsigned aic, aiv, ub, block_dim, system_workspace; };
+using deepep::megamoe::PlatformInfo;
 """
-        + helpers
-        + make_tiling
+        + planner
         + r"""
 using namespace MegaMoeImpl;
 #define __aicore__
@@ -153,6 +152,21 @@ int main() {
     t.maxOutputSize = capacity;
     sw.SelectWaveStorage();
     assert(!sw.reuseWaveSlots_ && readyWaits == 0 && prefixReads == 0);
+    // The public 39,280 rows include a 112-row tail at W256. Both GMM inputs
+    // are nibble-packed in A4W4, including the output of GELU/SwiGLU.
+    for (int topk : {25, 32}) for (int rows : {256, 39280 % 256}) for (int early : {0, 1}) {
+        for (bool gelu : {true, false}) {
+            auto t = MakeTiling(rows, 4096, gelu ? 1536 : 3072, topk, 50, 16, 256, 0,
+                                false, true, 0, platform, early, gelu ? "gelu" : "swiglu");
+            assert(t.groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ);
+            assert(t.dispatchBufferConfig.copyBufferBytes == CalcQuantTokenScaleBytes(4096, 2, topk, early));
+            WorkspaceInfo w(nullptr, &t);
+            auto capacity = MteWorkspaceRowCapacity(t);
+            assert(w.dispatchRevScalePtr - w.dispatchRevDataPtr == int64_t(capacity) * 2048);
+            assert(w.activationQuantScalePtr - w.activationQuantDataPtr == int64_t(capacity) * 768);
+            assert(t.maxOutputSize == unsigned(256 * 16 * topk));
+        }
+    }
     for (int world : {8, 16, 32}) for (int topk : {25, 32}) for (bool w4 : {true, false}) {
         PeermemSizeParams params{256, topk, 4096, 800/world, world, 2, 1, true, false, TOPO_TYPE_MTE, true};
         const auto required = AlignUp<int64_t>(EXCEPTION_DUMP_REGION_SIZE + CalcPeermemLeastSize(params), 2LL << 20);

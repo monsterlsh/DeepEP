@@ -14,6 +14,7 @@ import random
 
 ROUTES = ("balanced", "random", "hot_expert", "hot_rank", "local", "remote", "ring", "empty_experts")
 DATA = ("normal", "uniform", "zero", "small", "sparse", "cancellation", "outliers", "labels")
+MAX_LOCAL_EXPERTS = 128
 
 
 @dataclass(frozen=True)
@@ -45,9 +46,8 @@ class CaseSpec:
             raise ValueError("invalid EP size or local expert count")
         if min(self.m, self.k, self.n) < 1:
             raise ValueError("m/k/n must be positive; zero input is tested as an API rejection")
-        limit = 64 if self.operator == "alltoallv_gmm" else 32
-        if self.local_experts > limit and self.expected_error != "experts":
-            raise ValueError(f"operator supports at most {limit} local experts")
+        if self.local_experts > MAX_LOCAL_EXPERTS and self.expected_error != "experts":
+            raise ValueError(f"operator supports at most {MAX_LOCAL_EXPERTS} local experts")
         if self.route not in ROUTES or self.x_data not in DATA or self.w_data not in DATA:
             raise ValueError("unknown route/data distribution")
         if self.route_device not in ("host", "cpu", "npu"):
@@ -198,8 +198,8 @@ def generate(suite="smoke", seed=20260920, random_count=24):
             )
             for i in range(random_count)
         ]
-        for op, limit in (("alltoallv_gmm", 64), ("gmm_alltoallv", 32)):
-            cases.append(replace(base, operator=op, local_experts=limit + 1, expected_error="experts"))
+        for op in ("alltoallv_gmm", "gmm_alltoallv"):
+            cases.append(replace(base, operator=op, local_experts=MAX_LOCAL_EXPERTS + 1, expected_error="experts"))
             cases += [
                 replace(base, operator=op, expected_error=error)
                 for error in ("zero_input", "dtype", "route_dtype", "route_sum")

@@ -24,13 +24,31 @@
 #include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
 #include "kernels/mega_moe_common/common/mega_moe_workspace.hpp"
 #include "kernels/mega_moe_common/mc2_common/mc2_moe_context.hpp"
+#include "kernels/mega_moe_hierarchical/common/ascend_timer_v2.hpp"
 
 namespace deepep::megamoe {
-namespace {
 
-// Raw launches allocate the kernel-visible WorkspaceInfo regions,
-// the AscendC system workspace, and a 50 MiB reserve.
-constexpr int64_t kReservedWorkspaceBytes = 50LL * 1024LL * 1024LL;
+PlatformInfo GetPlatformInfo()
+{
+    auto* platform = platform_ascendc::PlatformAscendCManager::GetInstance();
+    TORCH_CHECK(platform != nullptr, "failed to get AscendC platform information");
+    uint64_t ub = 0;
+    platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub);
+    const uint32_t aic = platform->GetCoreNumAic();
+    const uint32_t aiv = platform->GetCoreNumAiv();
+    TORCH_CHECK(aic > 0 && aiv > 0 && ub > 0, "invalid A5 platform resources");
+    return {aic, aiv, static_cast<uint32_t>(ub), platform->CalcTschBlockDim(aiv, aic, aiv),
+            platform->GetLibApiWorkSpaceSize()};
+}
+
+void CheckTensor(const at::Tensor& t, int64_t dims, const char* name)
+{
+    TORCH_CHECK(t.defined() && t.device().type() == c10::DeviceType::PrivateUse1, name, " must be an NPU tensor");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(t.dim() == dims, name, " must be ", dims, "D");
+}
+
+namespace {
 
 template <typename T>
 T CeilDiv(T value, T divisor)
@@ -235,19 +253,6 @@ void SetUnpermuteConfigs(MegaMoeTilingData& t, uint32_t ub)
     t.unpermuteConfigForTailTokenChunk = tail_full ? MegaMoeUnpermuteBufferConfig{} : UnpermuteConfig(t, tail, ub);
 }
 
-PlatformInfo GetPlatformInfo()
-{
-    auto* platform = platform_ascendc::PlatformAscendCManager::GetInstance();
-    TORCH_CHECK(platform != nullptr, "failed to get AscendC platform information");
-    uint64_t ub = 0;
-    platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub);
-    const uint32_t aic = platform->GetCoreNumAic();
-    const uint32_t aiv = platform->GetCoreNumAiv();
-    TORCH_CHECK(aic > 0 && aiv > 0 && ub > 0, "invalid A5 platform resources");
-    return {aic, aiv, static_cast<uint32_t>(ub), platform->CalcTschBlockDim(aiv, aic, aiv),
-            platform->GetLibApiWorkSpaceSize()};
-}
-
 MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t topk, int64_t local_experts,
                              int64_t world, int64_t max_tokens, int64_t max_recv, bool is_a8w4, bool is_a4w4,
                              int64_t shared_experts, const PlatformInfo& p, int64_t topk_weights_type,
@@ -304,13 +309,6 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     SetSendMaskConfigs(t, p.ub);
     SetUnpermuteConfigs(t, p.ub);
     return t;
-}
-
-void CheckTensor(const torch::Tensor& t, int64_t dims, const char* name)
-{
-    TORCH_CHECK(t.defined() && t.device().type() == c10::DeviceType::PrivateUse1, name, " must be an NPU tensor");
-    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
-    TORCH_CHECK(t.dim() == dims, name, " must be ", dims, "D");
 }
 
 uint64_t Address(const torch::Tensor& tensor)
@@ -420,7 +418,7 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
            const std::string& activation, const std::string& mma_type, bool windowed,
            int64_t timeout_seconds)
     : backend_(backend == "mte" ? Backend::Mte : Backend::Urma),
-      topk_weights_type_(activation == "gelu" ? 1 : topk_weights_type),
+      topk_weights_type_(topk_weights_type == -1 ? static_cast<int64_t>(activation == "gelu") : topk_weights_type),
       ffts_(ffts),
       example_(example),
       intermediate_(intermediate),
@@ -437,12 +435,13 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
       symmetric_address_(symmetric_address),
       symmetric_bytes_(symmetric_bytes)
 {
-    TORCH_CHECK(topk_weights_type == 0 || topk_weights_type == 1, "topk_weights_type must be 0 or 1");
+    TORCH_CHECK(topk_weights_type_ == 0 || topk_weights_type_ == 1, "topk_weights_type must be 0 or 1");
     TORCH_CHECK(activation_ == "swiglu" || activation_ == "gelu", "activation must be 'swiglu' or 'gelu'");
     const std::string resolved_mma_type = mma_type.empty() ? (is_a8w4 ? "fp8xfp4" : "fp8xfp8") : mma_type;
     TORCH_CHECK(resolved_mma_type == "fp8xfp4" || resolved_mma_type == "fp8xfp8" || resolved_mma_type == "fp4xfp4",
                 "mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4");
-    TORCH_CHECK(resolved_mma_type != "fp4xfp4", "A4W4 (mma_type=fp4xfp4) is not enabled");
+    TORCH_CHECK(!is_a4w4_ || (backend == "mte" && world == 16 && ranks_per_node == 16),
+                "MTE A4W4 requires all 16 ranks on one host");
     TORCH_CHECK(is_a8w4_ == (resolved_mma_type == "fp8xfp4") && is_a4w4_ == (resolved_mma_type == "fp4xfp4"),
                 "is_a8w4 and mma_type describe different matrix modes");
     TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
@@ -453,9 +452,9 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     const bool urma = backend_ == Backend::Urma;
     TORCH_CHECK(!windowed_ ||
                     (urma && shared_experts == 0 &&
-                     ((activation_ == "gelu" && topk_weights_type == 1) ||
-                      (activation_ == "swiglu" && topk_weights_type == 0 && (world == 16 || world == 32)))),
-                "Windowed MegaMoE requires URMA S0 with early GELU or EP16/EP32 SwiGLU with Finalize weighting");
+                     (activation_ == "gelu" ||
+                      (activation_ == "swiglu" && topk_weights_type_ == 0 && (world == 16 || world == 32)))),
+                "Windowed MegaMoE requires URMA S0 with GELU or EP16/EP32 SwiGLU with Finalize weighting");
     TORCH_CHECK(timeout_seconds_ > 0 && timeout_seconds_ <= 3600, "Plan timeout_seconds must be in [1,3600]");
     TORCH_CHECK(!windowed_ || (world == 32 ? ranks_per_node == 16 : (ranks_per_node == 0 || ranks_per_node == world)),
                 "Windowed MegaMoE requires one host for EP8/16 or two contiguous 16-rank hosts for EP32");
@@ -761,9 +760,12 @@ torch::Tensor allocate_timer(torch::Tensor example, const std::string& backend)
     TORCH_CHECK(false, "Rebuild with DEEPEP_MEGAMOE_TIMER=ON before allocating timer");
 #endif
     CheckTensor(example, 2, "timer example");
-    TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
+    TORCH_CHECK(backend == "mte" || backend == "urma" || backend == "mte_roce",
+                "MegaMoE backend must be mte, urma or mte_roce");
     int64_t elements = AscendTimer::TOTAL_BUFFER_SIZE;
-    if (backend == "urma") {
+    if (backend == "mte_roce") {
+        elements = HierarchicalAscendTimer::TOTAL_BUFFER_SIZE;
+    } else if (backend == "urma") {
         elements = int64_t{MegaMoeUrma::kTimerCores} *
                        (MegaMoeUrma::kTraceHeaderElements +
                         int64_t{MegaMoeUrma::kTraceMaxCapacity} * MegaMoeUrma::kTraceRecordElements) +
@@ -774,7 +776,17 @@ torch::Tensor allocate_timer(torch::Tensor example, const std::string& backend)
 
 void validate_timer(const torch::Tensor& timer, const std::string& backend)
 {
-    TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
+    if (backend == "mte_roce") {
+#ifndef DEEPEP_MEGAMOE_TIMER
+        TORCH_CHECK(false, "Rebuild with DEEPEP_MEGAMOE_TIMER=ON before passing timer");
+#endif
+        CheckTensor(timer, 1, "timer");
+        TORCH_CHECK(timer.scalar_type() == torch::kInt64 &&
+                        timer.numel() == HierarchicalAscendTimer::TOTAL_BUFFER_SIZE,
+                    "Invalid MTE+RoCE timer allocation");
+        return;
+    }
+    TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte, urma or mte_roce");
     ValidateTimer(timer, backend == "urma");
 }
 
@@ -809,17 +821,18 @@ int64_t mte_plan_bytes(int64_t world, int64_t experts, int64_t tokens, int64_t c
     TORCH_CHECK(intermediate >= 256 && intermediate <= 4096 && intermediate % 128 == 0,
                 "Plan intermediate_hidden must be divisible by 128, in [256,4096]");
     TORCH_CHECK(activation == "gelu" || activation == "swiglu", "activation must be 'swiglu' or 'gelu'");
-    TORCH_CHECK(topk_weights_type == 0 || topk_weights_type == 1, "topk_weights_type must be 0 or 1");
     const bool gelu = activation == "gelu";
     const bool w4 = mma_type == "fp8xfp4";
-    const int64_t weight_mode = gelu ? 1 : topk_weights_type;
+    const bool a4w4 = mma_type == "fp4xfp4";
+    const int64_t weight_mode = topk_weights_type == -1 ? static_cast<int64_t>(gelu) : topk_weights_type;
+    TORCH_CHECK(weight_mode == 0 || weight_mode == 1, "topk_weights_type must be 0 or 1");
     TORCH_CHECK(shared_experts >= 0 && shared_experts <= 8 && (w4 || shared_experts == 0),
                 "Plan shared experts require W4A8, with count in [0,8]");
     // Validate routed dimensions and MMA mode through the same entry point as Plan.
     buffer_size(world, experts, capacity, topk, hidden, "mte", weight_mode, mma_type, false);
     const auto platform = GetPlatformInfo();
     auto tiling = MakeTiling(tokens, hidden, intermediate * (gelu ? 1 : 2), topk, experts, world, capacity,
-                             0, w4, false, shared_experts, platform, weight_mode, activation);
+                             0, w4, a4w4, shared_experts, platform, weight_mode, activation);
     if (gelu && w4 && shared_experts == 0) {
         // A different tail can pass the UB guard even when the current shape misses it.
         // Budget the largest calibrated table for any tail at this capacity.
@@ -837,7 +850,8 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
     const std::string resolved_mma_type = mma_type.empty() ? "fp8xfp8" : mma_type;
     TORCH_CHECK(resolved_mma_type == "fp8xfp4" || resolved_mma_type == "fp8xfp8" || resolved_mma_type == "fp4xfp4",
                 "mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4");
-    TORCH_CHECK(resolved_mma_type != "fp4xfp4", "A4W4 (mma_type=fp4xfp4) is not enabled");
+    TORCH_CHECK(resolved_mma_type != "fp4xfp4" || (backend == "mte" && world == 16),
+                "A4W4 requires the single-host EP16 MTE kernel or the EP32 RocePlan");
     if (backend == "urma") {
         TORCH_CHECK(resolved_mma_type == "fp8xfp4" || (mma_type == "fp8xfp8" && windowed && (world == 16 || world == 32)),
                     "URMA requires routed FP8xFP4 or windowed EP16/EP32 FP8xFP8");

@@ -27,6 +27,7 @@ struct SessionOptions {
     bool combine_only = false;
     bool use_1g_huge_pages = false;
     uint32_t window_ranks_per_host = 0;
+    bool megamoe_hierarchical_roce = false;
 };
 
 // The framework owns ACL initialization, device and context. Only this workspace

@@ -39,13 +39,13 @@ def test_build_variants_have_disjoint_python_and_native_outputs(monkeypatch):
     assert len({row[1] for row in outputs}) == 3
 
 
-def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
+def wheel(tmp_path, enabled, payload, ep_gmm_fused=False, mte_roce=False, roce_payload=False):
     entries = {
         "deep_ep/_C.fake.so": b"not-an-executable",
         "deep_ep/_build_info.json": json.dumps(
             {
                 "communication_operations": [],
-                "megamoe": {"enabled": enabled},
+                "megamoe": {"enabled": enabled, "mte_roce": mte_roce},
                 "ep_gmm_fused": {"enabled": ep_gmm_fused},
                 "shmem": {"revision": "test-sdk"},
             }
@@ -63,6 +63,8 @@ def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
         ):
             entries["deep_ep_experimental/megamoe/" + name] = b"fixture"
         entries["test.dist-info/licenses/cann.LICENSE"] = b"fixture"
+    if roce_payload:
+        entries["deep_ep_experimental/megamoe/libmegamoe_mte_roce_kernel.so"] = b"fixture"
     if ep_gmm_fused:
         prefix = "deep_ep_experimental/ep_gmm_fused/"
         for name in (
@@ -96,6 +98,14 @@ def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
 def test_wheel_expected_payload(tmp_path, enabled, payload):
     validate = load(ROOT / "scripts/validate_package.py")
     assert validate.inspect_wheel(wheel(tmp_path, enabled, payload))["megamoe"]["enabled"] == enabled
+
+
+def test_wheel_requires_hierarchical_library_when_advertised(tmp_path):
+    validate = load(ROOT / "scripts/validate_package.py")
+    with pytest.raises(RuntimeError, match="Incomplete MegaMoE Beta wheel"):
+        validate.inspect_wheel(wheel(tmp_path, True, True, mte_roce=True))
+    info = validate.inspect_wheel(wheel(tmp_path, True, True, mte_roce=True, roce_payload=True))
+    assert info["megamoe"]["mte_roce"] is True
 
 
 @pytest.mark.parametrize("megamoe,ep_gmm_fused", [(False, False), (False, True), (True, False), (True, True)])

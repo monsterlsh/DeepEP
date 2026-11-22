@@ -1,0 +1,79 @@
+{
+  "_comments": {
+    "启动命令": "在UBX 单机的仓库根目录运行 python3 experiments/megamoe/scripts/run_megamoe.py --run-config experiments/megamoe/scripts/configs/ubx_ep16_target_swiglu.json",
+    "plan": "可在 JSON 外层加 plan: true，仅打印执行计划。正式启动时设为 false 或删除该字段。",
+    "可选值": {
+      "machine": ["ubx"],
+      "ep_size": [16],
+      "backend": ["mte", "urma"],
+      "activation": ["gelu", "swiglu"],
+      "weighting": ["auto", "early", "late"],
+      "input": ["fp8", "fp4"],
+      "routing": ["balanced", "skewed", "random", "random-balanced"],
+      "config.model.topk_weights_type": [0, 1],
+      "按 backend 选择": {
+        "mte": {
+          "mode": ["accuracy", "perf", "both"],
+          "precision": ["a8w4", "a8w8", "a4w4", "all"],
+          "timer": [false, true]
+        },
+        "urma": {
+          "mode": ["accuracy", "perf", "both", "compare"],
+          "precision": ["a8w4", "a8w8", "all"],
+          "timer": [false, true]
+        }
+      },
+      "URMA compare 可选窗口": {
+        "window_tokens": [64, 128, 256]
+      }
+    },
+    "组合约束": "URMA 的 SwiGLU 用 Finalize 加权。compare 由脚本选择两组激活与加权，设置 weighting: auto，并省略外层 activation。input 会由 precision 自动推导，手动指定时 a8w4/a8w8 对应 fp8、a4w4 对应 fp4。",
+    "schema_version / config.schema_version": "运行配置和内嵌模型配置的格式版本，均为 1。",
+    "machine / ep_size": "UBX 单机 16 卡。",
+    "backend": "mte 用于单机 MTE 通信。urma 用于 URMA 通信，也支持 compare。",
+    "weighting": "auto 按模型或激活预设决定，early 在量化前加权，late 在 Finalize 加权。",
+    "mode": "accuracy 只测精度，perf 只测性能，both 先测精度再测性能。设备 timer A/B 对照使用 URMA 的 compare 模式。",
+    "precision / config.model.mma_type": "a8w4、a8w8、a4w4 分别表示 FP8×FP4、FP8×FP8、FP4×FP4，激活精度在前。all 跑所选后端支持的精度。脚本根据外层 precision 设置每轮的 mma_type。",
+    "master_addr / shmem_port": "本机 IPv4 和 SHMEM 引导端口，单机预设使用 127.0.0.1。",
+    "timer": "是否采集设备 timer。单机 MTE 启用时将 precision 设为 a8w4。",
+    "config.bs_values": "每卡 token 数，填一个值，例如 [39280]。",
+    "config.model.hidden / intermediate_hidden": "输入和输出隐藏维度、激活后的专家中间维度。GMM2 K/N 为 intermediate_hidden/hidden。",
+    "config.model.num_experts / num_topk / num_shared_experts": "全局路由专家数、每个 token 选择的专家数、共享专家数。路由专家数应能被 EP 整除，TopK 范围为 1–32。",
+    "config.model.activation / topk_weights_type": "本预设使用 swiglu 和 0，在 Finalize 乘路由权重。GMM1 的 N 为 2 倍 intermediate_hidden，gate 和 up 各占一半。",
+    "config.warmup / iters / seed": "预热次数、测量迭代次数和数据生成随机种子。",
+    "config.alignment": "性能采集时用于起跑对齐的 Exp 前缀。rows 和 cols 控制矩阵尺寸，repeats 控制执行次数。",
+    "routing": "生成路由索引的分布。支持 balanced、skewed、random、random-balanced。",
+    "check_tokens / golden_workers / dual_reference": "精度测试使用的每卡抽样 token 数（0 为全量）、CPU Golden 并行进程数，以及是否增加 NPU 级联参考比对。"
+  },
+  "schema_version": 1,
+  "machine": "ubx",
+  "mode": "both",
+  "precision": "all",
+  "backend": "mte",
+  "ep_size": 16,
+  "config": {
+    "schema_version": 1,
+    "model": {
+      "hidden": 4096,
+      "intermediate_hidden": 1536,
+      "num_experts": 800,
+      "num_topk": 25,
+      "num_shared_experts": 0,
+      "activation": "swiglu",
+      "mma_type": "fp8xfp4",
+      "topk_weights_type": 0
+    },
+    "bs_values": [39280],
+    "alignment": {"rows": 1024, "cols": 1024, "repeats": 1},
+    "warmup": 1,
+    "iters": 3,
+    "seed": 1234
+  },
+  "routing": "balanced",
+  "master_addr": "127.0.0.1",
+  "shmem_port": 29180,
+  "check_tokens": 0,
+  "golden_workers": 2,
+  "dual_reference": false,
+  "timer": false
+}

@@ -42,7 +42,7 @@ set_target_properties(_C PROPERTIES INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LI
 install(TARGETS _C LIBRARY DESTINATION .)
 include(cmake/Direct.cmake)
 if(DEEPEP_BUILD_MEGAMOE)
-    target_compile_definitions(_C PRIVATE DEEPEP_BUILD_MEGAMOE=1)
+    target_compile_definitions(_C PRIVATE DEEPEP_BUILD_MEGAMOE=1 DEEPEP_MEGAMOE_MTE_ROCE=1)
     target_include_directories(_C PRIVATE experiments/megamoe/csrc)
     target_sources(_C PRIVATE experiments/megamoe/csrc/runtime/megamoe_session.cpp)
     add_subdirectory(experiments/megamoe)

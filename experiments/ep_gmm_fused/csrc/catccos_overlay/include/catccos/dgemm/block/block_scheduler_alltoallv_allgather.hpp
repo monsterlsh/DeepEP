@@ -12,6 +12,8 @@
 #ifndef CATCCOS_DGEMM_BLOCK_SCHEDULER_ALLTOALLV_ALLGATHER_HPP
 #define CATCCOS_DGEMM_BLOCK_SCHEDULER_ALLTOALLV_ALLGATHER_HPP
 
+#include <type_traits>
+
 #include "catlass/catlass.hpp"
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
@@ -24,17 +26,19 @@ namespace Catccos::DGemm::Block {
 using Catlass::GemmCoord;
 using Catlass::MatrixCoord;
 
-template <class MoeConstraints_ = DefaultMoeConstraints, uint32_t M_SPLIT_ = 1>
+template <class MoeConstraints_ = DefaultMoeConstraints, uint32_t M_SPLIT_ = 1, bool CompactRows_ = false>
 struct BlockMmadSchedulerAllToAllVAllGather {
     using MoeConstraints = MoeConstraints_;
     using ProblemShape = AllToAllVAllGatherProblemShape;
+    // These offsets count rows. The native launcher bounds input and output rows by uint32.
+    using RowOffset = std::conditional_t<CompactRows_, uint32_t, uint64_t>;
     static constexpr uint32_t M_SPLIT = M_SPLIT_;
     static_assert(M_SPLIT > 0, "A2AV-GMM M swizzle split must be positive");
 
     struct CommContext {
         uint32_t tokenNumList[MoeConstraints::LOCAL_EXPERT_NUM_LIMIT][MoeConstraints::RANK_SIZE_LIMIT]{0};
-        uint64_t tokenOffsetList[MoeConstraints::LOCAL_EXPERT_NUM_LIMIT][MoeConstraints::RANK_SIZE_LIMIT]{0};
-        uint64_t inGroupOffsetList[MoeConstraints::LOCAL_EXPERT_NUM_LIMIT][MoeConstraints::RANK_SIZE_LIMIT]{0};
+        RowOffset tokenOffsetList[MoeConstraints::LOCAL_EXPERT_NUM_LIMIT][MoeConstraints::RANK_SIZE_LIMIT]{0};
+        RowOffset inGroupOffsetList[MoeConstraints::LOCAL_EXPERT_NUM_LIMIT][MoeConstraints::RANK_SIZE_LIMIT]{0};
     };
 
     struct MmadContext {
@@ -51,7 +55,7 @@ struct BlockMmadSchedulerAllToAllVAllGather {
     uint32_t commLoops;
 
     uint32_t outputSplitList[MoeConstraints::RANK_SIZE_LIMIT]{0};
-    uint64_t outputOffsetList[MoeConstraints::LOCAL_EXPERT_NUM_LIMIT][MoeConstraints::RANK_SIZE_LIMIT]{0};
+    RowOffset outputOffsetList[MoeConstraints::LOCAL_EXPERT_NUM_LIMIT][MoeConstraints::RANK_SIZE_LIMIT]{0};
 
     CommContext commContext{};
     MmadContext mmadContext{};
@@ -158,7 +162,7 @@ struct BlockMmadSchedulerAllToAllVAllGather {
     uint32_t startTask = AscendC::GetBlockIdx();
 
     struct Iter {
-        using Scheduler = BlockMmadSchedulerAllToAllVAllGather<MoeConstraints, M_SPLIT>;
+        using Scheduler = BlockMmadSchedulerAllToAllVAllGather<MoeConstraints, M_SPLIT, CompactRows_>;
         Scheduler* const scheduler;
         uint32_t taskIdx;
         uint32_t coreLoops;
@@ -202,7 +206,7 @@ struct BlockMmadSchedulerAllToAllVAllGather {
     }
 
     struct RemapperA {
-        using Scheduler = BlockMmadSchedulerAllToAllVAllGather<MoeConstraints, M_SPLIT>;
+        using Scheduler = BlockMmadSchedulerAllToAllVAllGather<MoeConstraints, M_SPLIT, CompactRows_>;
         const Scheduler* scheduler;
         uint32_t commIdx;
         uint32_t localExpertIdx;
@@ -235,7 +239,7 @@ struct BlockMmadSchedulerAllToAllVAllGather {
     }
 
     struct RemapperC {
-        using Scheduler = BlockMmadSchedulerAllToAllVAllGather<MoeConstraints, M_SPLIT>;
+        using Scheduler = BlockMmadSchedulerAllToAllVAllGather<MoeConstraints, M_SPLIT, CompactRows_>;
         const Scheduler* scheduler;
         uint32_t commIdx;
         uint32_t localExpertIdx;
@@ -243,8 +247,8 @@ struct BlockMmadSchedulerAllToAllVAllGather {
         CATLASS_DEVICE
         MatrixCoord operator()(DistGemmCoord const& blockOffset) const
         {
-            auto outputOffset = scheduler->outputOffsetList[localExpertIdx][blockOffset.rank()];
-            auto inGroupOffset = scheduler->commContext.inGroupOffsetList[localExpertIdx][blockOffset.rank()];
+            uint64_t outputOffset = scheduler->outputOffsetList[localExpertIdx][blockOffset.rank()];
+            uint64_t inGroupOffset = scheduler->commContext.inGroupOffsetList[localExpertIdx][blockOffset.rank()];
             return blockOffset.GetCoordMN() + Catlass::MakeCoord<uint32_t>(outputOffset + inGroupOffset, 0);
         }
 

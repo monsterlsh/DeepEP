@@ -28,8 +28,8 @@
 #include "kernels/mega_moe_common/common/mega_moe_gmm_common.hpp"
 #include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
 #include "../common/mega_moe_mxfp8_utils.hpp"
-#include "../mc2_common/mc2_kernel_utils.hpp"
-#include "../mc2_common/quantize_functions.hpp"
+#include "kernels/mega_moe_common/mc2_common/mc2_kernel_utils.hpp"
+#include "kernels/mega_moe_common/mc2_common/quantize_functions.hpp"
 
 namespace MegaMoeImpl {
 

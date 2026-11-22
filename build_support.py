@@ -342,7 +342,7 @@ def build_configuration(environment=None):
         catlass = Path(env.get("CATLASS_ROOT", str(ROOT / "third-party/catlass")))
         if not (catlass / "include/catlass/gemm/tile/copy_l1_to_l0a.hpp").is_file():
             raise RuntimeError(
-                "MegaMoE requires CATLASS: run git submodule update --init --recursive, "
+                "MegaMoE requires CATLASS: run git -c submodule.recurse=false submodule update --init -- third-party/catlass, "
                 "or set CATLASS_ROOT; see experiments/megamoe/README.md"
             )
         revision = subprocess.check_output(["git", "-C", str(catlass), "rev-parse", "HEAD"], text=True).strip()
@@ -352,7 +352,7 @@ def build_configuration(environment=None):
         import torch_npu
 
         result["CATLASS_ROOT"] = str(catlass.resolve())
-        result["megamoe"].update(torch=torch.__version__, torch_npu=torch_npu.__version__, catlass=revision)
+        result["megamoe"].update(torch=torch.__version__, torch_npu=torch_npu.__version__, catlass=revision, mte_roce=True)
     result["compiler_sha256"] = hashlib.sha256(Path(compiler).read_bytes()).hexdigest()
     result["compiler_version_sha256"] = hashlib.sha256(compiler_version).hexdigest()
     print(f"Host C++ compiler: {compiler}", flush=True)
@@ -545,6 +545,10 @@ class CMakeBuild(build_ext):
         checked_run(arguments)
         checked_run([cmake, "--build", directory, "--parallel", jobs])
         checked_run([cmake, "--install", directory, "--prefix", destination])
+        if megamoe.get("mte_roce"):
+            library = destination.parent / "deep_ep_experimental/megamoe/libmegamoe_mte_roce_kernel.so"
+            if not library.is_file():
+                raise RuntimeError(f"Missing installed MegaMoE MTE+RoCE device library: {library}")
         # A reused setuptools build_lib may still contain the former library.
         (destination / "libdeepep_notify.so").unlink(missing_ok=True)
         # Elastic implementation/layout modules now live under buffers/.

@@ -64,6 +64,9 @@ PYBIND11_MODULE(_C, module)
         .def_property_readonly("peer_access_error", &deepep::Session::peer_access_error)
         .def_property_readonly("peer_table", &deepep::Session::peer_table);
 #ifdef DEEPEP_BUILD_MEGAMOE
+#ifdef DEEPEP_MEGAMOE_MTE_ROCE
+    module.attr("megamoe_mte_roce_enabled") = true;
+#endif
     module.def("create_megamoe_runtime", &deepep::megamoe::create_runtime, py::arg("rank"), py::arg("size"),
                py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"), py::arg("backend") = "mte",
                py::arg("windowed") = false, py::call_guard<py::gil_scoped_release>());

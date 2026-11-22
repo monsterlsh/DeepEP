@@ -304,15 +304,13 @@ class ElasticBuffer:
         machine_type: str = "auto",
         rootinfo_path: Optional[str] = None,
     ) -> int:
-        """Two SHMEM arenas sized for the worst-case token rows.
+        """Size both HT arenas for balanced expert routing.
 
-        A rank receives each source token at most once, so ``server_partial``
-        reserves the power-of-two stride over ``world * num_max_tokens_per_rank``.
-        ``gather_input`` and ``returned_partial`` reserve the average route rows
-        ``num_max_tokens_per_rank * num_topk``; heavier expanded skew requires an
-        explicit ``num_bytes``. Size hints include weights and optional FP8
-        scales. Both operators are included at every supported shape; actual
-        allocation depends on the runtime.
+        Each selected expert contributes one receive row, including multiple
+        experts on the same rank. Reserve at least ``tokens * num_topk`` rows
+        per rank and retain the existing power-of-two token budget. More
+        heavily skewed routes can require a larger explicit ``num_bytes``.
+        The hint includes weights and optional FP8 scales.
         """
         require_native("ElasticBuffer.get_buffer_size_hint")
         validate_hidden(hidden, use_fp8_dispatch)
@@ -322,9 +320,9 @@ class ElasticBuffer:
             raise ValueError("num_topk must be positive to size the route rows")
         _, world = rank_and_world(group, 0 if group is None else None, world_size)
         tokens = num_max_tokens_per_rank
-        # The receive side uses a power-of-two stride; topk=1 must stay within the route bound.
-        receive_rows = min(1 << (world * tokens - 1).bit_length(), world * tokens * num_topk)
         route_rows = tokens * num_topk
+        token_stride = 1 << (world * tokens - 1).bit_length()
+        receive_rows = max(route_rows, min(token_stride, world * route_rows))
         return elastic_size_hint(
             world,
             num_max_tokens_per_rank,

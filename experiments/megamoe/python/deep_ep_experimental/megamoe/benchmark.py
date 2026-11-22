@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .timer.__main__ import parse_ranks
 from .numerics import prequant_route_weight
+from .validation import collective_check
 from .performance import (
     alignment_config,
     collect_profile,
@@ -32,8 +33,10 @@ def load_config(name, bs_values=None):
         path = files(__package__).joinpath("configs", name + ".json")
     config = json.loads(path.read_text(encoding="utf-8"))
     required = {"schema_version", "model", "bs_values", "warmup", "iters", "seed"}
-    if not required <= set(config) or set(config) - required - {"alignment"} or config["schema_version"] != 1:
+    if not required <= set(config) or set(config) - required - {"alignment", "shared_dtype"} or config["schema_version"] != 1:
         raise ValueError("Invalid config schema; see the packaged smoke.json")
+    if "shared_dtype" in config and config["shared_dtype"] not in ("fp4", "fp8"):
+        raise ValueError("shared_dtype must be 'fp4' or 'fp8'")
     optional = {
         "shared_intermediate_hidden",
         "shared_output_rounding",
@@ -50,10 +53,8 @@ def load_config(name, bs_values=None):
     if model.get("activation", "swiglu") not in ("swiglu", "gelu"):
         raise ValueError("activation must be 'swiglu' or 'gelu'")
     mma_type = model.get("mma_type", "fp8xfp4")
-    if mma_type == "fp4xfp4":
-        raise ValueError("A4W4 (mma_type='fp4xfp4') is not enabled")
-    if mma_type not in ("fp8xfp4", "fp8xfp8"):
-        raise ValueError("mma_type must be fp8xfp4 or fp8xfp8")
+    if mma_type not in ("fp8xfp4", "fp8xfp8", "fp4xfp4"):
+        raise ValueError("mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4")
     if model.get("activation") == "gelu" and "activation_clamp" in model:
         raise ValueError("activation_clamp is only defined for SwiGLU")
     normalize_clamp(model.get("activation_clamp"))
@@ -248,6 +249,7 @@ def main():
     parser.add_argument("--config", default="smoke", help="Packaged name or JSON path")
     parser.add_argument("--bs-values", help="Only model config override, e.g. 96,4096")
     parser.add_argument("--mode", choices=("accuracy", "perf"), default="accuracy")
+    parser.add_argument("--backend", choices=("mte", "mte_roce"), help="Select single-host EP16 MTE or two-host EP32 MTE+RoCE")
     parser.add_argument("--perf-scope", choices=("all", "host", "timer"), default="all",
                         help="Run all performance measures, synchronized host timing, or a separate device trace")
     parser.add_argument("--paired-weights", action="store_true",
@@ -299,13 +301,13 @@ def main():
 def run(args, config, group):
     from .backend import select_backend
 
-    backend = select_backend(group)
+    requested_backend = getattr(args, "backend", None)
+    backend = select_backend(group) if requested_backend is None else requested_backend
     urma = backend == "urma"
+    roce = backend == "mte_roce"
     import torch
     from .api import SymmBuffer, fp8_fp4_mega_moe, transform_weights_for_mega_moe
     from .reference import make_weights, quantize_activation
-    from .validation import collective_check
-
     rank, world = group.rank(), group.size()
     ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", world))
     perf_scope = getattr(args, "perf_scope", "all")
@@ -329,10 +331,15 @@ def run(args, config, group):
             perf_scope,
             paired_weights,
             urma_window_tokens,
+            requested_backend,
         ),
     )
     model = config["model"]
     mma_type = model.get("mma_type", "fp8xfp4")
+    if roce and (paired_weights or urma_window_tokens is not None):
+        raise ValueError("MTE+RoCE does not accept --paired-weights or --urma-window-tokens")
+    if "shared_dtype" in config and not roce:
+        raise ValueError("The benchmark shared_dtype option requires --backend mte_roce")
     if paired_weights and (mma_type not in ("fp8xfp4", "fp8xfp8") or model["num_shared_experts"]):
         raise ValueError("--paired-weights requires routed W4A8 or W8A8 with zero shared experts")
     storage_kind = "fp4" if mma_type == "fp4xfp4" else "fp8"
@@ -340,7 +347,9 @@ def run(args, config, group):
         raise ValueError(f"{mma_type} buffered input must be {storage_kind}")
     if urma and args.input != "fp8":
         raise ValueError("URMA requires --input fp8")
-    timer_ranks = args.timer_ranks if args.timer_ranks is not None else default_timer_ranks(world, ranks_per_node, urma=urma)
+    timer_ranks = args.timer_ranks if args.timer_ranks is not None else default_timer_ranks(
+        world, ranks_per_node, urma=urma or roce,
+    )
     if any(value >= world for value in timer_ranks):
         raise ValueError("timer rank exceeds EP world size")
     if config["model"]["num_experts"] % world:
@@ -397,7 +406,7 @@ def run(args, config, group):
         timer_ranks=timer_ranks,
         host_coordination="tcpstore",
         backend=backend,
-        device_communication="shmem_mte_udma" if urma else "shmem_mte",
+        device_communication="shmem_mte_roce" if roce else ("shmem_mte_udma" if urma else "shmem_mte"),
         api="fp8_fp4_mega_moe",
         numerical_contract=(
             "ascend_pre_quant_route_weight_v1" if prequant_route_weight(config["model"]) else "ascend_post_gmm2_route_weight_v1"
@@ -426,6 +435,7 @@ def run(args, config, group):
         group,
         num_max_tokens_per_rank=max(config["bs_values"]),
         ranks_per_node=ranks_per_node,
+        **({"backend": requested_backend} if requested_backend is not None else {}),
         **({"urma_window_tokens": urma_window_tokens} if urma_window_tokens is not None else {}),
         **{k: v for k, v in model.items() if k not in ("shared_intermediate_hidden", "shared_output_rounding", "activation_clamp")},
     )
@@ -451,7 +461,9 @@ def run(args, config, group):
         raise RuntimeError("Timer requires a supported matrix mode and DEEPEP_MEGAMOE_TIMER=ON")
     activation_name = model.get("activation", "swiglu")
     raw = routed_weights(config, world, rank, paired=paired_weights)
-    prepared = transform_weights_for_mega_moe(*map(device_pair, raw), activation=activation_name, backend=backend)
+    prepared = transform_weights_for_mega_moe(
+        *map(device_pair, raw), activation=activation_name, backend=backend, mma_type=mma_type,
+    )
     shared_raw, shared_kwargs = None, {}
     if model["num_shared_experts"]:
         shared_raw = make_weights(
@@ -462,15 +474,19 @@ def run(args, config, group):
             activation_name,
         )
 
+        shared_fp8 = urma or (roce and config.get("shared_dtype") == "fp8")
+
         def shared_pair(pair):
-            if not urma:
+            if not shared_fp8:
                 return device_pair(pair)
             from .reference import expand_fp4_to_fp8
 
             data, scale = device_pair(expand_fp4_to_fp8(pair))
             return data.view(torch.float8_e4m3fn), scale
 
-        shared = transform_weights_for_mega_moe(*map(shared_pair, shared_raw), activation=activation_name, shared=True)
+        shared = transform_weights_for_mega_moe(
+            *map(shared_pair, shared_raw), activation=activation_name, shared=True, backend=backend,
+        )
         shared_kwargs = dict(shared_l1_weights=shared[0], shared_l2_weights=shared[1])
     cascade = None
     cascade_owned = False
@@ -541,15 +557,9 @@ def run(args, config, group):
         )
         resources_path = case / "resources.json"
         resources_path.write_text(json.dumps(resources, indent=2), encoding="utf-8")
-        timer, error = None, None
-        if args.timer:
-            try:
-                timer = buffer.allocate_timer() if rank in timer_ranks else None
-            except Exception as failure:
-                error = str(failure)
-            collective_check(group, f"timer allocation BS={bs}", error)
+        timer = _allocate_case_timer(buffer, group, bs, rank in timer_ranks) if args.timer and not roce else None
         prefix = None
-        if not urma and perf_scope == "all" and (args.mode == "perf" or args.timer):
+        if not urma and perf_scope == "all" and (args.mode == "perf" or (args.timer and not roce)):
             error = None
             try:
                 alignment = config["alignment"]
@@ -674,7 +684,13 @@ def run(args, config, group):
             performance_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         if args.timer:
             uninstrumented = result.float().cpu().numpy() if args.mode == "accuracy" else None
-            if perf_scope == "timer":
+            if roce:
+                # Keep the trace buffer and zeroing out of formal profiling and host E2E.
+                timer = _allocate_case_timer(buffer, group, bs, rank in timer_ranks)
+                group.barrier(f"MTE+RoCE timer BS={bs}")
+                flush_l2_before_call()
+                call(timer)
+            elif perf_scope == "timer":
                 flush_l2_before_call()
                 call(timer)
             elif urma:
@@ -706,6 +722,8 @@ def run(args, config, group):
                 from .urma_trace import export_diagnostics
 
                 export_diagnostics(group, timer, case, timer_ranks=timer_ranks)
+            elif roce:
+                _export_roce_timer(group, timer, case, rank, bs, min(bs, buffer.window_tokens))
             else:
                 _export_mte_timer(args.output_dir, bs, rank, group, timer)
             del timer
@@ -728,6 +746,30 @@ def run(args, config, group):
 
         dist.destroy_process_group()
     group.close()
+
+
+def _allocate_case_timer(buffer, group, bs, sampled):
+    timer, error = None, None
+    try:
+        if sampled:
+            timer = buffer.allocate_timer()
+    except Exception as failure:
+        error = str(failure) or type(failure).__name__
+    collective_check(group, f"timer allocation BS={bs}", error)
+    return timer
+
+
+def _export_roce_timer(group, timer, case, rank, bs, window_tokens):
+    error = None
+    if timer is not None:
+        try:
+            from .roce_trace import export_diagnostics
+
+            raw = timer.cpu().numpy().astype("<i8", copy=False).reshape(-1)
+            export_diagnostics(raw, case, rank, bs, window_tokens)
+        except Exception as failure:
+            error = str(failure) or type(failure).__name__
+    collective_check(group, f"MTE+RoCE timer export BS={bs}", error)
 
 
 def _export_mte_timer(output_dir, bs, rank, group, timer):

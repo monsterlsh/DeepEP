@@ -161,9 +161,10 @@ destroy_udma_group()
 - `received_counts` 长度相同，按源 EP rank、当前 rank 的 local expert 排列。
 - 正向输入 `[M,K]` 按全局专家排列，每 rank 的 M 相同；结果按 local expert、源 rank 排列。
 - 逆向输入使用正向结果的排列，结果恢复源 rank 的全局专家顺序；本地输入/输出行数可不同。
-- 正向最多 64 个本地专家，逆向最多 32 个；输入 M 必须大于 0。
+- 正向和逆向各支持最多 128 个本地专家，输入 M 必须大于 0。
 - 路由可传 host 整数列表、CPU int64、NPU int64。host 路径每次包含 H2D；性能用例默认 NPU。
 - 正向可 `received_rows=` 避免 count D2H，可 `output_all_to_allv=True` 返回 `(result, dispatched)`。
+- 正向导出使用 host 路由且每卡最多 64 个专家时会打包前缀元数据。65–128 个专家使用设备上的路由张量计算前缀。
 - 两算子均支持 `out=`；正向导出还支持 `all_to_allv_out=`。异步结果需按 NPU stream 规则消费。
 - 所有 rank 必须使用一致的形状配置、路由对应关系及 tiling；本库不是 autograd 封装。
 

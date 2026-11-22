@@ -31,11 +31,6 @@ enum class KernelVariant {
     kM0_256N0_256,
 };
 
-template <class T>
-struct TypeTag {
-    using type = T;
-};
-
 struct TilingProfile {
     KernelVariant kernelVariant;
     uint32_t m0;
@@ -116,8 +111,6 @@ TilingProfile ResolveTiling(const TilingProfile& defaultTiling, at::IntArrayRef 
     return result;
 }
 
-// Capacity check only; 128 covers E/P up to 128 (for example 800 experts on EP8).
-constexpr uint32_t kMaxLocalExperts = 128;
 constexpr uint32_t kBf16UbAlignElements = 16;
 
 uint32_t TargetOrderLocalCopyColumns(uint32_t columns)
@@ -270,7 +263,7 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
     Catlass::MatrixCoord commBlockShape{tiling.commBlockM, static_cast<uint32_t>(n64)};
     Catlass::MatrixCoord commTileShape{localCopyRows, localCopyColumns};
     const uint64_t fftsAddress = runtime.FftsAddress();
-    auto launchWithConfig = [&](auto configTag) {
+    auto launchSelected = [&](auto configTag) {
         using SelectedConfig = typename decltype(configTag)::type;
         using SelectedDeviceOp = typename SelectedConfig::Device;
         using SelectedKernel = typename SelectedConfig::Kernel;
@@ -307,6 +300,9 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
             return 0;
         };
         at_npu::native::OpCommand::RunOpApi("GroupedMatMulAllToAllVUdma", launch);
+    };
+    auto launchWithConfig = [&](auto configTag) {
+        LaunchWithExpertCapacity(configTag, static_cast<uint32_t>(localExpertNum), launchSelected);
     };
     if (tiling.kernelVariant == KernelVariant::kM0_256N0_256) {
         if (tiling.workspaceStages == 3) {

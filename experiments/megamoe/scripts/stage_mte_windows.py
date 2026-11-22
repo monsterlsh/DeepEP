@@ -8,6 +8,13 @@ import statistics
 import subprocess
 import sys
 
+if __package__:
+    from .paired_benchmark import ARMS, IDENTITY_FIELDS, window_lengths
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from paired_benchmark import ARMS, IDENTITY_FIELDS, window_lengths
+    sys.path.pop(0)
+
 
 def cases(windows):
     # Alternate routing and reverse the window sweep for hotspots.
@@ -18,9 +25,6 @@ def cases(windows):
 def summarize(root, windows):
     reference = None
     by_route = {}
-    identity_fields = ("config", "backend", "world", "ranks_per_node", "hosts_by_rank", "devices_by_rank",
-                       "bs", "warmup_pairs", "formal_pairs", "cache", "input", "routes", "weights",
-                       "torch", "torch_npu", "build")
     for route, window in cases(windows):
         directory = root / f"{route}-w{window}"
         report = json.loads((directory / "paired.json").read_text())
@@ -28,16 +32,16 @@ def summarize(root, windows):
         if (report["routing"] != route or layout.get("staged_window") != window
                 or layout["weight_mode"] != {"gelu": 1, "swiglu": 0}):
             raise ValueError(f"{directory}: expected matched original-weight-mode study")
-        expected = [min(window, report["bs"] - i) for i in range(0, report["bs"], window)]
-        if report["windows"] != {"gelu": expected, "swiglu": expected}:
+        expected = window_lengths(report["bs"], window)
+        if report["windows"] != dict.fromkeys(ARMS, expected):
             raise ValueError(f"{directory}: unequal or incorrect window partition")
-        identity = {key: report[key] for key in identity_fields}
+        identity = {key: report[key] for key in IDENTITY_FIELDS}
         if reference is not None and identity != reference:
             raise ValueError(f"{directory}: settings or topology changed across window trials")
         reference = identity
         data = report["host_e2e"]
         medians = {arm: statistics.median(pair["rank_max_us"][arm] for pair in data["pairs"])
-                   for arm in ("gelu", "swiglu")}
+                   for arm in ARMS}
         entry = dict(window=window, windows=len(expected), tail=expected[-1], json=str(directory / "paired.json"),
                      median_slowest_rank_us=medians, median_pair_ratio=data["median_pair_ratio"],
                      rank_max_mean_us=data["rank_max_mean_us"], global_tokens_per_second=data["global_input_tokens_per_second"])
@@ -48,7 +52,7 @@ def summarize(root, windows):
     for route, trials in by_route.items():
         trials.sort(key=lambda trial: trial["window"])
         best = {arm: min(trials, key=lambda trial: trial["median_slowest_rank_us"][arm])
-                for arm in ("gelu", "swiglu")}
+                for arm in ARMS}
         result[route] = dict(
             trials=trials, best_window_by_arm={arm: trial["window"] for arm, trial in best.items()},
             fastest_gelu_over_fastest_swiglu=(best["gelu"]["median_slowest_rank_us"]["gelu"] /

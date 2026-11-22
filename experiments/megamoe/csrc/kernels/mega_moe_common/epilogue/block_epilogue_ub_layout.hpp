@@ -18,13 +18,13 @@
 #define BLOCK_EPILOGUE_UB_LAYOUT_H
 
 #if defined(__DAV_C310__)
-#if ASC_DEVKIT_MAJOR >= 9
+#include <cstdint>
 #include "kernels/mega_moe_common/implementation_namespace.hpp"
+#if ASC_DEVKIT_MAJOR >= 9
 #include "basic_api/kernel_basic_intf.h"
 #else
 #include "kernel_operator.h"
 #endif
-#include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
 
 namespace DEEPEP_MEGAMOE_IMPL_NAMESPACE {
 namespace Detail {
@@ -49,7 +49,7 @@ __aicore__ constexpr inline ActivationMxQuantUbOffsets BuildActivationMxQuantUbO
 {
     constexpr uint32_t maxSingleElementCount = TileM * TileN;
     constexpr uint32_t activationQuantElementCapacity =
-        IsInterleaved ? maxSingleElementCount / ACTIVATION_N_HALF : maxSingleElementCount;
+        IsInterleaved ? maxSingleElementCount / 2U : maxSingleElementCount;
     constexpr uint32_t activationOutputOffsetBytes = 0;
     constexpr uint32_t quantOutputOffsetBytes =
         activationOutputOffsetBytes + activationQuantElementCapacity * sizeof(bfloat16_t);
@@ -72,7 +72,7 @@ __aicore__ constexpr inline ActivationMxQuantUbOffsets BuildActivationMxQuantUbO
             reciprocalScaleOffsetBytes,
             scaleElementCapacity,
             vecInEndBytes,
-            TileM * INT32_PER_256B};
+            TileM * (32U / sizeof(int32_t))};
 }
 
 template <typename InputType>

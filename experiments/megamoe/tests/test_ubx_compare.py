@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from experiments.megamoe.scripts import run_ubx_gelu as launcher
+from experiments.megamoe.scripts import run_megamoe as launcher
 
 
 @pytest.mark.parametrize(
@@ -97,7 +97,8 @@ def test_target_k25_plans_both_precisions_without_execution(tmp_path, monkeypatc
     monkeypatch.setattr(launcher, "run_stage", unexpected)
     monkeypatch.setattr(launcher, "run_case", unexpected)
     monkeypatch.setattr(launcher, "report_comparison", unexpected)
-    assert launcher.cli(["compare", "all", "--ep-size", str(world), "--plan", "--output-dir", str(output)]) == 0
+    nodes = ["--node-ip", "192.0.2.1", "192.0.2.2"] if world == 32 else []
+    assert launcher.cli(["compare", "all", "--ep-size", str(world), "--plan", "--output-dir", str(output), *nodes]) == 0
     plan = json.loads(capsys.readouterr().out)
     assert plan["ep_size"] == world and plan["config"]["model"]["num_topk"] == 25
     assert plan["bs"] == 39280 and plan["window_tokens"] == 256
@@ -107,6 +108,53 @@ def test_target_k25_plans_both_precisions_without_execution(tmp_path, monkeypatc
         assert len(case["pairs"]) == 8 and set(case["timer"]) == {"gelu", "swiglu"}
         assert not case["absolute"] and not case["blocked"]
     assert not output.exists()
+
+
+def test_run_json_supplies_pair_defaults_and_model_stays_compatible(tmp_path):
+    from deep_ep_experimental.megamoe.benchmark import load_config
+    from experiments.megamoe.scripts.ubx_ab_report import expected_config
+
+    source = launcher.CONFIG_DIR / "target_gelu_k25.json"
+    spec = json.loads(source.read_text(encoding="utf-8"))
+    assert "comparison" not in spec
+    arms = {
+        "gelu": {"activation": "gelu", "topk_weights_type": 1},
+        "swiglu": {"activation": "swiglu", "topk_weights_type": 0},
+    }
+    spec["bs_values"] = [257]
+    config = tmp_path / "model.json"
+    config.write_text(json.dumps(spec), encoding="utf-8")
+    run = tmp_path / "run.json"
+    run.write_text(json.dumps({
+        "schema_version": 1, "mode": "compare", "config": config.name, "master_addr": "127.0.0.1",
+        "comparison": {"precisions": ["w8a8"], "arms": arms},
+    }), encoding="utf-8")
+
+    args = launcher.parse_args(["--run-config", str(run)])
+    plan = launcher.comparison_plan(args)
+    assert plan["bs"] == 257 and args.perf_precisions == ("w8a8",)
+    assert plan["arms"] == arms
+    assert "comparison" not in plan["config"] and "comparison" not in load_config(str(config))
+
+    overrides = launcher.parse_args(["--run-config", str(run), "--precision", "a8w4", "--bs", "65"])
+    assert overrides.bs == 65 and overrides.perf_precisions == ("w4a8",)
+    for arm in plan["arms"]:
+        job = launcher.parse_args(["perf", "w8a8", "--comparison-arm", arm, "--config", str(config),
+                                   "--output-dir", str(tmp_path)])
+        runtime_config = launcher.config_for(job, "w8a8")
+        runtime = load_config(str(runtime_config), str(job.bs))
+        assert runtime == expected_config(plan, "w8a8", arm)
+
+
+@pytest.mark.parametrize(("ep_size", "backend"), [(16, "mte"), (32, "mte_roce")])
+def test_target_run_json_selects_either_activation_on_its_hardware(ep_size, backend):
+    run = launcher.SCRIPT.parent / "configs" / f"ubx_ep{ep_size}_target.json"
+    for activation, weight in (("gelu", 1), ("swiglu", 0)):
+        args = launcher.parse_args(["--run-config", str(run), "--mode", "perf", "--activation", activation])
+        model = launcher.case_model(args)
+        assert (args.ep_size, args.backend, args.bs) == (ep_size, backend, 39280)
+        assert args.spec == json.loads(run.read_text(encoding="utf-8"))["config"]
+        assert (model["activation"], model["topk_weights_type"], model["num_topk"]) == (activation, weight, 25)
 
 
 @pytest.mark.parametrize("precision", ["w4a8", "w8a8"])
@@ -131,7 +179,8 @@ def test_ep32_compare_forwards_arm_scope_and_topk_to_both_nodes(tmp_path, monkey
             argv = shlex.split(script.splitlines()[-1])[3:]
             assert "--timer-ranks" not in argv
             assert ("--timer" in argv) == (argv[argv.index("--perf-scope") + 1] == "timer")
-            assert launcher.cli(argv) == 0
+            assert argv[0] == "--worker"
+            assert launcher.cli(argv[1:]) == 0
 
     monkeypatch.setattr(launcher, "run_case", run_case)
     monkeypatch.setattr(launcher, "run_stage", run_stage)

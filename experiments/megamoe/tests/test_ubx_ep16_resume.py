@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from deep_ep_experimental.megamoe.benchmark import load_config
-from experiments.megamoe.scripts import run_ubx_gelu as launcher
+from experiments.megamoe.scripts import run_megamoe as launcher
 
 
 @pytest.fixture

@@ -51,7 +51,7 @@ with open(sys.argv[1], encoding="utf-8") as stream:
     print(json.load(stream)["megamoe"]["catlass_revision"])
 ' "$REPO_ROOT/dependencies.lock.json")
     if [[ ! -e "$CATLASS_ROOT/.git" ]]; then
-        "${git_clean_env[@]}" submodule update --init --recursive -- third-party/catlass
+        "${git_clean_env[@]}" -c submodule.recurse=false submodule update --init -- third-party/catlass
     fi
     catlass_head=$(git -C "$CATLASS_ROOT" rev-parse HEAD)
     catlass_changes=$(git -C "$CATLASS_ROOT" status --porcelain --untracked-files=normal)
@@ -193,7 +193,8 @@ else
     build_log=$(mktemp -t deepep-ubx-build.XXXXXXXX)
 fi
 printf '[UBX] Build log: %s\n' "$build_log"
-bash "$build_root/experiments/megamoe/scripts/build.sh" "$@" 2>&1 | tee "$build_log" || {
+# ubx_env.sh already sets the Python executable and the Conda runtime library path.
+"$PYTHON" "$build_root/experiments/megamoe/scripts/build.py" "$@" 2>&1 | tee "$build_log" || {
     build_status=$?
     if [[ -z $latest_shmem_revision && ! -v SHMEM_ROOT && ${1:-} != --rebuild-shmem ]] &&
         grep -Eq 'Existing SHMEM build identity changed|SHMEM build/install already exists|Cannot determine the compiled SHMEM HNS_1825 doorbell mode' "$build_log"; then

@@ -356,6 +356,20 @@ def test_early_weights_shared_expert_unweighted_and_cache_contract(config):
     assert golden.contract(changed, 2, 7, "fp8", "random", 0) != spec
 
 
+@pytest.mark.parametrize("world,topk", [(16, 32), (32, 25)])
+@pytest.mark.parametrize("activation,early", [("gelu", 1), ("swiglu", 0)])
+@pytest.mark.parametrize("mma", ["fp8xfp4", "fp8xfp8", "fp4xfp4"])
+def test_ubx_mx_routes_across_expert_owners(config, world, topk, activation, early, mma):
+    config["model"].update(num_experts=32, num_shared_experts=0, num_topk=topk, activation=activation,
+                           topk_weights_type=early, mma_type=mma)
+    source = world - 1
+    spec = golden.contract(config, world, 3, "fp4" if mma == "fp4xfp4" else "fp8", "balanced", 0)
+    actual = golden.generate(config, spec, [source], workers=1)[source]
+    expected = naive(config, world, source, 3, "balanced", 0)
+    for output, reference in zip(actual, expected):
+        np.testing.assert_array_equal(output, reference)
+
+
 @pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8", "fp4xfp4"])
 def test_gelu_prequant_weights_all_precisions_match_independent_oracle(config, mma_type):
     config["model"].update(activation="gelu", mma_type=mma_type)

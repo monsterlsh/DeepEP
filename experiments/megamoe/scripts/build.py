@@ -62,24 +62,13 @@ def build(root=ROOT, *, rebuild_shmem=False):
     if beta == "ON":
         run([sys.executable, "-c", "import torch, torch_npu; print(torch.__version__, torch_npu.__version__)"])
 
-    def submodule(name, revision):
-        source = root / "third-party" / name
-        if not (source / ".git").exists():
-            run(["git", "submodule", "update", "--init", "--recursive", "--", f"third-party/{name}"])
-
-        # 不对已初始化子模块自动 checkout，避免覆盖用户修改或隐藏版本漂移。
-        def git(*args):
-            return subprocess.check_output(["git", "-C", str(source), *args], env=git_env, text=True).strip()
-
-        if git("rev-parse", "HEAD") != revision or git("status", "--porcelain", "--untracked-files=normal"):
-            raise RuntimeError(f"{source} must be clean and pinned to {revision}; review it before updating")
-
-    if "SHMEM_ROOT" not in env:
-        submodule("shmem", lock["shmem"]["revision"])
+    if "SHMEM_ROOT" not in env and not (root / "third-party/shmem/.git").exists():
+        run(["git", "submodule", "update", "--init", "--recursive", "--", "third-party/shmem"])
     run([sys.executable, "-m", "pip", "install", "-r", str(root / "requirements-build.txt")])
     if "SHMEM_ROOT" not in env:
-        prepare(root, rebuild=rebuild_shmem, if_needed=True)
-        env["SHMEM_ROOT"] = str(root / "third-party/shmem/install/shmem")
+        # SDK preparation owns the checkout, revision, local edits and artifact checks.
+        manifest = prepare(root, rebuild=rebuild_shmem, if_needed=True)
+        env["SHMEM_ROOT"] = str(manifest.parent)
     env["LD_LIBRARY_PATH"] = str(Path(env["SHMEM_ROOT"]) / "lib") + ":" + env.get("LD_LIBRARY_PATH", "")
     # 复用与外部 SDK 同样走原有完整预检，主构建仍只有一个 CMake/wheel 路径。
     sys.path.insert(0, str(ROOT))

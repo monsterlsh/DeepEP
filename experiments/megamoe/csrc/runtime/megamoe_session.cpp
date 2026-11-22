@@ -21,7 +21,14 @@ SessionOptions options_for(const std::string& backend, int size, bool windowed)
         options.maximum_bytes = 1ULL << 30;
         return options;
     }
-    if (backend != "urma") throw std::invalid_argument("MegaMoE backend must be mte or urma");
+    if (backend == "mte_roce") {
+        if (windowed || size != 32) throw std::invalid_argument("MegaMoE MTE+RoCE requires the non-URMA EP32 runtime");
+        options.maximum_bytes = 1ULL << 30;
+        options.required_peer_transports = ACLSHMEM_TRANSPORT_MTE;
+        options.megamoe_hierarchical_roce = true;
+        return options;
+    }
+    if (backend != "urma") throw std::invalid_argument("MegaMoE backend must be mte, mte_roce or urma");
 
     options.maximum_bytes = 32ULL << 30;
     if (windowed) {

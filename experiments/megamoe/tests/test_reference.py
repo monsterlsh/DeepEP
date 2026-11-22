@@ -92,6 +92,19 @@ def test_fp8_cascade_passes_e8m0_as_full_quantization_scales():
     assert "antiquant_scale" not in call and "weight_dtype" not in call
 
 
+def test_fp4_cascade_uses_two_packed_operands_and_mx_scales():
+    cascade = SimpleNamespace(
+        mma_type="fp4xfp4", fp4="e2m1x2", e8m0_operator="e8m0",
+        npu=SimpleNamespace(npu_grouped_matmul=lambda **kwargs: [kwargs]),
+        torch=SimpleNamespace(uint8=np.uint8, bfloat16="bf16"),
+    )
+    scale = np.array([125, 131], dtype=np.uint8)
+    call = CascadeReference._gmm(cascade, "packed x", scale, "counts", ("packed w", scale))
+    assert call["x_dtype"] == call["weight_dtype"] == "e2m1x2"
+    assert call["scale_dtype"] == call["per_token_scale_dtype"] == "e8m0"
+    assert call["scale"][0] is scale and "antiquant_scale" not in call
+
+
 def test_local_moe_decomposition_and_empty_expert():
     rng = np.random.default_rng(7)
     x = rng.normal(size=(3, 32)).astype(np.float32) * 0.1

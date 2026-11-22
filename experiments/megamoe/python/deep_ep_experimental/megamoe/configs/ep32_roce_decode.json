@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "model": {
+    "hidden": 3584,
+    "intermediate_hidden": 1280,
+    "num_experts": 384,
+    "num_topk": 8,
+    "num_shared_experts": 0,
+    "mma_type": "fp8xfp4",
+    "activation": "swiglu",
+    "topk_weights_type": 0
+  },
+  "bs_values": [32],
+  "warmup": 20,
+  "iters": 30,
+  "seed": 20260922
+}

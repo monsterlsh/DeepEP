@@ -13,12 +13,13 @@ if [[ $(type -t conda) != function ]]; then
 fi
 conda activate py311_tpr || return 1
 
-export CANN_ENV=/usr/local/Ascend/cann-9.2.T101/set_env.sh
+export CANN_ENV="${UBX_CANN_SETUP:-/usr/local/Ascend/cann-9.2.T101/set_env.sh}"
 if [[ ! -r "$CANN_ENV" ]]; then
     printf 'Cannot read UBX CANN environment: %s\n' "$CANN_ENV" >&2
     return 1
 fi
 source "$CANN_ENV" || return 1
+export UBX_CANN_LOADED="$CANN_ENV"
 
 export PYTHON="${CONDA_PREFIX:?Conda activation failed}/bin/python"
 if [[ ! -x "$PYTHON" ]]; then

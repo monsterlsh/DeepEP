@@ -53,14 +53,16 @@ python experiments/megamoe/scripts/stage_mte_windows.py --nproc-per-node 8 \
 
 W2048 的 A/B 对称区合计为 832 MiB。单独执行 GELU 时，全量输入与路由 165.724 MiB、输出 306.875 MiB、准备好的模型权重 159.375 MiB。合并两份 Plan 与单个对称区，单卡已知常驻量约 1687.562 MiB，另需 CANN 系统工作区、路由排序临时张量、运行时分配及框架缓存。`paired.json` 的 `layout.prepared_plan_bytes` 给出按实际设备准备的两侧 scratch，`resources_by_rank` 记录独立于计时区间的 Torch 分配峰值和设备剩余内存。
 
-## UBX 共同支持的配置
+## UBX URMA 对照
 
-原 UBX SwiGLU 支持机内 EP8/16、K≤8、每卡 B≤16384。以下示例在一台 UBX 上使用 E32、K8、B257。设置 `EP=8` 或 `16`。两个公共接口各自在独立的进程中初始化其实际通信后端。脚本对两次独立进程的输入和权重使用同一生成规则。每一对使用相邻独占作业，逐对交替先后顺序。每个作业预热两次，采三次同步端到端延迟。结果只适用于测量的拓扑和配置。UBX EP32/K25 没有原 SwiGLU 同配置基线。
+当前 UBX EP16 和 EP32 的端到端配对、首窗掩盖率和验收使用统一入口的 `compare`。[UBX 性能对照](../README.md#ubx-gelu-与-swiglu-性能对照)
+
+旧版公共接口的 EP8 实验仍可用 `--isolated-arm`。以下在一台 UBX 上测 E32、K8、B257。两侧各自在独立进程初始化通信，每对作业相邻执行并逐对交换顺序。每个作业预热两次，记录三次同步端到端延迟。
 
 ```bash
 set -e
 export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:29180
-EP=16
+EP=8
 ROOT="runs/ubx-isolated-ep$EP-k8-b257"
 for pair in {0..7}; do
   arms=(gelu swiglu)
@@ -73,6 +75,8 @@ for pair in {0..7}; do
 done
 python experiments/megamoe/scripts/summarize_isolated_pairs.py "$ROOT" --pairs 8 --require-no-regression
 ```
+
+## 950 MTE 独立进程配对
 
 950 的 K32、H4096、W2048 下每个实现单独需要 528 MiB 对称区。两份合计超过单会话的 1 GiB 上限，可以交替启动独立进程作业。以下命令每侧各运行 8 次，保存每个作业的原始轮次、所用窗口及汇总时延比。把 `balanced` 改为 `skewed` 测热点，使用新输出目录。
 

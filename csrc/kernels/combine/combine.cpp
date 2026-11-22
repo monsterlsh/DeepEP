@@ -2761,13 +2761,9 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward
                 }
                 const uint64_t token_server_bits = source_mask_ub.GetValue(mask_batch_index * mask_words_per_slot);
                 ++mask_batch_index;
-                uint32_t servers[16];
-                uint32_t partial_num = 0;
-                for (uint32_t server = 0; server < server_num; ++server) {
-                    if (token_server_bits & (1ULL << server)) {
-                        servers[partial_num++] = server;
-                    }
-                }
+                uint32_t servers[ascend_deepep::kCombineReturnMaskSlots];
+                const uint32_t partial_num = ascend_deepep::CollectCombineReturnSlots(token_server_bits, server_num,
+                                                                                     servers);
                 trace_recorder.Add(combine_profile::SummarySlot, combine_profile::FinalRows, partial_num);
                 profile.Add(diagnostics::FinalRows, partial_num);
                 profile.ChunkAdd(chunks::Rows, partial_num);

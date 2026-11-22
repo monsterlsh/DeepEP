@@ -1842,7 +1842,7 @@ def test_ep256_combine_cli(monkeypatch, tmp_path):
             "--tokens",
             "4096",
             "--topk",
-            "6",
+            "32",
             "--experts",
             "512",
             "--route",
@@ -1859,7 +1859,7 @@ def test_ep256_combine_cli(monkeypatch, tmp_path):
     monkeypatch.setitem(_notify, "_launch", lambda args, worker: calls.append(args))
     main()
     (args,) = calls
-    assert (args.ep_size, args.node_rank, args.tokens, args.topk, args.experts) == (256, 31, 4096, 6, 512)
+    assert (args.ep_size, args.node_rank, args.tokens, args.topk, args.experts) == (256, 31, 4096, 32, 512)
     assert not args.check_dispatch
     assert args.without_weights and args.profile_op == "combine"
     assert args.route == "random" and args.seed == 2026
@@ -1886,7 +1886,7 @@ int main()
 {
     using ascend_deepep::CombineReturnRow;
     for (uint32_t world : {2U, 4U, 8U, 16U, 32U, 64U, 128U, 256U, 512U}) {
-        for (uint32_t topk : {1U, 6U, 16U}) {
+        for (uint32_t topk : {1U, 6U, 16U, 17U, 25U, 32U}) {
             uint32_t servers = ascend_deepep::CombineReturnSlots(world, topk);
             assert(servers >= (world + 7U) / 8U && servers >= topk);
             auto t = ascend_deepep::MakeCombineTiling(0, world, 16384, topk, 1, 1, 512);
@@ -1903,6 +1903,17 @@ int main()
         }
     }
     assert(CombineReturnRow(INT32_MIN, 64, 511) == uint64_t(INT32_MAX));
+    uint32_t selected[ascend_deepep::kCombineReturnMaskSlots];
+    for (uint32_t count : {17U, 25U, 32U, 64U}) {
+        const uint64_t mask = UINT64_MAX >> (64U - count);
+        assert(ascend_deepep::CollectCombineReturnSlots(mask, count, selected) == count);
+        for (uint32_t slot = 0; slot < count; ++slot) {
+            assert(selected[slot] == slot);
+        }
+    }
+    const uint64_t sparse = (1ULL << 63U) | (1ULL << 31U) | (1ULL << 16U) | 1ULL;
+    assert(ascend_deepep::CollectCombineReturnSlots(sparse, 64U, selected) == 4U);
+    assert(selected[0] == 0 && selected[1] == 16 && selected[2] == 31 && selected[3] == 63);
 }
 """,
         encoding="utf-8",
@@ -2108,9 +2119,9 @@ void run()
 
     notify = (root / "csrc/kernels/notify/notify.cpp").read_text(encoding="utf-8")
     scale = (root / "csrc/kernels/dispatch/scale_pipeline.hpp").read_text(encoding="utf-8")
+    helpers += '\n#include "kernels/notify/route_encoding.hpp"\n'
     helpers += "\nnamespace destination_test {\nconstexpr uint32_t kNotifySimtThreads = 128, kSimtThreads = 128;\n"
     helpers += "constexpr uint32_t kTileTokens = ascend_deepep::kNotifyLocalTopkTileTokens, kMetaFields = 6;\n"
-    helpers += notify[notify.index("constexpr uint32_t kWireRankMask") : notify.index("template <uint32_t CoreCount")]
     helpers += "template <uint32_t CoreCount, bool RankDedup = false>\n" + function(notify, "ParseLocalTopkTokensVf")
     helpers += "template <bool CachedHist, uint32_t CoreCount, bool RankDedup>\n" + function(notify, "ParseLocalTopkVf")
     helpers += "template <uint32_t CoreCount>\n" + function(notify, "NotifyResolveDstVf")
@@ -2185,7 +2196,7 @@ void large_shape_test()
     local_gateway_parse_test<64>();
     for (uint32_t world : {8U, 16U, 512U}) {
         using namespace destination_test;
-        constexpr uint32_t tokens = 35, topk = 16;
+        constexpr uint32_t tokens = 35, topk = 32;
         const uint32_t experts = world * 2, stride = (experts + world + 15) / 16 * 16;
         std::vector<int64_t> indices(tokens * topk), masks(tokens, -1), fallback_masks(tokens, -1);
         std::vector<int32_t> meta(tokens * topk * 6, -97), fallback(meta.size(), -97), cache(3 * 16 * topk * 2, -97);
@@ -2221,7 +2232,7 @@ void large_shape_test()
                     for (uint32_t field : {0U, 1U, 2U, 3U, 5U})
                         assert(row[field] == fallback[(t * topk + k) * 6 + field]);
                 }
-                assert(masks[t] == int64_t((1U << peers.size()) - 1));
+                assert(masks[t] == int64_t((1ULL << peers.size()) - 1));
             }
         }
     }
@@ -2234,12 +2245,16 @@ void large_shape_test()
         assert(uint64_t(mask) == ((1ULL << 63) | (1ULL << 32) | 1ULL));
         assert(meta[6 + 1] == 511 && meta[12 + 1] == 511 && meta[12 + 2] == 1 && meta[18] == -1);
         for (uint32_t rank = 0; rank < 512; ++rank)
-            for (uint32_t k = 0; k < 16; ++k) {
-                const uint32_t word = rank | (k << kWirePrimaryTopkShift) | ((15 - k) << kWireSecondaryTopkShift);
-                assert((word & kWireRankMask) == rank);
-                assert(((word >> kWirePrimaryTopkShift) & kWireTopkMask) == k);
-                assert(((word >> kWireSecondaryTopkShift) & kWireTopkMask) == 15 - k);
-            }
+            for (uint32_t primary = 0; primary < 32; ++primary)
+                for (uint32_t secondary = 0; secondary < 32; ++secondary) {
+                    const uint32_t word = ascend_deepep::PackNotifyRoute(rank, primary, secondary);
+                    assert((word & ascend_deepep::kNotifyWireRankMask) == rank);
+                    assert(ascend_deepep::NotifyRoutePrimarySlot(word) == primary);
+                    assert(ascend_deepep::NotifyRouteSecondarySlot(word) == secondary);
+                    if (primary < 16 && secondary < 16) {
+                        assert(word == (rank | (primary << 9U) | (secondary << 13U)));
+                    }
+                }
     }
     constexpr uint32_t n = 6;
     int32_t meta[n * 6]{}, bases[512]{}, stride = 1 << 27;
@@ -3116,8 +3131,9 @@ def main():
         parser.error("--notify-num-cores 32 requires the default Notify-only Combine test")
     if args.dispatch_dtype == "fp8" and not args.check_dispatch:
         parser.error("--dispatch-dtype fp8 requires --with-dispatch")
-    if args.ep_size > 512 or not 1 <= args.tokens <= 16384 or not 1 <= args.topk <= 16 or args.repeat < 1:
-        parser.error("EP<=512, tokens1..16384, topk1..16, repeat>=1 required")
+    max_topk = _notify["MAX_TOPK"]
+    if args.ep_size > 512 or not 1 <= args.tokens <= 16384 or not 1 <= args.topk <= max_topk or args.repeat < 1:
+        parser.error(f"EP<=512, tokens1..16384, topk1..{max_topk}, repeat>=1 required")
     if args.experts < args.ep_size or args.experts > 1024 or args.experts % args.ep_size:
         parser.error("experts must be divisible by EP and <=1024")
     if args.route == "sq_pressure" and (
