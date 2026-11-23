@@ -415,6 +415,136 @@ def test_inline_model_reaches_both_ubx_nodes_and_950pod(tmp_path, monkeypatch):
     assert pod_stages == ["golden", "accuracy"]
 
 
+@pytest.mark.parametrize(("machine", "ep_size", "cli_flag"), [("ubx", 16, True), ("ubx", 32, False), ("950pod", 32, True)])
+@pytest.mark.parametrize(("stage", "model_config", "activation", "precision"), [
+    ("decode", "ep32_roce_decode", "swiglu", "w8a8"),
+    ("decode", "ep32_roce_decode", "gelu", "w8a8"),
+    ("prefill", "target_gelu_k25", "gelu", "w8a8"),
+    ("prefill", "target_gelu_k25", "gelu", "w4a4"),
+])
+def test_cascade_comparison_reaches_workers_and_reads_reports(
+    tmp_path, monkeypatch, capsys, machine, ep_size, cli_flag, stage, model_config, activation, precision,
+):
+    spec = json.loads((launcher.CONFIG_DIR / f"{model_config}.json").read_text(encoding="utf-8"))
+    spec["model"]["activation"] = activation
+    bs, = spec["bs_values"]
+    backend = "mte_roce" if machine == "ubx" and ep_size == 32 else "mte"
+    data = dict(schema_version=1, machine=machine, ep_size=ep_size, backend=backend, mode="perf",
+                precision="all" if stage == "decode" and activation == "gelu" else precision,
+                config=spec, output_dir="run", master_addr="192.0.2.1")
+    input_kind = "fp4" if precision == "w4a4" else "fp8"
+    stage_field = f"compare_{stage}_cascade"
+    stage_option = f"--compare-{stage}-cascade"
+    if not cli_flag:
+        data[stage_field] = True
+    if backend == "mte_roce":
+        data["node_ip"] = ["192.0.2.1", "192.0.2.2"]
+    if machine == "950pod":
+        data["node_rank"] = 1
+        spec["model"]["topk_weights_type"] = 0
+    source = tmp_path / "run.json"
+    source.write_text(json.dumps(data), encoding="utf-8")
+    launched = []
+
+    def run_logged(command, env, log):
+        assert stage_option in command and "--timer" not in command
+        assert "--dual-reference" not in command and "--golden-dir" not in command
+        assert command[command.index("--input") + 1] == input_kind
+        output = Path(command[command.index("--output-dir") + 1])
+        config = json.loads(Path(command[command.index("--config") + 1]).read_text(encoding="utf-8"))
+        assert config["model"]["activation"] == activation
+        assert config["model"]["mma_type"] == launcher.MMA_TYPES[precision]
+        assert config["model"]["topk_weights_type"] == spec["model"]["topk_weights_type"]
+        assert command[command.index("--bs-values") + 1] == str(bs)
+        ranks_per_node = 8 if machine == "950pod" else 16
+        node = next((int(opt.partition("=")[2]) for opt in command if opt.startswith("--node-rank=")), 0)
+        for rank in range(node * ranks_per_node, (node + 1) * ranks_per_node):
+            rank_dir = output / f"rank_{rank}"
+            case = rank_dir / f"bs_{bs}"
+            case.mkdir(parents=True)
+            manifest = dict(backend=backend, mode="perf", ep_size=ep_size, rank=rank, ranks_per_node=ranks_per_node,
+                            routing="balanced", input=input_kind, config=config)
+            manifest[stage_field] = True
+            (rank_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            report = {
+                arm: {key: {"rank_max_mean_us": value} for key in ("kernel_sum", "device_span", "host_e2e")}
+                for arm, value in (("fused", 25), (f"{stage}_cascade", 50))
+            }
+            (case / f"{stage}_comparison.json").write_text(json.dumps(report), encoding="utf-8")
+        launched.append(node)
+
+    def run_stage(label, scripts, logs, **ssh):
+        assert label == f"run-perf-{precision}"
+        for script in scripts.values():
+            worker_args = shlex.split(script.splitlines()[-1])[3:]
+            assert launcher.entrypoint(worker_args) == 0
+
+    monkeypatch.setenv("DEEPEP_950POD_BOOTSTRAPPED", "1")
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "run_logged", run_logged)
+    monkeypatch.setattr(launcher, "run_stage", run_stage)
+    argv = ["--run-config", str(source)] + ([stage_option] if cli_flag else [])
+    assert launcher.entrypoint(argv) == 0
+    assert launched == ([1] if machine == "950pod" else [0, 1] if ep_size == 32 else [0])
+    printed = capsys.readouterr().out
+    assert "融合 25.000 us，级联 50.000 us，融合加速 2.000x" in printed
+    assert f"{stage}_comparison.json" in printed
+
+
+@pytest.mark.parametrize(("args", "message"), [
+    (["--mode", "accuracy"], "mode=perf"),
+    (["--mode", "perf", "--timer"], "timer"),
+    (["--mode", "perf", "--precision", "a4w4"], "A8W4 和 A8W8"),
+    (["--mode", "perf", "--weighting", "early"], "Finalize"),
+    (["--mode", "perf", "--bs", "513"], "BS <= 512"),
+    (["--mode", "perf", "--topk", "25"], "TopK <= 16"),
+])
+def test_decode_comparison_rejects_incomparable_cases(args, message, capsys):
+    with pytest.raises(SystemExit, match="2"):
+        launcher.parse_args(["--backend", "mte", "--config", "ep32_roce_decode", "--compare-decode-cascade", *args])
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("extra_args", "message"), [
+    (["--precision", "a8w4", "--weighting", "late"], "仅支持 A8W8"),
+    (["--precision", "a8w8"], "Finalize"),
+])
+def test_decode_gelu_requires_a8w8_and_finalize_weights(extra_args, message, capsys):
+    with pytest.raises(SystemExit, match="2"):
+        launcher.parse_args([
+            "--mode", "perf", "--backend", "mte", "--config", "ep32_roce_decode",
+            "--compare-decode-cascade", "--activation", "gelu", *extra_args,
+        ])
+    assert message in capsys.readouterr().err
+
+
+def test_prefill_comparison_option_rejects_swiglu_or_decode_flag(capsys):
+    args = ["--mode", "perf", "--backend", "mte", "--config", "ep32_roce_decode", "--compare-prefill-cascade"]
+    with pytest.raises(SystemExit, match="2"):
+        launcher.parse_args(args)
+    assert "要求 GELU" in capsys.readouterr().err
+    with pytest.raises(SystemExit, match="2"):
+        launcher.parse_args([*args, "--compare-decode-cascade"])
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_prefill_comparison_fp4_respects_native_backend_limits(tmp_path, capsys):
+    flags = ["--mode", "perf", "--config", "target_gelu_k25", "--compare-prefill-cascade"]
+    with pytest.raises(SystemExit, match="2"):
+        launcher.parse_args([*flags, "--backend", "urma", "--precision", "a4w4"])
+    assert "URMA 暂不支持 W4A4" in capsys.readouterr().err
+    assert launcher.parse_args([*flags, "--backend", "urma", "--precision", "all"]).perf_precisions == ("w4a8", "w8a8")
+    assert launcher.parse_args([*flags, "--backend", "mte", "--precision", "all"]).perf_precisions == (
+        "w4a8", "w8a8", "w4a4",
+    )
+
+    preset = launcher.SCRIPT.parent / "configs/950pod_target.json"
+    data = launcher.read_run_config(preset)
+    data.update(mode="perf", precision="a4w4", compare_prefill_cascade=True)
+    with pytest.raises(ValueError, match="950POD A4W4 需要 EP32"):
+        launcher.pod_settings(tmp_path / "run.json", data)
+
+
 @pytest.mark.parametrize("fault", [None, "manifest", "kernel", "host", "throughput", "missing"])
 def test_950pod_ep32_perf_only(tmp_path, monkeypatch, capsys, fault):
     preset = launcher.SCRIPT.parent / "configs/950pod_target.json"

@@ -272,6 +272,11 @@ def main():
     )
     parser.add_argument("--relative-rmse", type=float, default=0.02, help="Timer on/off output tolerance only")
     parser.add_argument("--dual-reference", action="store_true", help="Compare CPU Golden and NPU cascade")
+    comparison = parser.add_mutually_exclusive_group()
+    comparison.add_argument("--compare-decode-cascade", action="store_true",
+                            help="Compare fused MegaMoE with the moe_test Decode operator cascade")
+    comparison.add_argument("--compare-prefill-cascade", action="store_true",
+                            help="Compare fused MegaMoE with the GELU AllToAll Prefill cascade")
     args = parser.parse_args()
     config = load_config(args.config, args.bs_values)
     if args.check_tokens < 0 or not 0 < args.relative_rmse < 1:
@@ -282,6 +287,12 @@ def main():
         parser.error("--perf-scope timer requires --timer")
     if args.perf_scope == "host" and args.timer:
         parser.error("--perf-scope host cannot be combined with --timer")
+    cascade_kind = "decode" if args.compare_decode_cascade else ("prefill" if args.compare_prefill_cascade else None)
+    if cascade_kind:
+        try:
+            _validate_cascade_comparison(args, config, cascade_kind)
+        except ValueError as error:
+            parser.error(str(error))
     import torch
     import torch_npu  # noqa: F401 - Registers NPU dtype/device/stream support.
     from .api import StoreGroup
@@ -298,6 +309,21 @@ def main():
         raise
 
 
+def _validate_cascade_comparison(args, config, kind):
+    if (
+        args.mode != "perf" or args.timer or getattr(args, "dual_reference", False)
+        or getattr(args, "paired_weights", False) or getattr(args, "perf_scope", "all") != "all"
+    ):
+        raise ValueError(f"--compare-{kind}-cascade requires plain perf mode (timer off)")
+    model = config["model"]
+    if kind == "decode":
+        from .decode_cascade import validate_decode_case
+
+        validate_decode_case(config)
+    elif model.get("activation", "swiglu") != "gelu" or model["num_shared_experts"]:
+        raise ValueError("Prefill comparison requires GELU and zero shared experts")
+
+
 def run(args, config, group):
     from .backend import select_backend
 
@@ -312,6 +338,11 @@ def run(args, config, group):
     ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", world))
     perf_scope = getattr(args, "perf_scope", "all")
     paired_weights = bool(getattr(args, "paired_weights", False))
+    model = config["model"]
+    compare_decode = bool(getattr(args, "compare_decode_cascade", False))
+    compare_prefill = bool(getattr(args, "compare_prefill_cascade", False))
+    decode_gelu = compare_decode and model.get("activation") == "gelu"
+    cascade_kind = "decode" if compare_decode else ("prefill" if compare_prefill else None)
     urma_window_tokens = getattr(args, "urma_window_tokens", None)
     collective_check(
         group,
@@ -330,11 +361,35 @@ def run(args, config, group):
             bool(getattr(args, "dual_reference", False)),
             perf_scope,
             paired_weights,
+            compare_decode,
+            compare_prefill,
             urma_window_tokens,
             requested_backend,
         ),
     )
-    model = config["model"]
+    if cascade_kind:
+        if compare_decode and compare_prefill:
+            raise ValueError("Select a single cascade comparison")
+        _validate_cascade_comparison(args, config, cascade_kind)
+        import torch_npu
+
+        required_ops = ["npu_dynamic_mx_quant", "npu_grouped_matmul"]
+        if compare_decode:
+            required_ops += ["npu_moe_distribute_dispatch_v2", "npu_moe_distribute_combine_v2"]
+            required_ops.append("npu_format_cast" if decode_gelu else "npu_grouped_matmul_swiglu_quant_v2")
+        else:
+            required_ops += ["npu_moe_init_routing_v2", "npu_moe_re_routing", "npu_moe_finalize_routing"]
+        missing = [name for name in required_ops if not callable(getattr(torch_npu, name, None))]
+        collective_check(group, "cascade operators", f"Missing torch_npu operators: {', '.join(missing)}" if missing else None)
+        if decode_gelu:
+            from .decode_cascade import load_fused_gelu_op
+
+            error = None
+            try:
+                load_fused_gelu_op()
+            except Exception as failure:
+                error = f"{type(failure).__name__}: {failure}"
+            collective_check(group, "Decode fused GELU operator", error)
     mma_type = model.get("mma_type", "fp8xfp4")
     if roce and (paired_weights or urma_window_tokens is not None):
         raise ValueError("MTE+RoCE does not accept --paired-weights or --urma-window-tokens")
@@ -448,6 +503,14 @@ def run(args, config, group):
         kernel_duration_scope="sum_of_window_kernels_per_forward" if perf_scope == "all" else None,
         timer_scope="first_window_only" if args.timer else "disabled",
     )
+    if cascade_kind:
+        manifest[f"compare_{cascade_kind}_cascade"] = True
+        manifest["kernel_duration_scope"] = "all_forward_device_tasks"
+    if compare_decode:
+        manifest["decode_gmm1_operator"] = (
+            "cann_ops_transformer.ops.grouped_matmul_activation_quant"
+            if decode_gelu else "torch_npu.npu_grouped_matmul_swiglu_quant_v2"
+        )
     (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     def device_pair(pair):
@@ -495,13 +558,22 @@ def run(args, config, group):
 
         cascade_owned = init_process_group(group)
         cascade = CascadeReference(model, raw, shared_raw, host_group=group)
-    guard = None
-    if urma and args.mode == "perf" and perf_scope == "all":
+    guard = perf_cascade = None
+    if cascade_kind or (urma and args.mode == "perf" and perf_scope == "all"):
         from .performance import UrmaLaunchGuard
 
         alignment = config["alignment"]
         guard = UrmaLaunchGuard(group, (alignment["rows"], alignment["cols"]), alignment["repeats"])
-        guard.prepare_per_call_alignment()
+        if compare_decode:
+            from .decode_cascade import DecodeCascade
+
+            perf_cascade = DecodeCascade(model, raw, host_group=group)
+        elif compare_prefill:
+            from .prefill_cascade import GeluPrefillCascade
+
+            perf_cascade = GeluPrefillCascade(model, raw, host_group=group)
+        else:
+            guard.prepare_per_call_alignment()
         manifest["alignment"] = guard.describe()
         (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     for bs in config["bs_values"]:
@@ -539,7 +611,7 @@ def run(args, config, group):
                 **shared_kwargs,
             )
 
-        if urma:
+        if urma and not cascade_kind:
             # Shared dimensions are inferred by native forward. Allocate its
             # workspace before profiling, using the same public call as MTE.
             if args.mode == "perf":
@@ -559,7 +631,7 @@ def run(args, config, group):
         resources_path.write_text(json.dumps(resources, indent=2), encoding="utf-8")
         timer = _allocate_case_timer(buffer, group, bs, rank in timer_ranks) if args.timer and not roce else None
         prefix = None
-        if not urma and perf_scope == "all" and (args.mode == "perf" or (args.timer and not roce)):
+        if not cascade_kind and not urma and perf_scope == "all" and (args.mode == "perf" or (args.timer and not roce)):
             error = None
             try:
                 alignment = config["alignment"]
@@ -575,7 +647,7 @@ def run(args, config, group):
                     f"batch_iterations={config['iters']}",
                     flush=True,
                 )
-        if not (urma and args.mode == "perf" and perf_scope == "all"):
+        if not cascade_kind and not (urma and args.mode == "perf" and perf_scope == "all"):
             for _ in range(config["warmup"]):
                 if args.mode == "perf":
                     flush_l2_before_call()
@@ -635,6 +707,40 @@ def run(args, config, group):
                     f"[ACCURACY] BS={bs} all {world} ranks passed ({args.input}, sampled={args.check_tokens})",
                     flush=True,
                 )
+        elif perf_cascade is not None:
+            from .cascade_performance import measure_cascade_comparison
+
+            ids = buffer.topk_idx[:bs]
+            weights = buffer.topk_weights[:bs]
+            quantized = (buffer.x[:bs], buffer.x_sf[:bs]) if args.input != "bf16" else None
+
+            def call_cascade():
+                return perf_cascade.forward(activation, ids, weights, input_kind=args.input, quantized=quantized)
+
+            # Materialize workspace and lazy operator initialization on both arms before sampling.
+            call()
+            call_cascade()
+            torch.npu.synchronize()
+            group.barrier(f"{cascade_kind} comparison setup BS={bs}")
+            comparison = measure_cascade_comparison(
+                call, call_cascade, group, torch, config, case, bs, ranks_per_node, guard, cascade_kind=cascade_kind,
+                expected_fused_windows=windows_by_bs[bs],
+            )
+            comparison.update(fused_backend=backend, input=args.input, model=model, routing=args.routing,
+                              ep_size=world, per_rank_tokens=bs, windows_per_fused_forward=windows_by_bs[bs])
+            if compare_decode:
+                comparison["decode_cascade"]["gmm1_operator"] = manifest["decode_gmm1_operator"]
+            if decode_gelu:
+                comparison["fused"]["gelu_variant"] = "erf"
+                comparison["decode_cascade"]["gelu_variant"] = "tanh"
+            if compare_prefill:
+                from .prefill_cascade import FFN_ROW_TILE, PREFILL_TOKEN_WINDOW
+
+                comparison.update(prefill_token_window=PREFILL_TOKEN_WINDOW, ffn_row_tile=FFN_ROW_TILE)
+            report_path = case / f"{cascade_kind}_comparison.json"
+            report_path.write_text(json.dumps(comparison, indent=2), encoding="utf-8")
+            if rank == 0:
+                print(f"[CASCADE PERF] BS={bs} {report_path}", flush=True)
         elif urma and perf_scope == "all":
             from .performance import measure_profiled_forward, summarize_profile_rounds
 
@@ -676,7 +782,7 @@ def run(args, config, group):
                     f"(last ceil(iters/2); kernel Duration; rank-min mean; timer off)",
                     flush=True,
                 )
-        if args.mode == "perf" and perf_scope != "timer":
+        if args.mode == "perf" and perf_scope != "timer" and not cascade_kind:
             if perf_scope == "host":
                 report = dict(windows_per_forward=windows_by_bs[bs])
                 performance_path = case / "performance.json"

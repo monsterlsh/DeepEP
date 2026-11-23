@@ -16,12 +16,33 @@
 
 namespace DEEPEP_MEGAMOE_IMPL_NAMESPACE {
 
+HOST_DEVICE bool MteA8W4LinearStorageEligible(const MegaMoeTilingData& tilingData)
+{
+    if (tilingData.topoType != TOPO_TYPE_MTE || tilingData.epWorldSize != 32U || tilingData.topK > 8U ||
+        tilingData.groupedMatmulMode != GROUPED_MATMUL_MODE_A8W4 ||
+        tilingData.combineQuantMode != COMBINE_NO_QUANT || tilingData.topkWeightsPrefetch != 0U ||
+        tilingData.actMode != static_cast<uint8_t>(MegaMoeActMode::SWIGLU)) {
+        return false;
+    }
+
+    // Original EP32 SwiGLU keeps logical rows resident so AIV1 can run
+    // Dispatch, activation and Combine independently. Bound the per-row
+    // allocation and retain the three-slot layout for high-fan-out workloads.
+    constexpr uint64_t linearStorageBudgetBytes = 32ULL << 30;
+    const uint64_t input = tilingData.h;
+    const uint64_t activation = tilingData.hiddenDim / ACTIVATION_N_HALF;
+    const uint64_t scale = (input + activation) / MXFP_SCALE_GROUP_NUM;
+    const uint64_t bytesPerRow = input + activation + scale + 32U + 2U * (tilingData.hiddenDim + input);
+    return static_cast<uint64_t>(tilingData.maxOutputSize) * bytesPerRow <= linearStorageBudgetBytes;
+}
+
 HOST_DEVICE uint32_t MteWorkspaceWindowSlots(const MegaMoeTilingData& tilingData)
 {
     const bool unsupported = tilingData.topoType != TOPO_TYPE_MTE || tilingData.combineQuantMode != COMBINE_NO_QUANT ||
                              tilingData.groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
                              tilingData.groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ;
-    return WaveWindowSlotCount(!unsupported, tilingData.groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4);
+    return WaveWindowSlotCount(!unsupported && !MteA8W4LinearStorageEligible(tilingData),
+                               tilingData.groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4);
 }
 
 HOST_DEVICE bool MteGeluLinearWindowEligible(const MegaMoeTilingData& tilingData)

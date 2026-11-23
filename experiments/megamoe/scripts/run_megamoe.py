@@ -42,6 +42,8 @@ FORWARDED_ENV = (
 )
 COMPARISON_PLAN = "comparison-plan.json"
 COMPARISON_REPORT = "comparison.json"
+CASCADE_STAGES = ("decode", "prefill")
+A8_PRECISIONS = ("w4a8", "w8a8")
 WEIGHT_MODE = {"gelu": 1, "swiglu": 0}
 DEVICE_CHECK = """
 import sys
@@ -153,6 +155,44 @@ def validate_geometry(model, ep_size):
         raise ValueError("TopK 必须在 1..32 且不能超过全局专家数")
 
 
+def add_cascade_arguments(parser):
+    options = parser.add_mutually_exclusive_group()
+    for stage in CASCADE_STAGES:
+        options.add_argument(f"--compare-{stage}-cascade", action="store_true",
+                             help=f"在 perf 中对照融合与 {stage.capitalize()} 小算子级联")
+
+
+def cascade_stage(args):
+    stages = [stage for stage in CASCADE_STAGES if getattr(args, f"compare_{stage}_cascade")]
+    if len(stages) > 1:
+        raise ValueError("Decode 和 Prefill 级联对照参数互斥")
+    return stages[0] if stages else None
+
+
+def decode_cascade_precisions(model):
+    return ("w8a8",) if model.get("activation") == "gelu" else A8_PRECISIONS
+
+
+def validate_cascade_comparison(stage, model, bs, mode, precisions, dual_reference):
+    if mode != "perf" or dual_reference:
+        raise ValueError("小算子级联对照要求 mode=perf 且关闭 dual_reference")
+    activation = model.get("activation", "swiglu")
+    weight_mode = model.get("topk_weights_type", WEIGHT_MODE.get(activation))
+    if stage == "decode":
+        if set(precisions) - set(decode_cascade_precisions(model)):
+            if activation == "gelu":
+                raise ValueError("Decode GELU 融合小算子仅支持 A8W8")
+            raise ValueError("Decode SwiGLU 小算子级联对照支持 A8W4 和 A8W8")
+        if (activation not in WEIGHT_MODE or type(weight_mode) is not int or weight_mode != 0
+                or model["num_shared_experts"] != 0 or model.get("activation_clamp") is not None):
+            raise ValueError("Decode 级联对照要求无截断的 SwiGLU 或 GELU、Finalize 加权、零共享专家")
+        if bs > 512 or model["num_topk"] > 16 or model["num_experts"] > 1024:
+            raise ValueError("Decode 级联对照要求每卡 BS <= 512、TopK <= 16、专家总数 <= 1024")
+    elif (activation != "gelu" or model["num_shared_experts"] != 0
+          or type(weight_mode) is not int or weight_mode not in (0, 1)):
+        raise ValueError("Prefill 级联对照要求 GELU、零共享专家，以及提前或 Finalize 加权")
+
+
 def read_run_config(path):
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or type(data.get("schema_version")) is not int or data["schema_version"] != 1:
@@ -173,7 +213,8 @@ def run_config_arguments(path, parser, argv, cli, data=None):
     strings = {"mode", "precision", "backend", "activation", "weighting", "input", "stage", "master_addr",
                "ssh_user", "config", "output_dir", "comparison_arm", "perf_scope"}
     integers = {"ep_size", "node_rank", "master_port", "shmem_port", "ssh_port", "bs", "topk", "window_tokens", "pairs"}
-    flags = {"timer", "force", "force_cpu", "force_npu", "plan", "report_only", "require_no_regression", "paired_weights"}
+    flags = {"timer", "force", "force_cpu", "force_npu", "plan", "report_only", "require_no_regression", "paired_weights",
+             "compare_decode_cascade", "compare_prefill_cascade"}
     env_types = dict(python=str, cann_env=str, golden_dir=str, run_base=str, routing=str, check_tokens=int,
                      golden_workers=int, dual_reference=bool)
     try:
@@ -288,6 +329,7 @@ def parse_args(argv, run_config=None):
                         help="在 accuracy 或 perf 中单测 GELU 提前加权或 SwiGLU Finalize 加权")
     parser.add_argument("--perf-scope", choices=("all", "host", "timer"), default="all", help=argparse.SUPPRESS)
     parser.add_argument("--paired-weights", action="store_true", help=argparse.SUPPRESS)
+    add_cascade_arguments(parser)
     args = parser.parse_args(argv)
     run_environment = {}
     comparison = comparison_settings({})
@@ -296,6 +338,7 @@ def parse_args(argv, run_config=None):
             args.run_config.resolve(), parser, argv, args, run_config,
         )
         args = parser.parse_args([*config_argv, *argv])
+    args.cascade_stage = cascade_stage(args)
     args.run_environment = run_environment
     args.arm_models, comparison_precisions = comparison
     if args.mode and args.mode_option:
@@ -315,7 +358,7 @@ def parse_args(argv, run_config=None):
             parser.error("MTE 和 MTE+RoCE 使用独立精度/性能轮，A/B 参数适用于 URMA")
         if args.perf_scope != "all":
             parser.error("MTE 和 MTE+RoCE 使用默认性能采样范围")
-    elif args.precision == "w4a4":
+    elif args.precision == "w4a4" and args.cascade_stage != "decode":
         parser.error("URMA 暂不支持 W4A4。EP16 使用 --backend mte，EP32 使用 --backend mte_roce")
     if args.ep_size == 16:
         if args.node_ip or args.node_rank is not None or args.stage:
@@ -422,16 +465,18 @@ def parse_args(argv, run_config=None):
     except (OSError, ValueError, AttributeError, KeyError, TypeError) as error:
         parser.error(f"无法读取 {config_source}：{error}")
 
-    supported = ("w4a8", "w8a8") if args.backend == "urma" else tuple(MMA_TYPES)
+    supported = A8_PRECISIONS if args.backend == "urma" else tuple(MMA_TYPES)
+    if args.cascade_stage == "decode":
+        supported = decode_cascade_precisions(model)
     wanted = supported if args.precision in (None, "all") else (args.precision,)
     if args.mode == "compare" and args.precision is None:
         wanted = comparison_precisions
     elif roce and args.precision is None:
-        wanted = ("w4a8",)
+        wanted = supported[:1]
     args.accuracy_precisions = wanted if args.mode in ("accuracy", "both") else ()
     args.perf_precisions = wanted if args.mode == "compare" else ()
     if args.mode in ("perf", "both"):
-        args.perf_precisions = wanted if args.precision else ("w4a8",)
+        args.perf_precisions = wanted if args.precision else supported[:1]
     if args.comparison_arm is not None and args.mode not in ("accuracy", "perf"):
         parser.error("--comparison-arm 用于单测 accuracy 或 perf")
     if args.comparison_arm is not None and args.activation is not None:
@@ -439,6 +484,13 @@ def parse_args(argv, run_config=None):
     if args.window_tokens is not None and args.mode != "compare" and not args.paired_weights:
         parser.error("--window-tokens 用于 compare")
     selected = set(args.accuracy_precisions) | set(args.perf_precisions)
+    if args.cascade_stage:
+        if args.timer or args.perf_scope != "all" or args.paired_weights or args.comparison_arm is not None:
+            parser.error("小算子级联对照使用独立性能报告，请关闭 timer、perf-scope 和 GELU/SwiGLU A/B 参数")
+        try:
+            validate_cascade_comparison(args.cascade_stage, model, args.bs, args.mode, selected, args.dual_reference)
+        except ValueError as error:
+            parser.error(str(error))
     if args.input is not None and any(input_kind(precision) != args.input for precision in selected):
         parser.error("W4A4 需要 fp4 输入，W4A8/W8A8 需要 fp8 输入，混合精度可省略 --input")
     if args.timer and args.backend == "mte" and selected - {"w4a8", "w4a4"}:
@@ -577,6 +629,24 @@ def runtime_identity(python, env):
     return None
 
 
+def cascade_perf_lines(case_dir, stage):
+    path = case_dir / f"{stage}_comparison.json"
+    report = json.loads(path.read_text(encoding="utf-8"))
+    lines = []
+    for metric, label in (("kernel_sum", "kernel 耗时总和"), ("device_span", "设备时间跨度"),
+                          ("host_e2e", "同步端到端时延")):
+        try:
+            fused = report["fused"][metric]["rank_max_mean_us"]
+            cascade = report[f"{stage}_cascade"][metric]["rank_max_mean_us"]
+        except (KeyError, TypeError) as error:
+            raise ValueError(f"{path} 缺少 {metric} 的融合或 {stage.capitalize()} 级联统计") from error
+        if any(type(value) not in (int, float) or not 0 < value < float("inf") for value in (fused, cascade)):
+            raise ValueError(f"{path} 的 {metric} 必须为有限正值")
+        lines.append(f"[{stage.upper()} PERF] {label}（最慢 rank 均值）融合 {fused:.3f} us，"
+                     f"级联 {cascade:.3f} us，融合加速 {cascade / fused:.3f}x")
+    return [*lines, f"[{stage.upper()} PERF] 全组报告 {path}"]
+
+
 def report_lines(directory, args, mode, precision):
     rank_dir = directory / f"rank_{args.node_rank * LOCAL_RANKS}"
     manifest_path = rank_dir / "manifest.json"
@@ -589,6 +659,10 @@ def report_lines(directory, args, mode, precision):
     case_dir = rank_dir / f"bs_{args.bs}"
     if mode == "accuracy":
         return [f"[ACCURACY] 全组报告 {case_dir / 'accuracy.json'}"]
+    if args.cascade_stage:
+        if manifest.get(f"compare_{args.cascade_stage}_cascade") is not True:
+            raise ValueError(f"{manifest_path} 缺少 {args.cascade_stage.capitalize()} 级联对照运行标记")
+        return cascade_perf_lines(case_dir, args.cascade_stage)
     if args.perf_scope == "timer":
         return [f"[TIMER] 诊断目录 {directory}"]
     report_path = case_dir / ("performance.json" if args.backend == "urma" else "profiling.json")
@@ -624,6 +698,8 @@ def run_case(python, env, args, mode, precision, config):
         extra.extend(("--perf-scope", args.perf_scope))
     if args.paired_weights:
         extra.extend(("--paired-weights", "--urma-window-tokens", str(args.window_tokens or 256)))
+    if args.cascade_stage:
+        extra.append(f"--compare-{args.cascade_stage}-cascade")
     if args.timer:
         ranks = ",".join(map(str, ubx_timer_ranks(args.ep_size)))
         extra.extend(("--timer", "--timer-ranks", ranks))
@@ -737,6 +813,8 @@ def orchestrate(args, env):
             argv.append("--paired-weights")
             if args.window_tokens is not None:
                 argv.extend(("--window-tokens", str(args.window_tokens)))
+        if args.cascade_stage:
+            argv.append(f"--compare-{args.cascade_stage}-cascade")
         scripts = {
             rank: node_script(REPO_ROOT, extra_env, ENV_SCRIPT, [*argv, "--node-rank", str(rank)])
             for rank in (0, 1)
@@ -791,6 +869,8 @@ def main(argv=None, run_config=None):
             timer_ranks=ubx_timer_ranks(args.ep_size) if args.timer else [],
             routing=args.routing, config=dict(args.spec, model=case_model(args), bs_values=[args.bs]),
         )
+        if args.cascade_stage:
+            plan[f"compare_{args.cascade_stage}_cascade"] = True
         print(json.dumps(plan, indent=2, ensure_ascii=False))
         return 0
     if args.report_only:
@@ -876,7 +956,7 @@ def pod_settings(path, data):
         run_base=os.environ.get("RUN_BASE") or str(REPO_ROOT / "benchmark-runs"), output_dir="",
         python=os.environ.get("PYTHON") or "", base_python=os.environ.get("BASE_PYTHON") or POD_PYTHON,
         cann_env=os.environ.get("CANN_ENV") or POD_CANN_ENV, backend="mte",
-        golden_only=False, skip_golden=False, plan=False,
+        golden_only=False, skip_golden=False, plan=False, compare_decode_cascade=False, compare_prefill_cascade=False,
     )
     unknown = data.keys() - settings.keys() - {"schema_version", "machine", "mode", "precision", "config", "bs"}
     if unknown:
@@ -892,6 +972,7 @@ def pod_settings(path, data):
                 value = str((path.parent / Path(value).expanduser()).resolve())
             settings[name] = value
     args = argparse.Namespace(**settings)
+    args.cascade_stage = cascade_stage(args)
     args.machine, args.mode, args.precision = data["machine"], data["mode"], parse_precision(data["precision"])
     if args.backend != "mte" or args.mode not in {"accuracy", "perf"} or args.precision not in {*MMA_TYPES, "all"}:
         raise ValueError("950POD 使用 MTE，mode 支持 accuracy 或 perf，precision 支持 a8w4、a8w8、a4w4 或 all")
@@ -913,13 +994,14 @@ def pod_settings(path, data):
 
     args.spec = data["config"]
     model = args.spec["model"]
-    if args.precision == "w4a4":
-        if args.ep_size != 32:
-            raise ValueError("950POD A4W4 需要 EP32（四台各 8 卡）")
-        if model.get("activation") not in WEIGHT_MODE or model["num_shared_experts"] != 0:
-            raise ValueError("950POD A4W4 支持 GELU 或 SwiGLU，且要求零共享专家")
-    elif model.get("activation") != "gelu":
-        raise ValueError("950POD 入口需要 GELU 模型")
+    if not args.cascade_stage:
+        if args.precision == "w4a4":
+            if args.ep_size != 32:
+                raise ValueError("950POD A4W4 需要 EP32（四台各 8 卡）")
+            if model.get("activation") not in WEIGHT_MODE or model["num_shared_experts"] != 0:
+                raise ValueError("950POD A4W4 支持 GELU 或 SwiGLU，且要求零共享专家")
+        elif model.get("activation") != "gelu":
+            raise ValueError("950POD 入口需要 GELU 模型")
     validate_geometry(model, args.ep_size)
     if "bs" in data:
         args.bs = data["bs"]
@@ -930,6 +1012,12 @@ def pod_settings(path, data):
         args.bs = batches[0]
     if type(args.bs) is not int or not 1 <= args.bs <= 65536:
         raise ValueError("bs 必须在 1..65536")
+    precisions = decode_cascade_precisions(model) if args.cascade_stage == "decode" else A8_PRECISIONS
+    args.precisions = precisions if args.precision == "all" else (args.precision,)
+    if args.cascade_stage:
+        validate_cascade_comparison(args.cascade_stage, model, args.bs, args.mode, args.precisions, args.dual_reference)
+        if args.precision == "w4a4" and args.ep_size != 32:
+            raise ValueError("950POD A4W4 需要 EP32（四台各 8 卡）")
     args.python = args.python or args.base_python
     return args
 
@@ -941,6 +1029,8 @@ def pod_perf_report(args, output, first, spec, precision):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         expected = dict(backend="mte", mode="perf", ep_size=args.ep_size, rank=rank,
                         ranks_per_node=POD_RANKS, routing=args.routing, input=input_kind(precision))
+        if args.cascade_stage:
+            expected[f"compare_{args.cascade_stage}_cascade"] = True
         if any(manifest.get(key) != value for key, value in expected.items()):
             raise ValueError(f"{manifest_path} 与本轮 950POD 性能配置不符")
         settings = manifest["config"]
@@ -948,7 +1038,13 @@ def pod_perf_report(args, output, first, spec, precision):
             settings["model"].get(key) != value for key, value in spec["model"].items()
         ):
             raise ValueError(f"{manifest_path} 的模型或 BS 与本轮配置不符")
-        report_path = rank_dir / f"bs_{args.bs}" / "profiling.json"
+        case_dir = rank_dir / f"bs_{args.bs}"
+        if args.cascade_stage:
+            lines = cascade_perf_lines(case_dir, args.cascade_stage)
+            if rank == first:
+                summary = lines
+            continue
+        report_path = case_dir / "profiling.json"
         report = json.loads(report_path.read_text(encoding="utf-8"))
         host = report["host_e2e"]
         times = (report["rank_max_mean_us"], host["rank_max_mean_us"], host["global_input_tokens_per_second"])
@@ -956,6 +1052,8 @@ def pod_perf_report(args, output, first, spec, precision):
             raise ValueError(f"{report_path} 的 kernel、host_e2e 时延和吞吐必须为有限正值")
         if rank == first:
             summary = (report_path, host["rank_max_mean_us"], host["global_input_tokens_per_second"])
+    if args.cascade_stage:
+        return "\n".join(summary)
     path, latency, throughput = summary
     return f"[PERF] 最慢 rank 的同步端到端均值 {latency / 1000:.3f} ms，全组吞吐量 {throughput:,.0f} token/s\n[PERF] 全组报告 {path}"
 
@@ -991,6 +1089,8 @@ def run_pod_case(args, precision, python, env, first):
     ]
     if args.mode == "accuracy" and args.dual_reference:
         command.append("--dual-reference")
+    if args.cascade_stage:
+        command.append(f"--compare-{args.cascade_stage}-cascade")
     with (args.output_dir / f"{args.mode}-{label}.log").open("w", encoding="utf-8") as log:
         run_logged(command, env, log)
         if args.mode == "perf":
@@ -1016,8 +1116,9 @@ def run_pod(path, data):
     if not os.environ.get("DEEPEP_950POD_BOOTSTRAPPED"):
         env = dict(os.environ, DEEPEP_950POD_BOOTSTRAPPED="1")
         base_lib = str(Path(args.base_python).parent.parent / "lib")
+        extra = [f"--compare-{args.cascade_stage}-cascade"] if args.cascade_stage else []
         os.execvpe("bash", ["bash", "-c", POD_BOOTSTRAP, "950pod-env", args.cann_env, args.python, base_lib,
-                           str(SCRIPT), "--run-config", str(path)], env)
+                           str(SCRIPT), "--run-config", str(path), *extra], env)
 
     python = sys.executable
     env = dict(os.environ, DEEPEP_SHMEM_ENDPOINT=f"tcp://{args.master_addr}:{args.shmem_port}",
@@ -1036,8 +1137,7 @@ def run_pod(path, data):
     first = args.node_rank * POD_RANKS
     print(f"[950 POD] EP{args.ep_size} rank {first}-{first + POD_RANKS - 1} {path.name} "
           f"B{args.bs} {args.routing}\n[950 POD] 输出目录 {args.output_dir}", flush=True)
-    precisions = ("w4a8", "w8a8") if args.precision == "all" else (args.precision,)
-    for precision in precisions:
+    for precision in args.precisions:
         run_pod_case(args, precision, python, env, first)
     return 0
 
@@ -1051,10 +1151,14 @@ def entrypoint(argv=None):
 
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--run-config", required=True, type=Path, help="包含机型和全部测试参数的 JSON")
+    add_cascade_arguments(parser)
     args = parser.parse_args(argv)
     path = args.run_config.resolve()
     try:
         data = read_run_config(path)
+        stage = cascade_stage(args)
+        if stage:
+            data[f"compare_{stage}_cascade"] = True
         if data.get("machine") not in ("ubx", "950pod"):
             raise ValueError("machine 必须为 ubx 或 950pod")
         if data.get("mode") not in MODES or not isinstance(data.get("precision"), str):
@@ -1065,7 +1169,8 @@ def entrypoint(argv=None):
             raise ValueError("config 必须包含 schema_version=1 的内嵌模型 JSON")
         if data["machine"] == "ubx":
             data.setdefault("backend", "mte_roce" if data.get("ep_size") == 32 else "mte")
-            return cli(["--run-config", str(path)], data)
+            extra = [f"--compare-{stage}-cascade"] if stage else []
+            return cli(["--run-config", str(path), *extra], data)
         return run_pod(path, data)
     except subprocess.CalledProcessError as error:
         print(f"[950 POD] 子进程退出，状态 {error.returncode}。", file=sys.stderr)

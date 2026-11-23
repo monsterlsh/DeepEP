@@ -612,6 +612,16 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         UpdateGmmLoopCount(gmmLoopCount_, LoopCountIndex::GMM2, ++gmm2Count);
     }
     timer_.SetWave(AscendTimer::NO_WAVE);
+    if constexpr (g_coreType == AIV && CombineQuantMode == COMBINE_NO_QUANT) {
+        if (GetSubBlockIdx() == 1U && sharedExpertNum_ > 0U) {
+            // The ring path bypassed the priority loop that normally publishes
+            // shared activation completion for AIC's shared GMM2.
+            SharedActivationCursor shared{};
+            while (!shared.done) {
+                TryRunSharedExpertActivation(shared);
+            }
+        }
+    }
 }
 
 template <TemplateMegaMoeA8W4WaveTypeClass>

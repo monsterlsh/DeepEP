@@ -227,6 +227,29 @@ int main() {
         }
         checkStorage(wideTail, 3584U);
     }
+    // The EP32 native SwiGLU Finalize benchmarks use their original
+    // resident row layout so the independent AIV1 scheduler can run.
+    const PlatformInfo pod{32, 64, 248 * 1024, 0, 0};
+    for (int bs : {96, 4096}) for (int shared : {0, 1}) {
+        auto legacy = MakeTiling(bs, 7168, 6144, 6, 12, 32, bs, 0, true, false, shared, pod, 0, "swiglu");
+        assert(MteWorkspaceWindowSlots(legacy) == 1 && !MteWorkspaceWindowed(legacy));
+        assert(MteWorkspaceRowCapacity(legacy) == static_cast<uint64_t>(bs) * 32 * 6);
+        StoragePolicy<false> policy{{&legacy, {nullptr, nullptr}}, {32, 12, 2},
+                                    static_cast<unsigned>(shared), {12, 32}};
+        readyWaits = prefixReads = 0;
+        policy.SelectWaveStorage();
+        assert(!policy.reuseWaveSlots_ && readyWaits == 0 && prefixReads == 0);
+        assert(MapWaveRow(policy.WaveStorage(4, 1024), 1037) == 1037);
+
+        auto early = legacy;
+        early.topkWeightsPrefetch = 1;
+        assert(MteWorkspaceWindowed(early));
+        auto gelu = legacy;
+        gelu.actMode = static_cast<uint8_t>(MegaMoeActMode::GELU);
+        assert(MteWorkspaceWindowed(gelu));
+    }
+    auto large = MakeTiling(4096, 7168, 6144, 6, 12, 32, 65536, 0, true, false, 1, pod, 0, "swiglu");
+    assert(MteWorkspaceWindowSlots(large) == 3 && MteWorkspaceWindowed(large));
     // The public 39,280 rows include a 112-row tail at W256. Both GMM inputs
     // are nibble-packed in A4W4, including the output of GELU/SwiGLU.
     for (int topk : {25, 32}) for (int rows : {256, 39280 % 256}) for (int early : {0, 1}) {
