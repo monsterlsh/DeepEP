@@ -52,7 +52,7 @@ struct QuantProcessScratch {
 template <typename TopkWeightsType, typename ActivationType, bool TopkWeightsPrefetch>
 __aicore__ inline void LoadTopkWeightsToUb(const Params& params, const QuantProcessConfig& config,
                                            QuantProcessScratch<ActivationType>& scratch,
-                                           const LocalTensor<ActivationType>& xOutTensor, int32_t tokenIndex,
+                                           const LocalTensor<uint8_t>& xOutTensor, int32_t tokenIndex,
                                            TEventID event)
 {
     if constexpr (TopkWeightsPrefetch) {
@@ -168,7 +168,9 @@ __aicore__ inline void QuantizeLocalTokens(const AivJobContext& job, const MoeSt
         bool useFirstBuffer = index % DOUBLE_BUFFER == 0;
         auto event = useFirstBuffer ? EVENT_ID0 : EVENT_ID1;
         auto xInTensor = useFirstBuffer ? scratch.xInTensor0 : scratch.xInTensor1;
-        auto xOutTensor = useFirstBuffer ? scratch.xOutTensor0 : scratch.xOutTensor1;
+        // Scale and top-k positions in the packed record are byte offsets.
+        auto xOutTensor = (useFirstBuffer ? scratch.xOutTensor0 : scratch.xOutTensor1)
+                              .template ReinterpretCast<uint8_t>();
         WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event);
         DataCopyPad(xInTensor, srcGlobalTensor[static_cast<uint64_t>(index) * hiddenDim], xCopyInParams,
                     xCopyInPadParams);
@@ -194,8 +196,7 @@ __aicore__ inline void QuantizeLocalTokens(const AivJobContext& job, const MoeSt
         }
         SetFlag<AscendC::HardEvent::V_MTE3>(event);
         WaitFlag<AscendC::HardEvent::V_MTE3>(event);
-        auto xOutBytesTensor = xOutTensor.template ReinterpretCast<uint8_t>();
-        DataCopyPad(dstGlobalTensor[static_cast<uint64_t>(index) * config.quantTokenScaleAlignBytes], xOutBytesTensor,
+        DataCopyPad(dstGlobalTensor[static_cast<uint64_t>(index) * config.quantTokenScaleAlignBytes], xOutTensor,
                     xCopyOutParams);
         SetFlag<AscendC::HardEvent::MTE3_MTE2>(event);
     }

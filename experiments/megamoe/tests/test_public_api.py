@@ -812,6 +812,56 @@ def test_a4w4_rejects_unsupported_topology(backend):
         api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, mma_type="fp4xfp4")
 
 
+@pytest.mark.parametrize("activation", ["gelu", "swiglu"])
+def test_pod_a4w4_target_uses_fp4_mte_full_and_tail_plans(backend, monkeypatch, activation):
+    gather_control = api.gather_control
+
+    def gather(group, stage, value):
+        if stage == "MTE A4W4 host layout":
+            return [f"host-{rank // 8}" for rank in range(group.size())]
+        return gather_control(group, stage, value)
+
+    monkeypatch.setattr(api, "gather_control", gather)
+    monkeypatch.setattr(backend.ext, "mte_a4w4_enabled", True, raising=False)
+    monkeypatch.setattr(backend.ext, "mte_plan_bytes", lambda *args, **kwargs: 4096, raising=False)
+    torch = sys.modules["torch"]
+
+    def shape_only(shape, dtype, device):
+        return Tensor(np.broadcast_to(np.zeros((), dtype=DTYPES[dtype]), shape), dtype, device)
+
+    monkeypatch.setattr(torch, "empty", shape_only)
+    monkeypatch.setattr(torch, "empty_like", lambda tensor, dtype: shape_only(tensor.shape, dtype, tensor.device))
+    b = api.SymmBuffer(backend.group_type(32), 800, 39280, 25, 4096, 1536, ranks_per_node=8,
+                       backend="mte", mma_type="fp4xfp4", activation=activation)
+    try:
+        assert b.x.shape == (39280, 2048) and b.x.dtype == "uint8"
+        assert b.ranks_per_node == 8 and b.window_tokens == 256 and b.num_forward_windows(39280) == 154
+        assert not b.timer_enabled
+        monkeypatch.setattr(backend.ext, "mte_a4w4_timer_enabled", True, raising=False)
+        assert b.timer_enabled
+        b.prepare(39280)
+        for plan, rows in ((b._plan, 256), (b._tail_plan, 112)):
+            assert plan.bs == rows and plan.max_tokens == 256 and plan.local_experts == 25
+            assert plan.mma_type == "fp4xfp4" and plan.backend == "mte"
+            assert plan.topk_weights_type == int(activation == "gelu")
+    finally:
+        b.destroy()
+
+
+def test_pod_a4w4_rejects_noncontiguous_hosts(backend, monkeypatch):
+    gather_control = api.gather_control
+
+    def gather(group, stage, value):
+        if stage == "MTE A4W4 host layout":
+            return [f"host-{rank % 4}" for rank in range(group.size())]
+        return gather_control(group, stage, value)
+
+    monkeypatch.setattr(api, "gather_control", gather)
+    with pytest.raises(ValueError, match="four contiguous 8-rank hosts"):
+        api.SymmBuffer(backend.group_type(32), 800, 39280, 25, 4096, 1536, ranks_per_node=8,
+                       backend="mte", mma_type="fp4xfp4")
+
+
 @pytest.mark.parametrize("transport,world", [("mte", 16), ("mte_roce", 32)])
 @pytest.mark.parametrize("mma", ["fp8xfp4", "fp8xfp8", "fp4xfp4"])
 @pytest.mark.parametrize("activation,weight_mode", [("gelu", 1), ("swiglu", 0)])
@@ -860,12 +910,16 @@ def test_ubx_mx_window_and_tail_forward(backend, monkeypatch, transport, world, 
             assert not b.timer_enabled
             monkeypatch.setattr(ext, "mte_roce_timer_enabled", True, raising=False)
             timer = b.allocate_timer()
+        elif mma == "fp4xfp4":
+            assert not b.timer_enabled
+            monkeypatch.setattr(ext, "mte_a4w4_timer_enabled", True, raising=False)
+            timer = b.allocate_timer()
         api.fp8_fp4_mega_moe(y, *weights, b, activation=activation, cumulative_local_expert_recv_stats=stats, timer=timer)
         launches = native_launches(backend)
         assert [(launch[0].shape[0], launch[-1]) for launch in launches] == [(16, 1), (16, 2), (3, 3)]
         assert all(launch[8] is expected for launch, expected in zip(launches, (timer, None, None)))
         if timer is not None:
-            assert ("validate_timer", timer, "mte_roce") in backend.events
+            assert ("validate_timer", timer, transport) in backend.events
         assert b._plan.topk_weights_type == b._tail_plan.topk_weights_type == weight_mode
         assert b._plan.mma_type == b._tail_plan.mma_type == mma
         np.testing.assert_array_equal(stats.data, [6, 9])

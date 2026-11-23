@@ -40,7 +40,7 @@ __schedmode__(1) __global__
             op;
         op.Init(context, x, topk_ids, topk_weights, weight1, weight2, nullptr, weight_scales1, weight_scales2, x_scales,
                 shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
-                workspace, &tiling, nullptr);
+                workspace, &tiling, nullptr, timer);
         op.Process();
     } else if constexpr (IsA8W4) {
         MegaMoeImpl::MegaMoeA8W4Wave<bfloat16_t, bfloat16_t, float, fp4x2_e2m1_t, kDispatchE4M3,

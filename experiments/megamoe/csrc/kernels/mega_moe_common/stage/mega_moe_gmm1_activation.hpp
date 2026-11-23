@@ -180,6 +180,10 @@ __aicore__ inline void Gmm1AicPrefetchMmadGeneric(WorkSet& workSet, const Params
             WaitForGmm1InputReady<IsShared>(gmmAddrInfo, config, mLoc);
             lastWaveWaited = waveIdx;
         }
+        DEEPEP_MEGAMOE_TIMER_TILE_SCOPE tileTimer(
+            gmmAddrInfo.timer,
+            IsShared ? DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIC_SHARED_GMM1 : DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIC_GMM1,
+            mLoc, nLoc, Get<M_VALUE>(actualShape));
         Gmm1AicMmadTileToGmGeneric<BlockMmad, IsGmm1Interleaved>(blockMmad, config, workSet.gmB, workSet.gmScaleB,
                                                                  workSet.gmBias, workSet.gmC, actualShape, mLoc, nLoc,
                                                                  kLoc, gmBlockA, gmBlockScaleA);
@@ -233,6 +237,10 @@ __aicore__ inline void Gmm1AicMmadGeneric(WorkSet& workSet, const GMMAddrInfo& g
             WaitForVector();
         }
 
+        DEEPEP_MEGAMOE_TIMER_TILE_SCOPE tileTimer(
+            gmmAddrInfo.timer,
+            IsShared ? DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIC_SHARED_GMM1 : DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIC_GMM1,
+            mLoc, nLoc, Get<M_VALUE>(actualShape));
         Gmm1AicMmadTileToUbGeneric<BlockMmad, IsGmm1Interleaved>(
             blockMmad, config, workSet.gmB, workSet.gmScaleB, workSet.gmBias, actualShape, nLoc, kLoc, gmBlockA,
             gmBlockScaleA, l0cOutUbFirst, l0cOutUbSecond, pingpongIdx);
@@ -244,6 +252,12 @@ __aicore__ inline void Gmm1AicMmadGeneric(WorkSet& workSet, const GMMAddrInfo& g
         } else {
             NotifyVector();
             vecSetSyncCom = 1;
+        }
+        // NotifyVector is queued on FIX. Only the diagnostic launch waits
+        // for FIX completion on the scalar core before recording the end.
+        if (gmmAddrInfo.timer != nullptr) {
+            AscendC::SetFlag<AscendC::HardEvent::FIX_S>(0);
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(0);
         }
     }
 }

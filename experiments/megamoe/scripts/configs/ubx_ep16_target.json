@@ -36,7 +36,7 @@
     "precision / config.model.mma_type": "a8w4、a8w8、a4w4 分别表示 FP8×FP4、FP8×FP8、FP4×FP4，激活精度在前。all 跑所选后端支持的精度。脚本根据外层 precision 设置每轮的 mma_type。",
     "master_addr / shmem_port": "本机 IPv4 和 SHMEM 引导端口，单机预设使用 127.0.0.1。",
     "comparison.arms": "A 组 gelu 在量化前加权，B 组 swiglu 在 Finalize 加权。外层 activation 选其中一组，外层 mode 控制测精度、性能还是 A/B。",
-    "timer": "是否采集设备 timer。单机 MTE 启用时将 precision 设为 a8w4。",
+    "timer": "是否采集设备 timer。单机 MTE 启用时将 precision 设为 a8w4 或 a4w4，a4w4 需新版支持该打点的 wheel。",
     "config.bs_values": "每卡 token 数，填一个值，例如 [39280]。",
     "config.model.hidden / intermediate_hidden": "输入和输出隐藏维度、激活后的专家中间维度。GMM2 K/N 为 intermediate_hidden/hidden。",
     "config.model.num_experts / num_topk / num_shared_experts": "全局路由专家数、每个 token 选择的专家数、共享专家数。路由专家数应能被 EP 整除，TopK 范围为 1–32。",

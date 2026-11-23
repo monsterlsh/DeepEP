@@ -1,6 +1,6 @@
 # Copyright (c) 2026, Lu Lu
 
-"""Compare native UBX A8W4 first-window, rank-local stage envelopes offline."""
+"""Compare native UBX first-window, rank-local stage envelopes offline."""
 
 import argparse
 from collections import Counter
@@ -24,6 +24,10 @@ else:
 
 
 TOPOLOGIES = {"mte": (16, "shmem_mte"), "mte_roce": (32, "shmem_mte_roce")}
+TIMER_MODES = {
+    "mte": {"fp8xfp4": ("w4a8", "fp8"), "fp4xfp4": ("w4a4", "fp4")},
+    "mte_roce": {"fp8xfp4": ("w4a8", "fp8"), "fp4xfp4": ("w4a4", "fp4")},
+}
 GMM = ("AIC_GMM1", "AIC_GMM2")
 MTE_FAMILIES = (*GMM, "AIV_DISPATCH", "AIV_COMBINE")
 ASYNC = "AIV_COMBINE_ASYNC"
@@ -53,10 +57,14 @@ def read_job(root, arm):
     bs = batches[0]
     require(type(config["seed"]) is int and type(config["iters"]) is int and config["iters"] > 0,
             f"{root}: invalid seed or perf iterations")
+    mma_type = model["mma_type"]
+    require(mma_type in TIMER_MODES[backend],
+            f"{root}: {backend} native overlap supports {', '.join(TIMER_MODES[backend])}")
+    precision, input_kind = TIMER_MODES[backend][mma_type]
     require(model["activation"] == arm and type(model["topk_weights_type"]) is int
             and model["topk_weights_type"] == int(arm == "gelu")
-            and model["mma_type"] == "fp8xfp4" and model["num_shared_experts"] == 0,
-            f"{root}: expected routed-only A8W4 {arm} with weight mode {int(arm == 'gelu')}")
+            and model["num_shared_experts"] == 0,
+            f"{root}: expected routed-only {precision} {arm} with weight mode {int(arm == 'gelu')}")
     window = first["window_tokens"]
     require(type(window) is int and 0 < window <= bs, f"{root}: invalid physical window size")
     windows = (bs + window - 1) // window
@@ -77,7 +85,7 @@ def read_job(root, arm):
     require(first["routing"] in ("balanced", "random", "random-balanced", "skewed"), f"{root}: invalid routing")
     manifests = read_manifests([root], world)
     agreed = dict(
-        config=config, input="fp8", backend=backend, ep_size=world, device_communication=transport,
+        config=config, input=input_kind, backend=backend, ep_size=world, device_communication=transport,
         ranks_per_node=16, mode="perf", perf_scope="all", numerical_contract=CONTRACTS[arm],
         timer_scope="first_window_only", run_id=run_id, build=build, routing=first["routing"],
         paired_weights=first["paired_weights"], timer_ranks=timers, window_tokens=window,
@@ -118,6 +126,7 @@ def read_job(root, arm):
     return dict(
         root=root, run_id=run_id, backend=backend, ep_size=world, ranks_per_node=16, bs=bs,
         config=config, build=build, routing=first["routing"], paired_weights=first["paired_weights"],
+        precision=precision, input=input_kind,
         window_tokens=window, windows_per_forward=windows, timer_token_range_half_open=[0, min(bs, window)],
         timer_ranks=sorted(timers), devices=devices, cases=cases,
         host_e2e=dict(rank_max_mean_us=latency, global_input_tokens_per_second=throughput, rank_max_rounds_us=slowest),
@@ -281,7 +290,7 @@ def rank_phases(job, rank):
 def compare(gelu_root, swiglu_root):
     jobs = {arm: read_job(Path(root), arm) for arm, root in (("gelu", gelu_root), ("swiglu", swiglu_root))}
     gelu, swiglu = (jobs[arm] for arm in ("gelu", "swiglu"))
-    common = ("backend", "ep_size", "ranks_per_node", "bs", "routing", "paired_weights", "window_tokens",
+    common = ("backend", "ep_size", "ranks_per_node", "bs", "routing", "paired_weights", "precision", "input", "window_tokens",
               "windows_per_forward", "timer_token_range_half_open", "timer_ranks")
     differences = [key for key in (*common, "build", "devices") if gelu[key] != swiglu[key]]
     require(not differences, f"A/B manifest mismatch: {', '.join(differences)}")
@@ -310,7 +319,7 @@ def compare(gelu_root, swiglu_root):
     return dict(
         schema="ubx_native_first_window_overlap_v1", scope="rank_local_native_first_window_stage_envelopes",
         physical_mapping="verified" if gelu["devices"] is not None else "unverified", arms=arms,
-        case=dict({key: gelu[key] for key in common}, seed=gelu["config"]["seed"], precision="w4a8",
+        case=dict({key: gelu[key] for key in common}, seed=gelu["config"]["seed"],
                   model=comparable_config(gelu)["model"],
                   build_source_sha256=gelu["build"]["source_sha256"]),
         gelu_minus_swiglu_pp={phase: 100 * (arms["gelu"]["phases"][phase]["overlap_rate"]

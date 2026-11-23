@@ -68,6 +68,8 @@ URMA 的 `compare` 支持 EP16/EP32 的 A8W4、A8W8。A 为 GELU 提前加权，
 
 在 UBX 上对照 GELU 提前加权与 SwiGLU 后加权，按[UBX 掩盖率 A/B 快速开始](scripts/ubx_overlap_quickstart.md)生成运行 JSON、采集两组打点并读取结果。指南分别说明 EP16 MTE、EP32 MTE+RoCE 的本地阶段指标和 URMA 的通信完成指标。
 
+单机 EP16 MTE 可用 `precision=a4w4`、`timer: true` 采集 W4A4 首窗，需安装支持 `mte_a4w4_timer_enabled` 的 wheel。双机 EP32 MTE+RoCE 也支持 W4A4 打点。
+
 要在 MTE+RoCE 上采集设备 timer，在两台 UBX 安装同一份开启 `DEEPEP_MEGAMOE_TIMER` 的新 wheel。复制 EP32 预设，设置 `backend=mte_roce`、`mode=perf`、`precision=a8w4`、`timer: true`，填写 `output_dir`，从节点 0 启动。正式的 `profiling.json` 和同步端到端耗时先按关闭 timer 测量。随后独立诊断轮为默认采样 rank 记录首窗。
 
 MTE+RoCE trace 位于 `perf-<精度>/rank_<R>/bs_<B>/roce_trace.json`，可在 Perfetto 查看。每个采样 rank 同时保存 `roce_timer.bin` 原始缓冲区和 `roce_timer.json` 事件计数、token 范围和时钟单位。各 rank 的 trace 使用各自的设备时间起点。MTE+RoCE 的 trace 包含分层通信事件，现有 URMA 掩盖率汇总使用 URMA 的完成事件。
@@ -91,7 +93,7 @@ python3 experiments/megamoe/scripts/analyze_megamoe_profile.py "$OUT" --overlap 
 python3 "$RUN" --run-config "$CASES/950pod_target.json"
 ```
 
-将 `config.bs_values` 改为 `[257]`、`check_tokens` 改为 `8` 可快速抽样验证。将 `config.model.num_topk` 改为 `32` 可运行 K32。950POD 精度支持 `a8w4`、`a8w8` 或 `all`，通过同一字段 `precision` 选择。
+将 `config.bs_values` 改为 `[257]`、`check_tokens` 改为 `8` 可快速抽样验证。将 `config.model.num_topk` 改为 `32` 可运行 K32。`precision=all` 运行 `a8w4` 和 `a8w8`。四台各 8 卡时也可显式设 `ep_size=32`、`precision=a4w4` 运行 W4A4 精度或性能，要求零共享专家。GELU 使用 `activation=gelu`、`topk_weights_type=1`，SwiGLU 使用 `activation=swiglu`、`topk_weights_type=0`。每组使用独立的 `output_dir`。
 
 B05 和 B07 双机各 8 卡时，在两台的 JSON 中都设 `ep_size=16`、填写相同的 `master_addr`、`output_dir` 和模型与测试参数，`node_rank` 分别设为 `0`、`1`。两台先用 `golden_only: true` 准备各自的 Golden，全部完成后设为 `false`，加上 `skip_golden: true` 并同时启动精度测试。四台各 8 卡对应 `ep_size=32` 和节点序号 0–3。报告位于本轮目录的 `accuracy/rank_<r>/bs_<B>/accuracy.json`，`precision=all` 时按精度分目录。
 

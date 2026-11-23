@@ -53,7 +53,7 @@ from deep_ep_experimental.megamoe.api import _extension
 local, require_w8a8 = int(sys.argv[1]), sys.argv[2] == "1"
 backend = sys.argv[3] if len(sys.argv) > 3 else "urma"
 precision = sys.argv[4] if len(sys.argv) > 4 else None
-require_roce_timer = len(sys.argv) > 5 and sys.argv[5] == "1"
+require_timer = len(sys.argv) > 5 and sys.argv[5] == "1"
 count = torch.npu.device_count()
 if count < local:
     sys.exit(f"UBX 每机需要 {local} 张可见 NPU，当前只有 {count} 张。")
@@ -68,10 +68,14 @@ if backend == "mte_roce" and not getattr(extension, "mte_roce_enabled", False):
     sys.exit("当前 MegaMoE wheel 未启用 EP32 MTE+RoCE，请在两台主机安装同版本的新版 wheel。")
 if backend == "mte_roce" and not getattr(extension, "mte_roce_mx_enabled", False):
     sys.exit("当前 MegaMoE wheel 未启用新版 MTE+RoCE 矩阵精度与分块支持。")
-if require_roce_timer and not getattr(extension, "mte_roce_timer_enabled", False):
+if backend == "mte_roce" and require_timer and not getattr(extension, "mte_roce_timer_enabled", False):
     sys.exit("MTE+RoCE 设备 timer 需要两台节点安装支持此功能并启用 DEEPEP_MEGAMOE_TIMER 的 wheel。")
-if backend == "mte" and precision == "w4a4" and not getattr(extension, "mte_a4w4_enabled", False):
-    sys.exit("当前 MegaMoE wheel 未启用单机 MTE W4A4。")
+if backend == "mte" and precision == "w4a4":
+    if not getattr(extension, "mte_a4w4_enabled", False):
+        sys.exit("当前 MegaMoE wheel 未启用单机 MTE W4A4。")
+    if require_timer and not (getattr(extension, "timer_enabled", False) and
+                              getattr(extension, "mte_a4w4_timer_enabled", False)):
+        sys.exit("单机 MTE W4A4 设备 timer 需要安装启用此功能的 DEEPEP_MEGAMOE_TIMER wheel。")
 print(f"[UBX] MegaMoE wheel: {extension.__file__}", flush=True)
 """
 
@@ -437,8 +441,8 @@ def parse_args(argv, run_config=None):
     selected = set(args.accuracy_precisions) | set(args.perf_precisions)
     if args.input is not None and any(input_kind(precision) != args.input for precision in selected):
         parser.error("W4A4 需要 fp4 输入，W4A8/W8A8 需要 fp8 输入，混合精度可省略 --input")
-    if args.timer and args.backend == "mte" and selected - {"w4a8"}:
-        parser.error("本机 MTE 设备 timer 需要 W4A8")
+    if args.timer and args.backend == "mte" and selected - {"w4a8", "w4a4"}:
+        parser.error("本机 MTE 设备 timer 请指定 w4a8 或 w4a4")
     if model["num_shared_experts"] and selected - {"w4a8"}:
         parser.error("共享专家要求 W4A8 路由专家")
     return args
@@ -820,7 +824,8 @@ def main(argv=None, run_config=None):
     @cache
     def check_device(precision):
         extra = [args.backend, precision] if args.backend != "urma" else []
-        if args.backend == "mte_roce" and args.timer and args.stage != "prepare":
+        check_native_timer = args.backend == "mte_roce" or (args.backend == "mte" and precision == "w4a4")
+        if check_native_timer and args.timer and args.stage != "prepare":
             extra.append("1")
         subprocess.run(
             [python, "-c", DEVICE_CHECK, str(LOCAL_RANKS), str(int(precision == "w8a8" and args.backend == "urma")), *extra],
@@ -888,8 +893,8 @@ def pod_settings(path, data):
             settings[name] = value
     args = argparse.Namespace(**settings)
     args.machine, args.mode, args.precision = data["machine"], data["mode"], parse_precision(data["precision"])
-    if args.backend != "mte" or args.mode not in {"accuracy", "perf"} or args.precision not in {"w4a8", "w8a8", "all"}:
-        raise ValueError("950POD 使用 MTE，mode 支持 accuracy 或 perf，precision 支持 a8w4、a8w8 或 all")
+    if args.backend != "mte" or args.mode not in {"accuracy", "perf"} or args.precision not in {*MMA_TYPES, "all"}:
+        raise ValueError("950POD 使用 MTE，mode 支持 accuracy 或 perf，precision 支持 a8w4、a8w8、a4w4 或 all")
     if args.ep_size not in (8, 16, 32) or not 0 <= args.node_rank < args.ep_size // POD_RANKS:
         raise ValueError("950POD 支持 EP8/16/32，每机 8 卡，node_rank 从 0 开始")
     if not args.master_addr:
@@ -908,7 +913,12 @@ def pod_settings(path, data):
 
     args.spec = data["config"]
     model = args.spec["model"]
-    if model.get("activation") != "gelu":
+    if args.precision == "w4a4":
+        if args.ep_size != 32:
+            raise ValueError("950POD A4W4 需要 EP32（四台各 8 卡）")
+        if model.get("activation") not in WEIGHT_MODE or model["num_shared_experts"] != 0:
+            raise ValueError("950POD A4W4 支持 GELU 或 SwiGLU，且要求零共享专家")
+    elif model.get("activation") != "gelu":
         raise ValueError("950POD 入口需要 GELU 模型")
     validate_geometry(model, args.ep_size)
     if "bs" in data:
@@ -970,6 +980,8 @@ def run_pod_case(args, precision, python, env, first):
     if args.golden_only:
         return
 
+    if precision == "w4a4":
+        options.extend(("--backend", "mte"))
     output = args.output_dir / (f"{args.mode}-{precision}" if args.precision == "all" else args.mode)
     command = [
         python, "-I", "-c", "from torch.distributed.run import main; main()", "--rdzv-backend=static",

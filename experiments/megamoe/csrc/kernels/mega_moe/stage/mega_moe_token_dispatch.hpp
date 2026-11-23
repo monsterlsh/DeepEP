@@ -100,24 +100,26 @@ __aicore__ inline TokenDispatchConfig CreateTokenDispatchConfig(const Params& pa
 }
 
 template <typename ActivationType>
-__aicore__ inline LocalTensor<ActivationType> GetDispatchCopyBuffer(const TokenDispatchConfig& context,
-                                                                    const TokenDispatchScratch<ActivationType>& scratch,
-                                                                    int32_t bufferIdx)
+__aicore__ inline LocalTensor<uint8_t> GetDispatchCopyBuffer(const TokenDispatchConfig& context,
+                                                           const TokenDispatchScratch<ActivationType>& scratch,
+                                                           int32_t bufferIdx)
 {
-    return LocalTensor<ActivationType>(
+    // Records and their field offsets are measured in bytes. AscendC indexes
+    // an FP4 tensor in logical nibbles, which would halve these offsets.
+    return LocalTensor<uint8_t>(
         TPosition::VECCALC,
         scratch.copyTmpBaseAddr + static_cast<uint32_t>(bufferIdx) * context.quantTokenScaleAlignBytes,
-        context.quantTokenScaleAlignBytes / sizeof(ActivationType));
+        context.quantTokenScaleAlignBytes);
 }
 
 template <bool IsBufferReuse, bool TopkWeightsPrefetch, typename ActivationType>
 __aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& context, const Params& params,
                                                      TokenDispatchScratch<ActivationType>& scratch, int32_t bufferIdx,
                                                      int32_t topkIndex, int32_t remoteRankIdx,
-                                                     GlobalTensor<ActivationType>& remoteRankGlobalTensor)
+                                                     GlobalTensor<uint8_t>& remoteRankGlobalTensor)
 {
     TEventID eventId = static_cast<TEventID>(bufferIdx);
-    LocalTensor<ActivationType> copyTmpTensor = GetDispatchCopyBuffer(context, scratch, bufferIdx);
+    auto copyTmpTensor = GetDispatchCopyBuffer(context, scratch, bufferIdx);
     int32_t tokenIndex = topkIndex / static_cast<int32_t>(params.tilingData->topK);
     uint64_t remoteCopyOffset =
         static_cast<uint64_t>(tokenIndex) * static_cast<uint64_t>(context.quantTokenScaleAlignBytes);
@@ -148,18 +150,17 @@ __aicore__ inline void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
                                                      TokenDispatchScratch<ActivationType>& scratch, int32_t bufferIdx,
                                                      int32_t copyIdx)
 {
-    GlobalTensor<ActivationType> tokenRevGlobalTensor;
+    GlobalTensor<uint8_t> tokenRevGlobalTensor;
     GlobalTensor<QuantScaleType> scaleRevGlobalTensor;
     GlobalTensor<int32_t> metaInfoGlobalTensor;
-    tokenRevGlobalTensor.SetGlobalBuffer(
-        reinterpret_cast<__gm__ ActivationType*>(params.workspaceInfo.dispatchRevDataPtr));
+    tokenRevGlobalTensor.SetGlobalBuffer(params.workspaceInfo.dispatchRevDataPtr);
     scaleRevGlobalTensor.SetGlobalBuffer(
         reinterpret_cast<__gm__ QuantScaleType*>(params.workspaceInfo.dispatchRevScalePtr));
     metaInfoGlobalTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr));
     TEventID eventId = static_cast<TEventID>(bufferIdx);
     const uint64_t storageCopyIdx = MapWaveRow(context.waveMapping, static_cast<uint64_t>(copyIdx));
     WaitFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
-    LocalTensor<ActivationType> tokenScaleBuffer = GetDispatchCopyBuffer(context, scratch, bufferIdx);
+    auto tokenScaleBuffer = GetDispatchCopyBuffer(context, scratch, bufferIdx);
     LocalTensor<QuantScaleType> scaleBuffer =
         tokenScaleBuffer[context.quantTokenAlignBytes].template ReinterpretCast<QuantScaleType>();
     if constexpr (TopkWeightsPrefetch) {
@@ -171,8 +172,9 @@ __aicore__ inline void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
         scratch.metaInfoTensor[bufferIdx * INT32_PER_256B].SetValue(WEIGHT_INDEX, weightBits);
         SetFlag<AscendC::HardEvent::S_MTE3>(eventId);
     }
-    DataCopyPad(tokenRevGlobalTensor[storageCopyIdx * scratch.revTokenElemCnt], tokenScaleBuffer,
-                {1, static_cast<uint16_t>(scratch.revTokenElemCnt * sizeof(ActivationType)), 0U, 0U, 0U});
+    const uint32_t tokenBytes = scratch.revTokenElemCnt * sizeof(ActivationType);
+    DataCopyPad(tokenRevGlobalTensor[storageCopyIdx * tokenBytes], tokenScaleBuffer,
+                DataCopyExtParams{1, tokenBytes, 0U, 0U, 0U});
     DataCopyPad(scaleRevGlobalTensor[storageCopyIdx * scratch.revScaleElemCnt], scaleBuffer,
                 {1, static_cast<uint16_t>(scratch.revScaleElemCnt * sizeof(QuantScaleType)), 0U, 0U, 0U});
     WaitFlag<AscendC::HardEvent::S_MTE3>(eventId);
@@ -192,9 +194,8 @@ __aicore__ inline void CopyTokensAndMetaForDispatch(const TokenDispatchConfig& c
     const MegaMoeDispatchBufferConfig& bufferConfig = context.bufferConfig;
     int32_t bufferCount = bufferConfig.bufferCount;
 
-    GlobalTensor<ActivationType> remoteRankGlobalTensor;
-    remoteRankGlobalTensor.SetGlobalBuffer(
-        reinterpret_cast<__gm__ ActivationType*>(winRankAddr[remoteRankIdx] + context.quantWinOffset));
+    GlobalTensor<uint8_t> remoteRankGlobalTensor;
+    remoteRankGlobalTensor.SetGlobalBuffer(winRankAddr[remoteRankIdx] + context.quantWinOffset);
     for (int32_t issueIdx = 0; issueIdx < copyNum; ++issueIdx) {
         // 单槽没有读写重叠空间，必须先写出；否则 reuse 会等一个尚未发布的 MTE3 事件。
         if (bufferCount == 1 && progress.pendingRow >= 0) {

@@ -570,6 +570,8 @@ __aicore__ inline void Gmm2AicMmadGeneric(BlockMmad& blockMmad, WorkSet& workSet
             workSet.gmScaleB.Slice(Te::MakeCoord(0, nLoc), Te::MakeShape(config.scaleK, Get<N_VALUE>(actualShape)));
         auto gmBlockC = workSet.gmC.Slice(Te::MakeCoord(mLoc, nLoc),
                                           Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
+        AscendTimerTileScope tileTimer(NotifyCombineTileReady && !IsShared ? gmmAddrInfo.timer : nullptr,
+                                      AscendTimer::AIC_GMM2, mLoc, nLoc, Get<M_VALUE>(actualShape));
         blockMmad(gmBlockA, gmBlockB, gmBlockScaleA, gmBlockScaleB, workSet.gmBias, gmBlockC, singleShape);
         if constexpr (NotifyCombineTileReady && !IsShared) {
             // GMM2 tile 与配对 AIV1 的 Combine tile 一对一通知。

@@ -77,12 +77,13 @@ def roce_raw(arm):
     return raw
 
 
-def job(tmp_path, arm, backend, *, identity=False):
+def job(tmp_path, arm, backend, *, identity=False, fp4=False):
     world, transport = overlap.TOPOLOGIES[backend]
-    root = tmp_path / arm / "perf-w4a8"
+    root = tmp_path / arm / ("perf-w4a4" if fp4 else "perf-w4a8")
     sample = list(range(0, world, 16))
     config = dict(bs_values=[80], seed=1234, iters=2, warmup=1, alignment=dict(rows=4, cols=4, repeats=1),
-                  model=dict(activation=arm, topk_weights_type=int(arm == "gelu"), mma_type="fp8xfp4",
+                  model=dict(activation=arm, topk_weights_type=int(arm == "gelu"),
+                             mma_type="fp4xfp4" if fp4 else "fp8xfp4",
                              num_shared_experts=0, num_experts=800, num_topk=25, hidden=4096, intermediate_hidden=1536))
     report = dict(windows_per_forward=2, host_e2e=dict(
         scope="public_forward_through_device_synchronize", timer_pass=False, per_rank_rounds_us=[[100, 120]] * world,
@@ -91,7 +92,7 @@ def job(tmp_path, arm, backend, *, identity=False):
     for rank in range(world):
         ranked = root / f"rank_{rank}"
         manifest = dict(
-            config=config, input="fp8", backend=backend, ep_size=world, device_communication=transport,
+            config=config, input="fp4" if fp4 else "fp8", backend=backend, ep_size=world, device_communication=transport,
             rank=rank, local_rank=rank % 16, ranks_per_node=16, mode="perf", perf_scope="all",
             numerical_contract=overlap.CONTRACTS[arm], timer_scope="first_window_only", run_id=f"job-{arm}",
             build=dict(source_sha256="a" * 64, megamoe=dict(enabled=True, timer=True, mte_roce=True)), routing="balanced",
@@ -110,8 +111,9 @@ def job(tmp_path, arm, backend, *, identity=False):
     return root
 
 
-def test_ep16_legacy_manifests_and_disjoint_phase_envelopes(tmp_path, monkeypatch, capsys):
-    gelu, swiglu = (job(tmp_path, arm, "mte") for arm in ("gelu", "swiglu"))
+@pytest.mark.parametrize("fp4", [False, True])
+def test_ep16_legacy_manifests_and_disjoint_phase_envelopes(tmp_path, monkeypatch, capsys, fp4):
+    gelu, swiglu = (job(tmp_path, arm, "mte", fp4=fp4) for arm in ("gelu", "swiglu"))
 
     def raw(path, words, decode):
         assert path.relative_to(path.parents[2]).as_posix() == "bs_80/timer/rank_0_npu_time.bin"
@@ -126,6 +128,8 @@ def test_ep16_legacy_manifests_and_disjoint_phase_envelopes(tmp_path, monkeypatc
     assert "physical_mapping=unverified" in console
     assert "Full-batch timer-off host E2E  GELU 0.110 ms  SwiGLU 0.110 ms" in console
     assert result["schema"] == "ubx_native_first_window_overlap_v1"
+    assert result["case"]["precision"] == ("w4a4" if fp4 else "w4a8")
+    assert result["case"]["input"] == ("fp4" if fp4 else "fp8")
     assert result["case"]["timer_token_range_half_open"] == [0, 64]
     assert result["case"]["model"]["num_topk"] == 25
     assert result["arms"]["gelu"]["host_e2e"]["rank_max_mean_us"] == 110
@@ -172,6 +176,16 @@ def test_incomplete_selected_roce_trace_fails(tmp_path):
     path.unlink()
     with pytest.raises(ValueError, match="gelu rank 16: .*roce_trace.json"):
         overlap.compare(gelu, swiglu)
+
+
+def test_ep32_reports_fp4_and_rejects_mixed_precision(tmp_path):
+    gelu, swiglu = (job(tmp_path, arm, "mte_roce", fp4=True) for arm in ("gelu", "swiglu"))
+    result = overlap.compare(gelu, swiglu)
+    assert result["case"]["precision"] == "w4a4"
+    assert result["case"]["input"] == "fp4"
+    assert result["arms"]["gelu"]["phases"]["Total"]["overlap_rate"] == pytest.approx(95 / 140)
+    with pytest.raises(ValueError, match="A/B manifest mismatch: precision, input"):
+        overlap.compare(gelu, job(tmp_path, "swiglu", "mte_roce"))
 
 
 def test_roce_binary_is_preferred_and_uses_export_counts(tmp_path, monkeypatch):

@@ -7,7 +7,7 @@
 | A | GELU 后乘路由权重，再量化，`topk_weights_type=1` | 4096/1536 | 1536/4096 |
 | B | SwiGLU，在 Finalize 乘路由权重，`topk_weights_type=0` | 4096/3072 | 1536/4096 |
 
-两组均用 A8W4、E800、TopK25、零共享专家、每卡 BS39280、`balanced` 路由和 seed 1234。
+两组默认用 A8W4、E800、TopK25、零共享专家、每卡 BS39280、`balanced` 路由和 seed 1234。EP16 MTE 和 EP32 MTE+RoCE 均可把下面的 `PRECISION` 改成 `a4w4`，两组都使用 packed MXFP4 输入与权重。EP16 需安装含 `mte_a4w4_timer_enabled` 的新 wheel 才能采集 A4W4 打点。
 
 ## 1. 准备机器和输出目录
 
@@ -19,6 +19,11 @@ EP32 在 `90.90.93.84` 上操作，通过 SSH 拉起 `90.90.93.184`，每台 16 
 
 ```bash
 EP=32
+PRECISION=a8w4
+case "$PRECISION" in
+    a8w4) PERF_DIR=perf-w4a8 ;;
+    a4w4) PERF_DIR=perf-w4a4 ;;
+esac
 cd /mnt/share/l00911701/DeepEP-UBX
 SCRIPTS=experiments/megamoe/scripts
 source "$SCRIPTS/ubx_env.sh"
@@ -30,18 +35,18 @@ echo "$OUT"
 ## 2. 生成两份原生运行 JSON，依次跑 A、B
 
 ```bash
-"$PYTHON" - "$SCRIPTS" "$EP" "$OUT" <<'PY'
+"$PYTHON" - "$SCRIPTS" "$EP" "$OUT" "$PRECISION" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-scripts, ep, output = sys.argv[1:]
+scripts, ep, output, precision = sys.argv[1:]
 root = Path(output)
 for arm, suffix in (("gelu", ""), ("swiglu", "_swiglu")):
     preset = Path(scripts) / "configs" / f"ubx_ep{ep}_target{suffix}.json"
     job = json.loads(preset.read_text(encoding="utf-8"))
     job.pop("_comments", None)
-    job.update(mode="perf", precision="a8w4", timer=True, output_dir=str(root / arm))
+    job.update(mode="perf", precision=precision, timer=True, output_dir=str(root / arm))
     for name, preview in ((arm, False), (f"{arm}-plan", True)):
         (root / f"{name}.json").write_text(json.dumps(dict(job, plan=preview), indent=2) + "\n")
 PY
@@ -58,23 +63,23 @@ PY
 
 ```bash
 "$PYTHON" "$SCRIPTS/compare_ubx_native_overlap.py" \
-    --gelu "$OUT/gelu/perf-w4a8" --swiglu "$OUT/swiglu/perf-w4a8" \
+    --gelu "$OUT/gelu/$PERF_DIR" --swiglu "$OUT/swiglu/$PERF_DIR" \
     --output "$OUT/native-overlap.json"
 ```
 
-看表中的 Dispatch、Combine、Total 和 A−B（百分点）。**Total 的 A−B ≥ 0** 表示 A 在该首窗本地阶段的总掩盖率达到 B。在 `native-overlap.json` 中，`arms.gelu.phases.Total.overlap_rate` 和 `arms.swiglu.phases.Total.overlap_rate` 是两组比率，`gelu_minus_swiglu_pp.Total` 是百分点差。同步端到端时延越低越好，原始值在两臂 `perf-w4a8/rank_0/bs_39280/profiling.json` 的 `host_e2e.rank_max_mean_us`，单位 µs。原生示例每臂执行一个独立作业。
+看表中的 Dispatch、Combine、Total 和 A−B（百分点）。**Total 的 A−B ≥ 0** 表示 A 在该首窗本地阶段的总掩盖率达到 B。在 `native-overlap.json` 中，`arms.gelu.phases.Total.overlap_rate` 和 `arms.swiglu.phases.Total.overlap_rate` 是两组比率，`gelu_minus_swiglu_pp.Total` 是百分点差。同步端到端时延越低越好，原始值在两臂 `$PERF_DIR/rank_0/bs_39280/profiling.json` 的 `host_e2e.rank_max_mean_us`，单位 µs。原生示例每臂执行一个独立作业。
 
 要检查未掩盖的时间，查看每臂 `phases.Total.uncovered_us`。同一对象的 `communication_us` 和 `overlapping_us` 分别是分母和分子，单位均为采样 rank 累加的 µs。用 `recorded_spans.Total` 替换 `phases.Total`，可查看只统计实际打点区间的辅助口径。
 
-- **EP16 MTE** 使用本 rank 所有 AIC 的 `AIC_GMM1`、`AIC_GMM2` 活动区间，以及 AIV 的 `AIV_DISPATCH`、`AIV_COMBINE`。原始文件在各臂的 `perf-w4a8/bs_39280/timer/rank_<r>_npu_time.bin`。
+- **EP16 MTE** 使用本 rank 所有 AIC 的 `AIC_GMM1`、`AIC_GMM2` 活动区间，以及 AIV 的 `AIV_DISPATCH`、`AIV_COMBINE`。原始文件在各臂的 `$PERF_DIR/bs_39280/timer/rank_<r>_npu_time.bin`。
 - **EP32 MTE+RoCE** 中，Dispatch 取本地搬运阶段。异步 Combine 取 `AIV_COMBINE_ASYNC` 的行生命周期（Lifetime），从准备发送到本核观测该行 DMA 完成。RDMA 提交、网关归约和远端收到数据有独立打点。用该百分比检查本地 Combine 与 GMM 的重叠，用完整 forward 的 E2E 检查双机全程收益。各采样 rank 的 `bs_39280/roce_timer.bin` 和 `roce_trace.json` 可进一步定位。
 - `case.timer_token_range_half_open` 是两臂实际比较的 token 范围。若 W256，完整 forward 有 153 个满窗和 112-token 尾窗，首窗为 `[0,256)`。要在 UBX 得到全窗掩盖率，需要逐窗保存设备打点，再按下文公式汇总。两次作业固定同一组机器和物理卡。只保存逻辑 rank 的 wheel 会在报告中显示 `physical_mapping=unverified`。
 
-若 EP32 使用独立盘，先在主节点执行以下命令，把第二台的 `rank_16` 至 `rank_31` 收到第一台对应臂的 `perf-w4a8/`，再运行上面的汇总命令。两台输出路径字符串应相同。
+若 EP32 使用独立盘，先在主节点执行以下命令，把第二台的 `rank_16` 至 `rank_31` 收到第一台对应臂的 `$PERF_DIR/`，再运行上面的汇总命令。两台输出路径字符串应相同。
 
 ```bash
 for arm in gelu swiglu; do
-    dir="$OUT/$arm/perf-w4a8"
+    dir="$OUT/$arm/$PERF_DIR"
     rsync -a --include='rank_1[6-9]/***' --include='rank_2[0-9]/***' \
         --include='rank_3[01]/***' --exclude='*' "90.90.93.184:$dir/" "$dir/"
 done

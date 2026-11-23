@@ -23,6 +23,9 @@ PYBIND11_MODULE(_C, module)
     module.attr("urma_ep8_window_tokens") = MegaMoeUrma::kWindowTokens;
     module.attr("urma_w8a8_enabled") = true;
     module.attr("mte_a4w4_enabled") = true;
+#ifdef DEEPEP_MEGAMOE_TIMER
+    module.attr("mte_a4w4_timer_enabled") = true;
+#endif
     module.attr("urma_w8a8_swiglu_enabled") = true;
     module.attr("urma_windowed_swiglu_enabled") = true;
 #ifdef DEEPEP_MEGAMOE_MTE_ROCE

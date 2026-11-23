@@ -25,6 +25,7 @@
 #include "kernels/mega_moe_common/common/mega_moe_types.hpp"
 #include "kernels/mega_moe_common/common/mega_moe_workspace.hpp"
 #include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
+#include "kernels/mega_moe_common/common/ascend_timer_v2_device.hpp"
 #include "common/mega_moe_exception_dump_policy.hpp"
 #include "epilogue/block_epilogue_activation_mx_quant.hpp"
 #include "stage/mega_moe_token_quant.hpp"
@@ -72,7 +73,7 @@ public:
                                 GM_ADDR scales, GM_ADDR sharedWeight1, GM_ADDR sharedWeight2,
                                 GM_ADDR sharedWeightScales1, GM_ADDR sharedWeightScales2, GM_ADDR yOut,
                                 GM_ADDR expertTokenNumsOut, GM_ADDR workspaceGM, MegaMoeTilingData* tilingData,
-                                GM_ADDR tilingGM);
+                                GM_ADDR tilingGM, GM_ADDR timerGM = nullptr);
     __aicore__ inline void Process();
 
 private:
@@ -177,6 +178,7 @@ private:
         BlockEpilogueActivationMxQuant<ActivationType, bfloat16_t, L1_TILE_M_256, L1_TILE_N, false, GMM1_INTERLEAVED>;
     BlockEpilogue epilogueOp_;
     SharedBlockEpilogue sharedEpilogueOp_;
+    AscendTimerDevice timer_;
     MegaMoeImpl::ExceptionDumpEngine exceptionDump_;
     __gm__ MegaMoeImpl::GmmLoopCount* gmmLoopCount_{nullptr};
 };
@@ -226,8 +228,9 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Init(
     GM_ADDR context, GM_ADDR x, GM_ADDR topkIds, GM_ADDR topkWeights, GM_ADDR weight1, GM_ADDR weight2,
     GM_ADDR xActiveMask, GM_ADDR weightScales1, GM_ADDR weightScales2, GM_ADDR scales, GM_ADDR sharedWeight1,
     GM_ADDR sharedWeight2, GM_ADDR sharedWeightScales1, GM_ADDR sharedWeightScales2, GM_ADDR yOut,
-    GM_ADDR expertTokenNumsOut, GM_ADDR workspaceGM, MegaMoeTilingData* tilingData, GM_ADDR tilingGM)
+    GM_ADDR expertTokenNumsOut, GM_ADDR workspaceGM, MegaMoeTilingData* tilingData, GM_ADDR tilingGM, GM_ADDR timerGM)
 {
+    timer_.Init(timerGM);
     k_ = tilingData->h;
     worldSize_ = tilingData->epWorldSize;
     moeExpertPerRank_ = tilingData->moeExpertPerRank;
@@ -416,11 +419,13 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::SendAnd
         LocalTensor<uint16_t>(TPosition::VECCALC, mxTempTensorAddr, mxTempTensorSize / sizeof(uint16_t));
 
     uint32_t xOutTensorAddr1 = mxTempTensorAddr + mxTempTensorSize;
+    uint32_t xOutElements = xOutTensorSize * PackedElementTraits<ActivationType>::ELEMENTS_PER_BYTE /
+                            sizeof(ActivationType);
     quantProcessScratch_.xOutTensor0 =
-        LocalTensor<ActivationType>(TPosition::VECCALC, xOutTensorAddr1, xOutTensorSize / sizeof(ActivationType));
+        LocalTensor<ActivationType>(TPosition::VECCALC, xOutTensorAddr1, xOutElements);
     uint32_t xOutTensorAddr2 = xOutTensorAddr1 + xOutTensorSize;
     quantProcessScratch_.xOutTensor1 =
-        LocalTensor<ActivationType>(TPosition::VECCALC, xOutTensorAddr2, xOutTensorSize / sizeof(ActivationType));
+        LocalTensor<ActivationType>(TPosition::VECCALC, xOutTensorAddr2, xOutElements);
 
     uint32_t xInAlignAddr1 = xOutTensorAddr2 + xOutTensorSize;
     quantProcessScratch_.xInTensor0 =
@@ -555,10 +560,13 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTyp
         plannedDispatchPosition = nextDispatchRange.end;
         dispatchRange.end = nextDispatchRange.end;
     }
+    timer_.SetWave(static_cast<int64_t>(waveId));
+    timer_.StartSpan(AscendTimer::AIV_DISPATCH);
     DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch>(
         tokenDispatchConfig_, commonConfig_, gmmExecutionConfig_.blockJob, syncWorkspaceLayout_, params_,
         g_winRankAddr_, tokenDispatchScratch_, dispatchRange,
         MteWaveRowMapping(*params_.tilingData, waveId, dispatchRange.begin.globalTokenIndex));
+    timer_.EndSpan(AscendTimer::AIV_DISPATCH);
     // 整 WAVE 的数据和 ready flag 发布完成后，再提交 Dispatch 进度。
     dispatchPosition = plannedDispatchPosition;
     return dispatchPosition;
@@ -660,10 +668,12 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTyp
             gmm1Position.tokenIndexInExpert == 0U && static_cast<uint64_t>(waveEndTokenIndexInExpert) == expertRowCount;
         uint32_t waveTokenStartIndex =
             static_cast<uint32_t>(ExpertStorageRow(gmm1ExpertState, gmm1Position.tokenIndexInExpert));
+        timer_.SetSlice(gmm1Position.expertIdx, gmm1Position.tokenIndexInExpert, waveRowCount);
         RunGmm1GenericByWeightFormat<QuantOutType, ActivationType, QuantScaleOutType, GMM1_TILE_M, EPILOGUE_TILE_M,
                                      TopkWeightsPrefetch, GMM1_INTERLEAVED, true>(
             gmmExecutionConfig_, params_, epilogueOp_, gmm1AddrInfo, gmm1WaveProblemShape, waveTokenStartIndex,
             runtimeState, gmm1Position.expertIdx, nullptr, isWholeExpert);
+        timer_.ClearSlice();
 
         processedMGroupCount += problemMGroupCount;
         gmm1Position.tokenIndexInExpert = waveEndTokenIndexInExpert;
@@ -745,11 +755,13 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         if constexpr (CombineQuantMode == COMBINE_NO_QUANT) {
             tileSequence = &gmm2TileSequence;
         }
+        timer_.SetSlice(gmm2Position.expertIdx, gmm2Position.tokenIndexInExpert, waveRowCount);
         RunGmm2ByMode<COMBINE_NO_QUANT, QuantOutType, ActivationType, Weight1Type, QuantScaleOutType, false, false,
                       GMM1_TILE_M, TopkWeightsPrefetch, false, GMM1_INTERLEAVED, true,
                       CombineQuantMode == COMBINE_NO_QUANT>(gmmExecutionConfig_, gmm2AddrInfo, gmm2WaveProblemShape,
                                                             runtimeState, nullptr, isWholeExpert,
                                                             gmm2Position.tokenIndexInExpert, &params_, tileSequence);
+        timer_.ClearSlice();
 
         gmm2Position.tokenIndexInExpert = waveEndTokenIndexInExpert;
         gmm2Position.globalTokenIndex += waveRowCount;
@@ -844,6 +856,8 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
     GMMAddrInfo gmm1AddrInfo{};
     GMMAddrInfo gmm2AddrInfo{};
     GMMAddrInfo combineAddrInfo{};
+    gmm1AddrInfo.timer = timer_.Enabled() ? &timer_ : nullptr;
+    gmm2AddrInfo.timer = gmm1AddrInfo.timer;
     ExpertLoopState gmm1ExpertState = CreateExpertLoopState(commonConfig_);
     ExpertLoopState gmm2ExpertState = CreateExpertLoopState(commonConfig_);
     ExpertLoopState combineExpertState = CreateExpertLoopState(commonConfig_);
@@ -885,6 +899,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         gmm1ExpertState.waveMapping =
             MteWaveRowMapping(*params_.tilingData, gmm1Count, waveBeginPosition.globalTokenIndex);
         gmm2ExpertState.waveMapping = gmm1ExpertState.waveMapping;
+        timer_.SetWave(static_cast<int64_t>(gmm1Count));
         ExpertTokenPosition waveEndPosition =
             ProcessGmm1Wave(gmm1Position, gmm1ExpertState, gmm1AddrInfo, gmm1RuntimeState);
         if constexpr (g_coreType == AIV) {
@@ -905,6 +920,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         const uint32_t gmm1EndBlockIndex = startBlockIdx_;
 
         GmmRuntimeState gmm2RuntimeState{startBlockIdx_, vecSetSyncCom, gmm2PingPongIdx_};
+        timer_.SetWave(static_cast<int64_t>(gmm2Count));
         ProcessGmm2Wave(gmm2Position, waveEndPosition, gmm2ExpertState, gmm2AddrInfo, gmm2RuntimeState,
                         gmm2TileSequence, allCoreCombineExpertIndex, allCoreCombineExpertState);
         UpdateGmmLoopCount(gmmLoopCount_, LoopCountIndex::GMM2, ++gmm2Count);
@@ -935,6 +951,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         EndSync<GMM1_INTERLEAVED>(vecSetSyncCom, gmm1PingPongIdx_);
     }
     gmm1PingPongIdx_ = 0;
+    timer_.SetWave(AscendTimer::NO_WAVE);
     ExportCompactExpertTokenCounts(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
 }
 
@@ -967,6 +984,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
 template <TemplateMegaMoeA8W8WaveTypeClass>
 __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process()
 {
+    timer_.Start(AscendTimer::KERNEL_TIMING);
     // 保存入口时的溢出模式，并初始化输入准备阶段使用的 UB。
     int64_t oriOverflowMode = GetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>();
     SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(0);
@@ -998,12 +1016,16 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         CrossRankSyncInWorldSize(params_.peermemInfo.rankSyncInWorldPtr, rankId_, worldSize_, aivJob_);
         exceptionDump_.UpdateStage(MegaMoeImpl::Stage::UNPERMUTE);
         UnpermuteBufferConfig unpermuteBufferConfig = InitTokenUnpermuteBuffers();
+        timer_.Start(AscendTimer::AIV_UNPERMUTE);
         UnpermuteTokens<CombineQuantMode, TopkWeightsType, TopkWeightsPrefetch, GMM1_TILE_M>(
             tokenUnpermuteConfig_, commonConfig_, params_, tokenUnpermuteScratch_, unpermuteBufferConfig);
+        timer_.End(AscendTimer::AIV_UNPERMUTE);
     }
     // 恢复入口时保存的溢出模式。
     SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(oriOverflowMode);
     exceptionDump_.UpdateStage(MegaMoeImpl::Stage::COMPLETE);
+    timer_.End(AscendTimer::KERNEL_TIMING);
+    timer_.FlushDynamicCounts();
 }
 
 #undef TemplateMegaMoeA8W8WaveTypeClass

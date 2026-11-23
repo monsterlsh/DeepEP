@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     WeightPair = tuple[Tensor, Tensor]
 
 
-_TIMER_REQUIREMENTS = "Timer supports W4A8 and windowed URMA W8A8 in builds with DEEPEP_MEGAMOE_TIMER=ON"
+_TIMER_REQUIREMENTS = "Timer supports W4A8, MTE A4W4 and windowed URMA W8A8 in builds with DEEPEP_MEGAMOE_TIMER=ON"
 
 
 @lru_cache(maxsize=1)
@@ -135,7 +135,7 @@ def _ubx_mte_capacity(group, ext, backend, world, local_experts, tokens, topk, h
             raise ValueError(f"no native window fits {backend} ({free} bytes available): {rejected}")
     except Exception as exc:
         error = str(exc) or type(exc).__name__
-    peers = gather_control(group, "UBX MTE window capacity", (error, tuple(eligible)))
+    peers = gather_control(group, "MTE window capacity", (error, tuple(eligible)))
     failures = [f"rank={r}: {message}" for r, (message, _) in enumerate(peers) if message]
     if failures:
         raise ValueError("MegaMoE window selection failed: " + "; ".join(failures))
@@ -267,6 +267,7 @@ class SymmBuffer:
         urma = self._backend_name == "urma"
         roce = self._backend_name == "mte_roce"
         local_mte = self._backend_name == "mte" and (backend == "mte" or mma_type == "fp4xfp4")
+        pod_a4w4_mte = local_mte and mma_type == "fp4xfp4" and size == 32 and ranks_per_node == 8
         if topk_weights_type is None:
             topk_weights_type = int(activation == "gelu")
         urma_swiglu = (
@@ -314,8 +315,10 @@ class SymmBuffer:
                     raise ValueError("MTE+RoCE requires EP32 on two 16-rank hosts")
                 if num_shared_experts and (mma_type, activation) != ("fp8xfp4", "swiglu"):
                     raise ValueError("MTE+RoCE shared experts require W4A8 SwiGLU")
-            if local_mte:
+            if local_mte and not pod_a4w4_mte:
                 if size != 16 or ranks_per_node not in (0, 16):
+                    if mma_type == "fp4xfp4":
+                        raise ValueError("MTE A4W4 requires 16 ranks on one host or EP32 on four 8-rank hosts")
                     raise ValueError("UBX local MTE requires all 16 ranks on one host")
                 ranks_per_node = 16
             if self._urma_windowed:
@@ -329,7 +332,7 @@ class SymmBuffer:
             if activation not in {"swiglu", "gelu"}:
                 raise ValueError("activation must be 'swiglu' or 'gelu'")
             if mma_type == "fp4xfp4" and not (local_mte or roce):
-                raise ValueError("A4W4 requires backend='mte' on EP16 or 'mte_roce' on EP32")
+                raise ValueError("A4W4 requires native MTE or MTE+RoCE")
             if mma_type not in {"fp8xfp4", "fp8xfp8", "fp4xfp4"}:
                 raise ValueError("mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4")
             if urma and size not in (4, 8, 16, 32):
@@ -363,9 +366,16 @@ class SymmBuffer:
             topk_weights_type,
             urma_window_tokens,
             backend,
-            _host_boot_id() if local_mte or (self._urma_windowed and size <= 16) else None,
+            _host_boot_id() if (local_mte and not pod_a4w4_mte) or (self._urma_windowed and size <= 16) else None,
         )
         collective_check(group, "configuration", error, config)
+        if pod_a4w4_mte:
+            hosts = gather_control(group, "MTE A4W4 host layout", _host_boot_id())
+            node_hosts = hosts[::ranks_per_node]
+            if not all(node_hosts) or len(set(node_hosts)) != 4 or hosts != [
+                host for host in node_hosts for _ in range(ranks_per_node)
+            ]:
+                raise ValueError("MTE A4W4 EP32 requires four contiguous 8-rank hosts")
         ext = _extension()
         if roce:
             error = None if getattr(ext, "mte_roce_mx_enabled", False) else "install a MegaMoE wheel with MTE+RoCE MX support"
@@ -583,10 +593,13 @@ class SymmBuffer:
 
     @property
     def timer_enabled(self) -> bool:
+        ext = _extension()
         if self._backend_name == "mte_roce":
-            return bool(getattr(_extension(), "mte_roce_timer_enabled", False))
+            return bool(getattr(ext, "mte_roce_timer_enabled", False))
+        if self.mma_type == "fp4xfp4":
+            return self._backend_name == "mte" and bool(ext.timer_enabled and getattr(ext, "mte_a4w4_timer_enabled", False))
         supports_timer = self.mma_type == "fp8xfp4" or (self.mma_type == "fp8xfp8" and self._urma_windowed)
-        return bool(_extension().timer_enabled and supports_timer)
+        return bool(ext.timer_enabled and supports_timer)
 
     def allocate_timer(self) -> Tensor:
         """Fresh zeroed device trace; pass only to a separate diagnostic invocation."""

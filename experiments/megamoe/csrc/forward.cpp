@@ -440,8 +440,10 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     const std::string resolved_mma_type = mma_type.empty() ? (is_a8w4 ? "fp8xfp4" : "fp8xfp8") : mma_type;
     TORCH_CHECK(resolved_mma_type == "fp8xfp4" || resolved_mma_type == "fp8xfp8" || resolved_mma_type == "fp4xfp4",
                 "mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4");
-    TORCH_CHECK(!is_a4w4_ || (backend == "mte" && world == 16 && ranks_per_node == 16),
-                "MTE A4W4 requires all 16 ranks on one host");
+    TORCH_CHECK(!is_a4w4_ ||
+                    (backend == "mte" && ((world == 16 && ranks_per_node == 16) ||
+                                           (world == 32 && ranks_per_node == 8))),
+                "MTE A4W4 requires EP16 on one host or EP32 on four 8-rank hosts");
     TORCH_CHECK(is_a8w4_ == (resolved_mma_type == "fp8xfp4") && is_a4w4_ == (resolved_mma_type == "fp4xfp4"),
                 "is_a8w4 and mma_type describe different matrix modes");
     TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
@@ -645,8 +647,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     uint64_t trace_capacity = 0;
     int64_t trace_elements = 0;
     if (timer) {
-        TORCH_CHECK(is_a8w4_ || (urma && windowed_ && !is_w4),
-                    "MegaMoE timer requires routed A8W4 or windowed URMA A8W8");
+        TORCH_CHECK(is_a8w4_ || (!urma && is_a4w4_) || (urma && windowed_ && !is_w4),
+                    "MegaMoE timer requires routed A8W4, MTE A4W4 or windowed URMA A8W8");
         trace_elements = ValidateTimer(*timer, urma);
         if (urma) trace_capacity = trace_elements / kTraceRowElements - 1;
     }
@@ -850,8 +852,8 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
     const std::string resolved_mma_type = mma_type.empty() ? "fp8xfp8" : mma_type;
     TORCH_CHECK(resolved_mma_type == "fp8xfp4" || resolved_mma_type == "fp8xfp8" || resolved_mma_type == "fp4xfp4",
                 "mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4");
-    TORCH_CHECK(resolved_mma_type != "fp4xfp4" || (backend == "mte" && world == 16),
-                "A4W4 requires the single-host EP16 MTE kernel or the EP32 RocePlan");
+    TORCH_CHECK(resolved_mma_type != "fp4xfp4" || (backend == "mte" && (world == 16 || world == 32)),
+                "MTE A4W4 sizing requires EP16 or EP32");
     if (backend == "urma") {
         TORCH_CHECK(resolved_mma_type == "fp8xfp4" || (mma_type == "fp8xfp8" && windowed && (world == 16 || world == 32)),
                     "URMA requires routed FP8xFP4 or windowed EP16/EP32 FP8xFP8");
