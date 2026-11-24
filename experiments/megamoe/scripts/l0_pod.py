@@ -57,6 +57,8 @@ def run_pod_job(job, config_dir, *, nodes, plan=False):
     config_dir.mkdir(parents=True, exist_ok=True)
     out = Path(args.output_dir)
     phases = ("golden", "accuracy") if args.mode == "accuracy" else ("perf",)
+    if args.accuracy_stage:
+        phases = ("golden",) if args.golden_only else ("accuracy",)
     for phase in phases:
         commands = []
         run_id = uuid4().hex

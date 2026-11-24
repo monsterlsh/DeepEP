@@ -46,7 +46,7 @@ def case_jobs(data, selection):
     if selection in ("both", "accuracy"):
         for arm in ("gelu", "swiglu"):
             reason = None
-            if native_b_limited and arm == "swiglu":
+            if native_b_limited and arm == "swiglu" and data.get("accuracy_stage") not in ("golden", "cascade"):
                 reason = "950POD SwiGLU 的整批对称区超限；此精度尚无同窗的全量双参考入口。"
             add(f"{arm}-accuracy", "accuracy", arm, reason)
     if selection in ("both", "perf", "memory"):
@@ -77,27 +77,29 @@ def job_config(base, job, root):
     accuracy = workload == "accuracy"
     timing = job["kind"] == "perf" and (base["backend"] == "mte_roce" or base["precision"] != "a8w8")
     config = dict(base, config=dict(base["config"], model=model), output_dir=str(root / job["name"]),
-                  mode="accuracy" if accuracy else "perf", dual_reference=accuracy, check_tokens=0,
+                  mode="accuracy" if accuracy else "perf", dual_reference=accuracy and not base.get("accuracy_stage"), check_tokens=0,
                   timer=timing, compare_prefill_cascade=workload == "prefill",
                   profile_memory_peak=job["profile_memory_peak"])
     if job["kind"] == "memory":
         config["perf_scope"] = "memory"
-    if accuracy and base["machine"] == "ubx" and base["ep_size"] <= runner.LOCAL_RANKS:
+    if accuracy and not base.get("accuracy_stage") and base["machine"] == "ubx" and base["ep_size"] <= runner.LOCAL_RANKS:
         # This acceptance run must own the per-rank accuracy and memory reports it archives.
         config["force_npu"] = True
     return config
 
 
+def rank_zero_case_dir(cfg):
+    run = cfg["mode"]
+    if cfg["machine"] == "ubx":
+        run += "-" + runner.parse_precision(cfg["precision"])
+    if cfg.get("accuracy_stage"):
+        run += "-" + cfg["accuracy_stage"]
+    bs = cfg["config"]["bs_values"][0]
+    return Path(cfg["output_dir"]) / run / "rank_0" / f"bs_{bs}"
+
+
 def memory_result(cfg, paired):
-    directory = Path(cfg["output_dir"])
-    if paired:
-        path = directory / "paired.json"
-    else:
-        run = cfg["mode"]
-        if cfg["machine"] == "ubx":
-            run += "-" + runner.parse_precision(cfg["precision"])
-        bs = cfg["config"]["bs_values"][0]
-        path = directory / run / "rank_0" / f"bs_{bs}" / "resources.json"
+    path = Path(cfg["output_dir"]) / "paired.json" if paired else rank_zero_case_dir(cfg) / "resources.json"
     report = json.loads(path.read_text(encoding="utf-8"))
     summary = report.get("device_memory_peak_group")
     if (not isinstance(summary, dict) or summary.get("rank_count") != cfg["ep_size"]
@@ -143,7 +145,7 @@ def collect_overlap(base, root):
                 e2e_target_met=a <= b, first_window_overlap_target_met=diff >= 0)
 
 
-def run_l0(path, data, *, only=None, plan=False):
+def run_l0(path, data, *, only=None, plan=False, accuracy_arm=None):
     case = data.get("case")
     precision = data.get("precision")
     matrix = [(machine, p) for machine in ("ubx", "950pod") for p in ("a8w4", "a8w8", "a4w4")]
@@ -167,6 +169,16 @@ def run_l0(path, data, *, only=None, plan=False):
         raise ValueError("plan 必须为布尔值")
     plan = plan or data.get("plan", False)
     jobs = case_jobs(data, selection)
+    if accuracy_stage := data.get("accuracy_stage"):
+        jobs = [job for job in jobs if accuracy_arm is None or job["arm"] == accuracy_arm]
+        for job in jobs:
+            job["name"] = f"{job['arm']}-{accuracy_stage}"
+            if accuracy_stage == "golden":
+                job["profile_memory_peak"] = False
+            if job["profile_memory_peak"]:
+                job["memory_scope"] = "fused" if accuracy_stage == "megamoe" else "npu_cascade"
+            else:
+                job.pop("memory_scope", None)
     base = {k: v for k, v in data.items() if k not in ("suite", "case", "nodes", "mode", "plan", "output_dir", "run_base")}
     # The resolved worker configs will live under the run directory, not beside the user's preset.
     for key in ("cann_env", "golden_dir"):
@@ -179,6 +191,8 @@ def run_l0(path, data, *, only=None, plan=False):
     base_dir = (path.parent / base_dir).resolve() if data.get("run_base") else base_dir.resolve()
     explicit = data.get("output_dir")
     root = (path.parent / Path(explicit).expanduser()).resolve() if explicit else base_dir / f"{case}-RUN"
+    if explicit and accuracy_stage:
+        root = root / (f"{accuracy_stage}-{accuracy_arm}" if accuracy_arm else accuracy_stage)
     nodes = data.get("nodes")
     pod = base["machine"] == "950pod"
     if not pod:
@@ -209,6 +223,8 @@ def run_l0(path, data, *, only=None, plan=False):
     summary = dict(case=case, machine=base["machine"], backend=base.get("backend"), precision=precision,
                    ep_size=ep, nodes=nodes,
                    tokens_per_rank=spec["bs_values"][0], selection=selection, jobs=jobs)
+    if accuracy_stage:
+        summary.update(accuracy_stage=accuracy_stage, golden_dir=base["golden_dir"])
     if base.get("peer_python"):
         summary["peer_python"] = base["peer_python"]
     if plan:
@@ -218,7 +234,9 @@ def run_l0(path, data, *, only=None, plan=False):
     if explicit:
         root.mkdir(parents=True, exist_ok=False)
     else:
-        stage = "full" if selection == "both" else selection
+        stage = accuracy_stage or ("full" if selection == "both" else selection)
+        if accuracy_arm:
+            stage += "-" + accuracy_arm
         if base.get("profile_memory_peak") and selection in ("both", "perf", "prefill"):
             stage += "-hbm"
         label = f"{case}-{base['machine']}-ep{base['ep_size']}-{precision}-{stage}"
@@ -246,6 +264,8 @@ def run_l0(path, data, *, only=None, plan=False):
                 src = configs / f"{name}.json"
                 write_json(src, cfg)
                 job.update(config=str(src), output_dir=cfg["output_dir"])
+                if accuracy_stage in ("megamoe", "cascade"):
+                    job["accuracy_report"] = str(rank_zero_case_dir(cfg) / "accuracy.json")
                 paired_job = job.get("workload", job["kind"]) == "paired"
                 if pod:
                     launch = run_pod_paired if paired_job else run_pod_job

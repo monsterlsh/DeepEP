@@ -45,6 +45,7 @@ FORWARDED_ENV = (
 COMPARISON_PLAN = "comparison-plan.json"
 COMPARISON_REPORT = "comparison.json"
 CASCADE_STAGES = ("decode", "prefill")
+ACCURACY_STAGES = ("golden", "megamoe", "cascade")
 A8_PRECISIONS = ("w4a8", "w8a8")
 WEIGHT_MODE = {"gelu": 1, "swiglu": 0}
 DEVICE_CHECK = str(SCRIPT.with_name("ubx_device_check.py"))
@@ -101,6 +102,8 @@ def workload_run_label(machine, args, model, precisions):
         mode = args.perf_scope
     if args.cascade_stage:
         mode += f"-{args.cascade_stage}"
+    if getattr(args, "accuracy_stage", None):
+        mode = f"accuracy-{args.accuracy_stage}"
     if args.timer and args.perf_scope == "all":
         mode += "-timer"
     if args.profile_memory_peak and args.mode in ("both", "perf", "compare") and args.perf_scope != "memory":
@@ -223,7 +226,7 @@ def python_command(value, directory):
 
 def run_config_arguments(path, parser, argv, cli, data=None):
     """Use the command parser for JSON options and keep explicit CLI overrides."""
-    strings = {"mode", "precision", "backend", "activation", "weighting", "input", "stage", "master_addr",
+    strings = {"mode", "precision", "backend", "activation", "weighting", "input", "stage", "accuracy_stage", "master_addr",
                "ssh_user", "peer_python", "config", "output_dir", "comparison_arm", "perf_scope"}
     integers = {"ep_size", "node_rank", "master_port", "shmem_port", "ssh_port", "bs", "topk", "window_tokens", "pairs"}
     flags = {"timer", "force", "force_cpu", "force_npu", "plan", "report_only", "require_no_regression", "paired_weights",
@@ -316,6 +319,8 @@ def parse_args(argv, run_config=None):
                       help="EP32 自动拉起的两台节点")
     node.add_argument("--node-rank", type=int, choices=(0, 1), help="EP32 手动分阶段拉起时的节点序号")
     parser.add_argument("--stage", choices=("prepare", "run"), help="EP32 手动模式先 prepare，再 run")
+    parser.add_argument("--accuracy-stage", choices=ACCURACY_STAGES)
+    parser.add_argument("--golden-dir", type=Path)
     parser.add_argument("--master-addr", help="本机或手动启动的 IPv4，自动 EP32 默认用 node_ip 的第一项")
     parser.add_argument("--master-port", type=int, default=os.environ.get("MASTER_PORT", "29500"))
     parser.add_argument("--shmem-port", type=int, default=29180, help="指定 SHMEM 引导端口")
@@ -465,6 +470,11 @@ def parse_args(argv, run_config=None):
         if dual_reference not in ("0", "1"):
             parser.error("DUAL_REFERENCE 必须是 0 或 1")
     args.dual_reference = dual_reference == "1"
+    if args.accuracy_stage:
+        if args.mode != "accuracy" or args.timer or args.dual_reference or args.cascade_stage:
+            parser.error("独立精度阶段要求 accuracy，关闭双参考、timer 和性能级联")
+        if args.stage and (args.stage == "prepare") != (args.accuracy_stage == "golden"):
+            parser.error("手动 EP32 的 prepare 只适用于 golden，run 适用于 megamoe/cascade")
 
     if args.inline_config is None:
         name = args.config or ("ep32_roce_decode" if roce else "target_gelu_k25")
@@ -735,6 +745,8 @@ def report_lines(directory, args, mode, precision):
 
 def run_case(python, env, args, mode, precision, config):
     name = f"{mode}-{precision}"
+    if args.accuracy_stage:
+        name += f"-{args.accuracy_stage}"
     output = args.output_dir / name
     if (output / f"rank_{args.node_rank * args.ranks_per_node}").exists():
         raise ValueError(f"{output} 已有本节点的报告，请指定新的 --output-dir")
@@ -743,6 +755,8 @@ def run_case(python, env, args, mode, precision, config):
         extra.extend(("--golden-dir", env["GOLDEN_DIR"], "--check-tokens", args.check_tokens))
         if args.dual_reference:
             extra.append("--dual-reference")
+        if args.accuracy_stage == "cascade":
+            extra.append("--cascade-only")
     if args.backend != "urma":
         extra.extend(("--backend", args.backend))
     if args.perf_scope != "all":
@@ -842,7 +856,10 @@ def orchestrate(args, env):
     print(f"[UBX] node0 本机 {args.node_ip[0]}，node1 SSH {args.ssh_user}@{args.node_ip[1]}", flush=True)
     stages = []
     for precision in args.accuracy_precisions:
-        stages.extend((("prepare", "accuracy", precision), ("run", "accuracy", precision)))
+        phases = ("prepare", "run")
+        if args.accuracy_stage:
+            phases = ("prepare",) if args.accuracy_stage == "golden" else ("run",)
+        stages.extend((phase, "accuracy", precision) for phase in phases)
     stages.extend(("run", "perf", precision) for precision in args.perf_precisions)
     config_args = (["--config", str(args.config)] if args.config else
                    ["--inline-config", json.dumps(args.spec, separators=(",", ":"))])
@@ -856,6 +873,8 @@ def orchestrate(args, env):
         ]
         if args.backend != "urma":
             argv.extend(("--backend", args.backend))
+        if args.accuracy_stage:
+            argv.extend(("--accuracy-stage", args.accuracy_stage))
         if args.activation is not None:
             argv.extend(("--activation", args.activation))
         if stage == "prepare" and (args.force or args.force_cpu):
@@ -949,6 +968,8 @@ def main(argv=None, run_config=None):
             timer_ranks=sampled_timer_ranks(args.ep_size, args.ranks_per_node) if args.timer else [],
             routing=args.routing, config=dict(args.spec, model=case_model(args), bs_values=[args.bs]),
         )
+        if args.accuracy_stage:
+            plan.update(accuracy_stage=args.accuracy_stage, golden_dir=str(args.golden_dir or args.run_environment.get("GOLDEN_DIR")))
         if args.cascade_stage:
             plan[f"compare_{args.cascade_stage}_cascade"] = True
         if args.profile_memory_peak is not None:
@@ -974,7 +995,7 @@ def main(argv=None, run_config=None):
     env = ubx_wheel_env(env)
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS"):
         env[name] = "1"
-    env["GOLDEN_DIR"] = str(Path(env.get("GOLDEN_DIR") or REPO_ROOT / "benchmark-golden").resolve())
+    env["GOLDEN_DIR"] = str(Path(args.golden_dir or env.get("GOLDEN_DIR") or REPO_ROOT / "benchmark-golden").resolve())
     env["DEEPEP_SHMEM_ENDPOINT"] = f"tcp://{args.master_addr}:{args.shmem_port}"
     if args.output_dir is None:
         base = Path(env.get("RUN_BASE") or REPO_ROOT / "benchmark-runs").resolve()
@@ -1004,7 +1025,13 @@ def main(argv=None, run_config=None):
 
     for precision in args.accuracy_precisions:
         config = config_for(args, precision)
-        if args.nnodes == 1:
+        if args.accuracy_stage == "golden":
+            prepare_golden(python, env, args, precision, config)
+        elif args.accuracy_stage:
+            if args.accuracy_stage == "megamoe":
+                check_device(precision)
+            run_case(python, env, args, "accuracy", precision, config)
+        elif args.nnodes == 1:
             run_single_accuracy(python, env, args, precision, config, check_device)
         else:
             check_device(precision)
@@ -1040,7 +1067,7 @@ def pod_settings(path, data):
         run_base=os.environ.get("RUN_BASE") or str(REPO_ROOT / "benchmark-runs"), output_dir="",
         python=os.environ.get("PYTHON") or "", base_python=os.environ.get("BASE_PYTHON") or POD_PYTHON,
         cann_env=os.environ.get("CANN_ENV") or POD_CANN_ENV, backend="mte",
-        golden_only=False, skip_golden=False, plan=False, timer=False, perf_scope="all",
+        golden_only=False, skip_golden=False, plan=False, timer=False, perf_scope="all", accuracy_stage="",
         compare_decode_cascade=False, compare_prefill_cascade=False,
     )
     unknown = data.keys() - settings.keys() - {
@@ -1061,6 +1088,9 @@ def pod_settings(path, data):
     args = argparse.Namespace(**settings)
     args.profile_memory_peak = configured_memory_peak(data)
     args.cascade_stage = cascade_stage(args)
+    if args.accuracy_stage:
+        args.golden_only = args.accuracy_stage == "golden"
+        args.skip_golden = not args.golden_only
     args.machine, args.mode, args.precision = data["machine"], data["mode"], parse_precision(data["precision"])
     if args.perf_scope not in ("all", "memory"):
         raise ValueError("950POD 支持 perf_scope=all 或 memory")
@@ -1179,7 +1209,11 @@ def run_pod_case(args, precision, python, env, first):
 
     if precision == "w4a4":
         options.extend(("--backend", "mte"))
-    output = args.output_dir / (f"{args.mode}-{precision}" if args.precision == "all" else args.mode)
+    run = f"{args.mode}-{precision}" if args.precision == "all" else args.mode
+    if args.accuracy_stage:
+        run += f"-{args.accuracy_stage}"
+        label += f"-{args.accuracy_stage}"
+    output = args.output_dir / run
     command = [
         python, "-I", "-c", "from torch.distributed.run import main; main()", "--rdzv-backend=static",
         f"--nnodes={args.nnodes}", f"--nproc-per-node={args.ranks_per_node}", f"--node-rank={args.node_rank}",
@@ -1190,6 +1224,8 @@ def run_pod_case(args, precision, python, env, first):
     ]
     if args.mode == "accuracy" and args.dual_reference:
         command.append("--dual-reference")
+    if args.accuracy_stage == "cascade":
+        command.append("--cascade-only")
     if args.perf_scope != "all":
         command.extend(("--perf-scope", args.perf_scope))
     if args.cascade_stage:
@@ -1225,6 +1261,10 @@ def run_pod(path, data):
         base_lib = str(Path(args.base_python).parent.parent / "lib")
         extra = [f"--compare-{args.cascade_stage}-cascade"] if args.cascade_stage else []
         extra.extend(memory_option(args.profile_memory_peak))
+        if args.accuracy_stage:
+            extra.extend(("--accuracy-stage", args.accuracy_stage))
+        if "golden_dir" in data:
+            extra.extend(("--golden-dir", args.golden_dir))
         os.execvpe("bash", ["bash", "-c", POD_BOOTSTRAP, "950pod-env", args.cann_env, args.python, base_lib,
                            str(SCRIPT), "--run-config", str(path), *extra], env)
 
@@ -1233,7 +1273,7 @@ def run_pod(path, data):
                PYTHONSAFEPATH="1", PYTHONNOUSERSITE="1", PYTHON_EXEC=python)
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS"):
         env[name] = "1"
-    if not args.golden_only:
+    if not args.golden_only and args.accuracy_stage != "cascade":
         subprocess.run([python, "-I", "-c", POD_DEVICE_CHECK, str(args.ranks_per_node)], env=env, check=True)
     if args.output_dir:
         args.output_dir = Path(args.output_dir)
@@ -1261,6 +1301,9 @@ def entrypoint(argv=None):
     parser.add_argument("--run-config", required=True, type=Path, help="包含机型和全部测试参数的 JSON")
     parser.add_argument("--plan", action="store_true", help="只打印运行计划")
     parser.add_argument("--only", choices=("accuracy", "perf", "prefill", "memory"), help="仅运行 L0 清单中选定的阶段")
+    parser.add_argument("--accuracy-stage", choices=ACCURACY_STAGES, help="单独生成 Golden，或用已有 Golden 验证一个实现")
+    parser.add_argument("--golden-dir", type=Path, help="CPU Golden 的共享根目录")
+    parser.add_argument("--accuracy-arm", choices=("gelu", "swiglu"), help="只运行 L0 所选精度臂")
     add_memory_argument(parser)
     add_cascade_arguments(parser)
     args = parser.parse_args(argv)
@@ -1271,6 +1314,18 @@ def entrypoint(argv=None):
         if args.profile_memory_peak is not None:
             data["profile_memory_peak"] = args.profile_memory_peak
         stage = cascade_stage(args)
+        accuracy_stage = args.accuracy_stage or data.get("accuracy_stage")
+        if args.golden_dir:
+            data["golden_dir"] = str(args.golden_dir.expanduser().resolve())
+        if args.accuracy_arm and (not accuracy_stage or data.get("suite") != "l0"):
+            raise ValueError("--accuracy-arm 适用于 L0 独立精度阶段")
+        if accuracy_stage is not None:
+            if accuracy_stage not in ACCURACY_STAGES or not isinstance(data.get("golden_dir"), str) or not data["golden_dir"].strip():
+                raise ValueError("独立精度阶段要求 golden/megamoe/cascade 和显式 golden_dir")
+            if (args.only not in (None, "accuracy") or stage or data.get("timer")
+                    or any(data.get(f"compare_{kind}_cascade") for kind in CASCADE_STAGES)):
+                raise ValueError("独立精度阶段与性能、级联性能对照或 timer 互斥")
+            data.update(accuracy_stage=accuracy_stage, dual_reference=False, mode="accuracy")
         if "suite" in data:
             if stage:
                 raise ValueError("L0 清单选择级联请使用 --only prefill")
@@ -1282,7 +1337,7 @@ def entrypoint(argv=None):
                     from l0_suite import run_l0
                 finally:
                     sys.path.pop(0)
-            return run_l0(path, data, only=args.only, plan=args.plan)
+            return run_l0(path, data, only=args.only, plan=args.plan, accuracy_arm=args.accuracy_arm)
         if args.only:
             raise ValueError("--only 适用于 L0 清单预设")
         if args.plan:
@@ -1301,6 +1356,10 @@ def entrypoint(argv=None):
             data.setdefault("backend", "mte_roce" if data.get("ep_size") == 32 else "mte")
             extra = [f"--compare-{stage}-cascade"] if stage else []
             extra.extend(memory_option(args.profile_memory_peak))
+            if accuracy_stage:
+                extra.extend(("--accuracy-stage", accuracy_stage))
+            if args.golden_dir:
+                extra.extend(("--golden-dir", data["golden_dir"]))
             return cli(["--run-config", str(path), *extra], data)
         return run_pod(path, data)
     except subprocess.CalledProcessError as error:

@@ -91,6 +91,24 @@ for arm in gelu swiglu; do
 done
 ```
 
+## L01 单独生成 Golden 和验证精度
+
+在 .84 从脚本目录启动。两台 UBX 安装含 `--cascade-only` 的同版本 wheel，`GOLDEN` 指两台均能访问的 CPU Golden 根目录。下面三条命令分别执行。首次生成后，任一实现都可以单独复测。
+
+```bash
+cd /mnt/share/l00911701/DeepEP-UBX/experiments/megamoe/scripts
+CASE=configs/l0/L01.json
+GOLDEN=/shared/megamoe/golden/L01
+
+python run_megamoe.py --run-config "$CASE" --accuracy-arm gelu --accuracy-stage golden  --golden-dir "$GOLDEN"
+python run_megamoe.py --run-config "$CASE" --accuracy-arm gelu --accuracy-stage megamoe --golden-dir "$GOLDEN"
+python run_megamoe.py --run-config "$CASE" --accuracy-arm gelu --accuracy-stage cascade --golden-dir "$GOLDEN"
+```
+
+`golden` 在 CPU 生成或复用校验过的 rank 文件。`megamoe` 只运行融合，`cascade` 只运行 HCCL 小算子级联。后两项独立读取已有 Golden，按相同的 CPU 误差阈值、有限值、专家计数给出通过或失败。缺失、损坏或参数不匹配的 Golden 会直接报错。每次可附加 `--plan` 查看启动计划。改为 `--accuracy-arm swiglu` 可验证 B 臂；该臂须先生成自己的 Golden，参数指纹会将两臂分开保存。省略 `--accuracy-arm` 则两臂都跑所选阶段。
+
+每次测试打印本轮输出目录。用 `jq -r '.jobs[] | [.name,.status,.accuracy_report] | @tsv' "$OUT/run-summary.json"` 找两臂各自的报告。每份 `accuracy.json` 记录全组 rank 的 `passed`、`max_abs_error`、`counts_equal`、`golden_path`。任一 rank 超限即返回失败。完整双参考所用的级联误差预算可用原命令 `--only accuracy` 核验。
+
 ## L01 完整验收
 
 在主节点 `90.90.93.84` 的共享 checkout 上运行。两台各 16 卡，使用同一份开启设备 timer 的 UBX wheel，主节点需能通过 SSH 连接 `90.90.93.188`。

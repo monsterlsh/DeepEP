@@ -173,6 +173,18 @@ def inputs(config, rank, bs, routing="balanced", *, world):
     return x, ids.astype(np.int32), weights
 
 
+def copy_quantized_input(x, mma_type, data_out, scale_out):
+    import torch
+    from .reference import quantize_activation
+
+    for begin in range(0, len(x), 256):
+        rows = slice(begin, min(len(x), begin + 256))
+        data, scale = quantize_activation(x[rows], mma_type)
+        codes = torch.from_numpy(data).npu()
+        data_out[rows].copy_(codes if mma_type == "fp4xfp4" else codes.view(torch.float8_e4m3fn))
+        scale_out[rows].copy_(torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
+
+
 def accuracy(
     config,
     rank,
@@ -187,6 +199,7 @@ def accuracy(
     group,
     golden_dir,
     input_kind,
+    implementation="megamoe",
 ):
     import numpy as np
     from .golden import cache_path, compare, contract, load
@@ -205,6 +218,7 @@ def accuracy(
         total_tokens=bs,
         check_tokens=check_tokens,
         golden_path=str(cache_path(golden_dir, spec, rank)),
+        implementation=implementation,
         counts_equal=bool(np.array_equal(counts.cpu().numpy(), expected_local)),
         policy="cpu_mixed_error",
         reference="cached_numpy_quantization_aware_not_bitwise",
@@ -276,6 +290,7 @@ def main():
     )
     parser.add_argument("--relative-rmse", type=float, default=0.02, help="Timer on/off output tolerance only")
     parser.add_argument("--dual-reference", action="store_true", help="Compare CPU Golden and NPU cascade")
+    parser.add_argument("--cascade-only", action="store_true", help="Check only the NPU cascade against an existing CPU Golden")
     comparison = parser.add_mutually_exclusive_group()
     comparison.add_argument("--compare-decode-cascade", action="store_true",
                             help="Compare fused MegaMoE with the moe_test Decode operator cascade")
@@ -283,6 +298,8 @@ def main():
                             help="Compare fused MegaMoE with the GELU AllToAll Prefill cascade")
     args = parser.parse_args()
     config = load_config(args.config, args.bs_values)
+    if args.cascade_only and (args.mode != "accuracy" or args.dual_reference or args.timer):
+        parser.error("--cascade-only requires standalone accuracy without dual-reference or timer")
     if args.check_tokens < 0 or not 0 < args.relative_rmse < 1:
         parser.error("Invalid accuracy sample count or tolerance")
     if args.mode != "perf" and (args.perf_scope != "all" or args.paired_weights):
@@ -344,7 +361,7 @@ def _run(args, config, group, monitors):
     roce = backend == "mte_roce"
     import torch
     from .api import SymmBuffer, fp8_fp4_mega_moe, transform_weights_for_mega_moe
-    from .reference import make_weights, quantize_activation
+    from .reference import make_weights
     rank, world = group.rank(), group.size()
     ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", world))
     perf_scope = getattr(args, "perf_scope", "all")
@@ -373,6 +390,7 @@ def _run(args, config, group, monitors):
             args.check_tokens,
             args.relative_rmse,
             bool(getattr(args, "dual_reference", False)),
+            bool(getattr(args, "cascade_only", False)),
             sample_peak,
             perf_scope,
             paired_weights,
@@ -486,6 +504,14 @@ def _run(args, config, group, monitors):
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
     )
+    if getattr(args, "cascade_only", False):
+        from .cascade_accuracy import run_cascade_accuracy
+
+        manifest.update(api="CascadeReference", device_communication="hccl", accuracy_stage="cascade")
+        (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        run_cascade_accuracy(args, config, group, rank_dir, sample_peak)
+        group.close()
+        return
     if device_identity is not None:
         manifest["device_identity"] = device_identity
     if urma:
@@ -614,12 +640,7 @@ def _run(args, config, group, monitors):
         if args.input == "bf16":
             activation = torch.from_numpy(x).to(device="npu", dtype=torch.bfloat16)
         else:
-            for begin in range(0, bs, 256):
-                rows = slice(begin, min(bs, begin + 256))
-                data, scale = quantize_activation(x[rows], mma_type)
-                codes = torch.from_numpy(data).npu()
-                buffer.x[rows].copy_(codes if mma_type == "fp4xfp4" else codes.view(torch.float8_e4m3fn))
-                buffer.x_sf[rows].copy_(torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
+            copy_quantized_input(x, mma_type, buffer.x, buffer.x_sf)
             activation = None
         buffer.topk_idx[:bs].copy_(torch.from_numpy(ids))
         buffer.topk_weights[:bs].copy_(torch.from_numpy(weights))
