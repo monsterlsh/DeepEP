@@ -107,8 +107,9 @@ def test_only_complete_json_replaces_a_published_record(tmp_path):
     assert list(tmp_path.iterdir()) == [path]
 
 
-def test_mte_packed_fp4_cache_requires_matching_backend_and_input(tmp_path):
-    previous, output = case(tmp_path)
+@pytest.mark.parametrize("dual", [False, True])
+def test_mte_packed_fp4_cache_requires_matching_backend_and_input(tmp_path, dual):
+    previous, output = case(tmp_path, dual=dual)
     identity = dict(previous.identity, backend="mte", input="fp4")
     cache = AccuracyCache(tmp_path, identity)
     with pytest.raises(ValueError, match="manifest does not match"):
@@ -116,7 +117,9 @@ def test_mte_packed_fp4_cache_requires_matching_backend_and_input(tmp_path):
     for manifest_path in output.glob("rank_*/manifest.json"):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest.update(backend="mte", input="fp4")
-        manifest.pop("dual_reference")
+        if not dual:
+            # Legacy single-reference MTE reports omitted the field.
+            manifest.pop("dual_reference")
         atomic_write_json(manifest_path, manifest)
     cache.publish(output)
     assert cache.lookup() == output
@@ -140,3 +143,27 @@ def test_same_entry_lock_serializes_workers(tmp_path):
             assert not entered.wait(0.15)
         future.result(timeout=5)
     assert entered.is_set()
+
+
+def test_sampled_request_checks_each_ranks_hbm_measurement(tmp_path):
+    unsampled, output = case(tmp_path)
+    unsampled.publish(output)
+    sampled = AccuracyCache(tmp_path, dict(unsampled.identity, profile_memory_peak=True))
+    assert sampled.lookup() is None
+    for manifest_path in output.glob("rank_*/manifest.json"):
+        manifest = json.loads(manifest_path.read_bytes())
+        atomic_write_json(manifest_path, dict(manifest, profile_memory_peak=True))
+        path = manifest_path.parent / "bs_16/resources.json"
+        resources = dict(device_memory_peak=dict(peak_used_bytes=0, sample_count=2),
+                         device_memory_peak_group=dict(rank_count=2, max_peak_used_bytes=1))
+        atomic_write_json(path, resources)
+    sampled.publish(output)
+    assert sampled.lookup() == output
+    path = output / "rank_1/bs_16/resources.json"
+    resources["device_memory_peak"]["peak_used_bytes"] = 1
+    atomic_write_json(path, resources)
+    assert sampled.lookup() is None
+    path.unlink()
+    assert sampled.lookup() is None
+    with pytest.raises(FileNotFoundError):
+        sampled.publish(output)

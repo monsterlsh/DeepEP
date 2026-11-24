@@ -40,14 +40,21 @@ def test_golden_finishes_everywhere_before_npu(tmp_path, monkeypatch):
     assert stages == ["golden", "accuracy"]
 
 
-def test_l04_pairs_profile_both_arms(tmp_path, monkeypatch):
+@pytest.mark.parametrize("options, expected, absent", [
+    ({}, {"--profile"}, {"--profile-memory-peak", "--memory-only"}),
+    ({"profile_memory_peak": True}, {"--profile", "--profile-memory-peak"}, {"--memory-only"}),
+    ({"profile_memory_peak": False}, {"--profile", "--no-profile-memory-peak"}, {"--memory-only"}),
+    ({"perf_scope": "memory", "profile_memory_peak": True}, {"--memory-only", "--profile-memory-peak"}, {"--profile"}),
+])
+def test_l04_pairs_profile_both_arms(tmp_path, monkeypatch, options, expected, absent):
     stages = []
-    data = job(tmp_path, mode="perf")
+    data = job(tmp_path, mode="perf", **options)
 
     def capture(name, commands, args, nodes):
         for rank, command in enumerate(commands):
             assert f"--node-rank={rank}" in command
-            assert {"--nnodes=4", "--nproc-per-node=8", "--profile"} <= set(command)
+            assert {"--nnodes=4", "--nproc-per-node=8"} | expected <= set(command)
+            assert not absent.intersection(command)
             assert command[command.index("--bs") + 1] == "39280"
             assert command[command.index("--pairs") + 1] == "8"
             model = command[command.index("--config") + 1]
@@ -78,3 +85,16 @@ def test_native_timer_rank_list(tmp_path, monkeypatch):
         l0_pod.run_pod_job(dict(data, precision="a8w8"), cfgdir, nodes=NODES, plan=True)
     with pytest.raises(ValueError, match="master_addr"):
         l0_pod.run_pod_job(data, cfgdir, nodes=NODES[::-1], plan=True)
+
+
+@pytest.mark.parametrize("ep", [8, 16])
+def test_small_l04_pair_only_starts_required_nodes(tmp_path, monkeypatch, ep):
+    data = dict(job(tmp_path, mode="perf"), ep_size=ep)
+    nodes = NODES[:ep // 8]
+    launches = []
+    monkeypatch.setattr(l0_pod, "_supervise", lambda name, commands, args, hosts: launches.append((commands, hosts)))
+    l0_pod.run_pod_paired(data, tmp_path / "configs", nodes=nodes)
+    (commands, hosts), = launches
+    assert hosts == nodes and len(commands) == len(nodes)
+    for rank, cmd in enumerate(commands):
+        assert {f"--nnodes={len(nodes)}", "--nproc-per-node=8", f"--node-rank={rank}"} <= set(cmd)

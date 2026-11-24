@@ -261,9 +261,10 @@ int main() {
     assert(MteWorkspaceWindowSlots(large) == 3 && MteWorkspaceWindowed(large));
     // The public 39,280 rows include a 112-row tail at W256. Both GMM inputs
     // are nibble-packed in A4W4, including the output of GELU/SwiGLU.
-    for (int topk : {25, 32}) for (int rows : {256, 39280 % 256}) for (int early : {0, 1}) {
-        for (bool gelu : {true, false}) {
-            auto t = MakeTiling(rows, 4096, gelu ? 1536 : 3072, topk, 50, 16, 256, 0,
+    for (int world : {4, 8, 16, 32}) for (int topk : {25, 32}) for (int rows : {256, 39280 % 256}) {
+        const int local = (world == 4 ? 384 : 800) / world;
+        for (int early : {0, 1}) for (bool gelu : {true, false}) {
+            auto t = MakeTiling(rows, 4096, gelu ? 1536 : 3072, topk, local, world, 256, 0,
                                 false, true, 0, platform, early, gelu ? "gelu" : "swiglu");
             assert(t.groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ);
             assert(t.dispatchBufferConfig.copyBufferBytes == CalcQuantTokenScaleBytes(4096, 2, topk, early));
@@ -271,22 +272,23 @@ int main() {
             auto capacity = MteWorkspaceRowCapacity(t);
             assert(w.dispatchRevScalePtr - w.dispatchRevDataPtr == int64_t(capacity) * 2048);
             assert(w.activationQuantScalePtr - w.activationQuantDataPtr == int64_t(capacity) * 768);
-            assert(t.maxOutputSize == unsigned(256 * 16 * topk));
+            assert(t.maxOutputSize == unsigned(256 * world * std::min(topk, local)));
         }
     }
-    for (int world : {8, 16, 32}) for (int topk : {25, 32}) for (bool w4 : {true, false}) {
-        PeermemSizeParams params{256, topk, 4096, 800/world, world, 2, 1, true, false, TOPO_TYPE_MTE, true};
+    for (int world : {4, 8, 16, 32}) for (int topk : {25, 32}) for (bool w4 : {true, false}) {
+        const int local = (world == 4 ? 384 : 800) / world;
+        PeermemSizeParams params{256, topk, 4096, local, world, 2, 1, true, false, TOPO_TYPE_MTE, true};
         const auto required = AlignUp<int64_t>(EXCEPTION_DUMP_REGION_SIZE + CalcPeermemLeastSize(params), 2LL << 20);
         assert(required < (1LL << 30));
         params.numMaxTokensPerRank = 39280;
         assert(CalcPeermemLeastSize(params) > (1LL << 30));
         int64_t previous = 0;
         for (int bs : {256, 112}) {
-            auto t = MakeTiling(bs, 4096, 1536, topk, 800/world, world, 256, 0, w4, false, 0,
+            auto t = MakeTiling(bs, 4096, 1536, topk, local, world, 256, 0, w4, false, 0,
                                 PlatformInfo{28, 56, 248*1024, 0, 0}, 1, "gelu");
             WorkspaceInfo info(nullptr, &t);
             assert(t.numMaxTokensPerRank == 256 && t.bs == bs);
-            assert(t.maxOutputSize == 256 * world * std::min(topk, 800/world));
+            assert(t.maxOutputSize == 256 * world * std::min(topk, local));
             assert(t.maxTilesPerExpert == unsigned(world * 6));
             assert(!UseDecodeRailRouting(&t));
             assert(info.workspaceSize > 0);

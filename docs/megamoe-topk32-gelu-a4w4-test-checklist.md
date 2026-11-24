@@ -2,7 +2,7 @@
 
 转测目标 · 核对旧路径无回退，验收 TopK32、GELU 加权、A4W4 和 EP32 大用例，并建立融合与小算子级联的时延、通信掩盖率、显存占用及 HBM 读写带宽基线。
 
-共 94 个对照组。一个编号对应一组配置。该组的分支、激活 A/B、融合和级联分别留结果，计时重复轮次与独立采集轮次按同一编号归档。交接时先看[当前验收进度](#当前验收进度)，逐项结果和原始产物在本文登记。
+共 **403 个对照组**，由平台、EP 和模型配置共同标识。原 94 组继续使用原编号和结果，新增 309 组。每组分别归档分支、激活 A/B、融合与级联的结果。交接时先看[分平台 EP 验收矩阵](#分平台-ep-验收矩阵)和[当前验收进度](#当前验收进度)。
 
 ## 测试验证与复现方法
 
@@ -97,13 +97,124 @@ fi
 
 K37 用 [N 方法](#n-直接启动融合) 另采 timer。两组按[显存占用方法](#ubx-与-950pod-显存复测)采 M，按[HBM 带宽方法](#hbm-显存带宽采集)采 H。归档 `accuracy.json`、`profiling.json`、`prefill_comparison.json`、原始 timer 和设备显存日志。其他 Case 按自己的表行和方法链接复用这套执行顺序。
 
-| 验证范围 | Case 编号 | 组数 | 完成判据 |
+### 分平台 EP 验收矩阵
+
+UBX 和 950POD 各有 55 个模型配置，每个配置分别登记 EP4、EP8、EP16，共 330 组。其中 UBX EP16 的 K01–K18 和 950POD EP8 的 C01–C03 已在原清单中。另保留 73 组原 EP32 配置。相同编号换平台或 EP 后单独归档，比较时固定每卡 BS、全局专家数、路由、精度和加权阶段。
+
+| 场景 | EP4 / EP8 / EP16 每平台每种 EP 的用例 | 每种 EP 两平台合计 | 原 EP32 | 合计 | 验收重点 |
+| --- | --- | ---: | ---: | ---: | --- |
+| 仓基准 | R01–R07 | 14 | 7 | 49 | 核对同平台同 EP 的分支时延、带宽和掩盖率。新拓扑需重建基线。 |
+| Decode | C01–C03 | 6 | 0 | 18 | 每卡 BS96，融合与 Decode 级联。 |
+| TopK 与激活 | UBX K01–K18，950POD K37–K54 | 36 | 36 | 144 | K25/K32 × 三种激活加权组合 × 三种精度。UBX EP32 沿用 K19–K36。 |
+| 大用例 | UBX L01–L03，950POD L04–L06 | 6 | 6 | 24 | 固定每卡 BS39280、H4096/I1536、E800/K25，比较同 EP 的 A/B 与 GELU Prefill。 |
+| 豆包 | D01–D24 | 48 | 24 | 168 | 两档 groupsize、四档 BS、三种精度，分别记录生效证据。 |
+| **合计** | | **110** | **73** | **403** | |
+
+| 申请的 EP | UBX | 950POD（B05） | 每台的默认 timer 逻辑卡号 |
 | --- | --- | --- | --- |
-| [仓基准回归](#仓基准回归) | R01–R07 | 7 | 在共同支持的口径下确认时延、带宽和掩盖率无回退。 |
-| TopK 与激活 | K01–K54 | 54 | 覆盖 K25 和 K32、三种激活加权组合，以及三种量化精度。 |
-| [EP32 大用例](#ep32-大用例) | L01–L06 | 6 | 目标配置通过精度。比较 A/B 的 E2E 与总掩盖率，并测 GELU Prefill 级联。 |
-| 豆包用例 | D01–D24 | 24 | 固定平台，对两档 groupsize、四档 BS、三种精度记录性能、显存及精度。 |
-| Decode 回归 | C01–C03 | 3 | 验证 SwiGLU 和 GELU 两条 Decode 级联各自的算子路径及性能。 |
+| 4 | .84 单机 4 卡，MTE | os1 单机 4 卡，MTE | 0、1、2、3 |
+| 8 | .84 单机 8 卡，MTE | os1 单机 8 卡，MTE | 0、2、4、6 |
+| 16 | .84 单机 16 卡，MTE | os1、os2 各 8 卡，MTE | UBX 为 0、4、8、12；950POD 每机为 0、2、4、6 |
+| 32 | .84、.188 各 16 卡，MTE+RoCE | os1、os2、os7、os8 各 8 卡，MTE | 每台沿用各自 EP16 的局部卡号 |
+
+**单组复现。** 在仓库根目录用[矩阵入口](../experiments/megamoe/scripts/acceptance_cases.py)列出所选拓扑，再生成这一组的运行 JSON。下面的 K01 是 UBX 上每卡 BS4096、K25、GELU Finalize 加权、A8W4 的融合性能。预览通过后在 .84 上执行。
+
+```bash
+MATRIX=experiments/megamoe/scripts/acceptance_cases.py
+RUN=experiments/megamoe/scripts/run_megamoe.py
+python3 "$MATRIX" list --machine ubx --ep-size 4
+python3 "$MATRIX" generate --machine ubx --ep-size 4 --case K01 --phase perf --output K01-ubx-ep4-perf.json
+python3 "$RUN" --run-config K01-ubx-ep4-perf.json --plan
+python3 "$RUN" --run-config K01-ubx-ep4-perf.json
+```
+
+**950POD 复现。** L 组从 os1 运行一次，按 JSON 中的节点顺序启动。例如在 B05 跑 EP16 的 L04 融合 A/B、设备 timer 与 Prefill 对照，用：
+
+```bash
+python3 "$MATRIX" generate --machine 950pod --ep-size 16 --case L04 --phase perf --output L04-pod-ep16-perf.json
+python3 "$RUN" --run-config L04-pod-ep16-perf.json --plan
+python3 "$RUN" --run-config L04-pod-ep16-perf.json
+```
+
+普通 950POD 多机用例在各节点并行启动。例如 K37 EP16 用 os1 和 os2，每个节点将 `NODE_RANK` 分别设为 0 和 1，`OUT` 取两机相同的本轮新共享路径。单机 EP4/EP8 只启动一份。运行小 EP 前按本次源代码构建并在所有参与节点安装同一份对应平台的 wheel，L04–L06 的预设 Python 要指向该环境。
+
+```bash
+# os1 用 0，os2 用 1
+NODE_RANK=0
+OUT=/mnt/share/l00911701_megamoe_b05/runs/K37-ep16-perf-run01
+CFG=K37-ep16-perf-node${NODE_RANK}.json
+python3 "$MATRIX" generate --machine 950pod --ep-size 16 --case K37 --phase perf \
+  --node-rank "$NODE_RANK" --results "$OUT" --output "$CFG"
+python3 "$RUN" --run-config "$CFG"
+```
+
+`list` 输出每组的实际参数、可运行阶段 `phases` 和限制 `limitation`。用 `--phase accuracy` 跑全量双参考，`perf` 测性能，`memory` 专测峰值，普通用例的 `timer`、`decode`、`prefill` 按该行可用阶段生成。L 组性能阶段自动编排适用的对照与打点。K32 的热点与零接收 rank 用 `accuracy-skewed` 另测。配置文件每个阶段独立命名。
+
+**待测结果。** 每组按照 `平台 / EP / Case / 臂` 填 Q（全 rank 双参考）、P（融合与适用级联的 kernel、同步 E2E、全组吞吐）、C（Dispatch、Combine、总掩盖率及采样 rank）、M（设备峰值 GiB、占比、最小余量）、H（HBM 读/写 GB/s 和采样覆盖）。性能、timer、显存和 HBM 带宽使用独立采集轮。历史结果只计入原平台、原 EP。缩小 EP 会增加每卡专家数及权重显存，比较时记录实选窗口和每卡专家数。
+
+**已知边界。** 330 个小 EP 组合中有 180 组可生成实机阶段计划。L 组在 EP4 时每卡有 200 个专家，超过 native 上限 128，两平台六组保留为阻塞。EP8、EP16 分别是每卡 100、50 个专家。144 组小 EP 豆包用例在落实生产 `groupsize` 配置键和实际生效证据前保留为待接入。普通 MTE 的 A8W8 可以跑时延和精度，设备掩盖率待 timer 支持。950POD 小 EP 上的 SwiGLU 整批超过对称区容量时使用分窗。L04 的同窗性能见 `paired/paired.json`，独立两臂的实际窗口不同时，首窗掩盖率标为不可比。
+
+#### 小 EP 逐组结果登记
+
+每格对应一个独立用例。实测后将“待测”替换为本轮报告路径及已有的 Q/P/C/M/H 数值或缺项。标“原表”的格沿用下方原编号行的进度。L 按两臂记录，C 另记 Decode 对照，K 另记 Prefill 对照。
+
+| UBX 编号 / 950POD 编号 | 每卡 BS · K · 激活和加权 · 精度 | UBX EP4 | UBX EP8 | UBX EP16 | 950POD EP4 | 950POD EP8 | 950POD EP16 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| R01 | 96 · K6 · SwiGLU后加权 · A8W4 · S0 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| R02 | 96 · K6 · SwiGLU后加权 · A8W4 · S1 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| R03 | 4096 · K6 · SwiGLU后加权 · A8W4 · S0 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| R04 | 4096 · K6 · SwiGLU后加权 · A8W4 · S1 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| R05 | 8192 · K6 · SwiGLU后加权 · A8W4 · S1 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| R06 | 12288 · K6 · SwiGLU后加权 · A8W4 · S1 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| R07 | 16384 · K6 · SwiGLU后加权 · A8W4 · S1 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| C01 | 96 · K8 · SwiGLU后加权 · A8W4 | 待测 | 待测 | 待测 | 待测 | 原表 | 待测 |
+| C02 | 96 · K8 · SwiGLU后加权 · A8W8 | 待测 | 待测 | 待测 | 待测 | 原表 | 待测 |
+| C03 | 96 · K8 · GELU后加权 · A8W8 | 待测 | 待测 | 待测 | 待测 | 原表 | 待测 |
+| K01 / K37 | 4096 · K25 · GELU后加权 · A8W4 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K02 / K38 | 4096 · K25 · GELU后加权 · A8W8 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K03 / K39 | 4096 · K25 · GELU后加权 · A4W4 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K04 / K40 | 4096 · K25 · GELU提前 · A8W4 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K05 / K41 | 4096 · K25 · GELU提前 · A8W8 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K06 / K42 | 4096 · K25 · GELU提前 · A4W4 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K07 / K43 | 4096 · K25 · SwiGLU后加权 · A8W4 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K08 / K44 | 4096 · K25 · SwiGLU后加权 · A8W8 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K09 / K45 | 4096 · K25 · SwiGLU后加权 · A4W4 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K10 / K46 | 4096 · K32 · GELU后加权 · A8W4 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K11 / K47 | 4096 · K32 · GELU后加权 · A8W8 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K12 / K48 | 4096 · K32 · GELU后加权 · A4W4 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K13 / K49 | 4096 · K32 · GELU提前 · A8W4 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K14 / K50 | 4096 · K32 · GELU提前 · A8W8 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K15 / K51 | 4096 · K32 · GELU提前 · A4W4 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K16 / K52 | 4096 · K32 · SwiGLU后加权 · A8W4 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K17 / K53 | 4096 · K32 · SwiGLU后加权 · A8W8 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| K18 / K54 | 4096 · K32 · SwiGLU后加权 · A4W4 | 待测 | 待测 | 原表 | 待测 | 待测 | 待测 |
+| L01 / L04 | 39280 · K25 · A/B · A8W4 | E200 超限 | 待测 | 待测 | E200 超限 | 待测 | 待测 |
+| L02 / L05 | 39280 · K25 · A/B · A8W8 | E200 超限 | 待测 | 待测 | E200 超限 | 待测 | 待测 |
+| L03 / L06 | 39280 · K25 · A/B · A4W4 | E200 超限 | 待测 | 待测 | E200 超限 | 待测 | 待测 |
+| D01 | 1024 · K8 · GELU提前 · A8W4 · GS256 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D02 | 1024 · K8 · GELU提前 · A8W8 · GS256 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D03 | 1024 · K8 · GELU提前 · A4W4 · GS256 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D04 | 2048 · K8 · GELU提前 · A8W4 · GS256 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D05 | 2048 · K8 · GELU提前 · A8W8 · GS256 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D06 | 2048 · K8 · GELU提前 · A4W4 · GS256 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D07 | 4096 · K8 · GELU提前 · A8W4 · GS256 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D08 | 4096 · K8 · GELU提前 · A8W8 · GS256 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D09 | 4096 · K8 · GELU提前 · A4W4 · GS256 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D10 | 8192 · K8 · GELU提前 · A8W4 · GS256 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D11 | 8192 · K8 · GELU提前 · A8W8 · GS256 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D12 | 8192 · K8 · GELU提前 · A4W4 · GS256 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D13 | 1024 · K8 · GELU提前 · A8W4 · GS512 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D14 | 1024 · K8 · GELU提前 · A8W8 · GS512 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D15 | 1024 · K8 · GELU提前 · A4W4 · GS512 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D16 | 2048 · K8 · GELU提前 · A8W4 · GS512 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D17 | 2048 · K8 · GELU提前 · A8W8 · GS512 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D18 | 2048 · K8 · GELU提前 · A4W4 · GS512 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D19 | 4096 · K8 · GELU提前 · A8W4 · GS512 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D20 | 4096 · K8 · GELU提前 · A8W8 · GS512 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D21 | 4096 · K8 · GELU提前 · A4W4 · GS512 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D22 | 8192 · K8 · GELU提前 · A8W4 · GS512 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D23 | 8192 · K8 · GELU提前 · A8W8 · GS512 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
+| D24 | 8192 · K8 · GELU提前 · A4W4 · GS512 | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS | 待 GS |
 
 ### 开测前确认
 
@@ -113,7 +224,7 @@ K37 用 [N 方法](#n-直接启动融合) 另采 timer。两组按[显存占用�
 
 ## 当前验收进度
 
-更新于 2026-11-24。**94 组中，整组验收完成 0 组。** 本轮 950POD 有 9 组可核对原始报告的融合性能、3 组 balanced 全量双参考、7 组可从正式性能轮提取的设备级 HBM 观察值。三项按指标分别计数，同一 Case 可以同时出现。按编号去重，本轮有可核对实测的共 9 组，另有 C03 仅有性能转录和级联失败日志，R01–R04 仅有历史分支对照。其余 80 组待采。
+更新于 2026-11-24。**403 组中，整组验收完成 0 组。** 原 94 组中，950POD 有 9 组可核对原始报告的融合性能、3 组 balanced 全量双参考、7 组可从正式性能轮提取的设备级 HBM 观察值。三项按指标分别计数，同一组可以同时出现。按拓扑和编号去重，有可核对实测的共 9 组，另有 C03 仅有性能转录和级联失败日志，R01–R04 仅有历史分支对照。原清单其余 80 组与新加的 309 组均待实测或解除所列阻塞。
 
 | 环境与范围 | 组数 | 已有结果 | 待验收事项 |
 | --- | ---: | --- | --- |
@@ -123,8 +234,9 @@ K37 用 [N 方法](#n-直接启动融合) 另采 timer。两组按[显存占用�
 | 950POD EP32 · K37–K54 | 18 | K37/K39/K46/K48 有融合 P、Torch 显存和 HBM 观察值；K37/K39/K48 的 balanced Q 通过 | K37 修复包 P/C/M/H、K32 压测、Prefill 对照及其余 14 组实测 |
 | 950POD EP32 · L04–L06 | 3 | 三组均有 A 臂融合 P、Torch 显存及 HBM 观察值；历史同窗 A/B 中 L04 达标、L06 未达标 | 本轮同窗 A/B 性能与掩盖率、两臂全量 Q 和 GELU Prefill |
 | 950POD EP8 · C01–C03 | 3 | C01/C02 有融合 P 和 Torch 显存；C03 有用户回传值 | C03 融合原始报告、Decode 对照、三组 Q 和短时 HBM 复采 |
+| 两平台扩展拓扑 · 去重后新增 | 309 | 尚无新增拓扑的实机报告 | 按矩阵逐组执行，记录 P/C/Q/M/H 或对应阻塞 |
 
-UBX 先前回传的 EP16 Dispatch 39.76%、Combine 81.48% 缺少可核对的完整 profile 与采样配置，单列为观察记录，暂不计入这 94 组的验收结果。
+UBX 先前回传的 EP16 Dispatch 39.76%、Combine 81.48% 缺少可核对的完整 profile 与采样配置，单列为观察记录，暂不计入验收结果。
 
 转测优先补三项。先在 K37 修复 wheel 上复采融合 P/C/M/H，保留 W2048 × 2；再用同一构建和相同窗口复测 L04/L06 的 A/B，核对两个验收门槛；随后补齐 K37 Prefill 和 C03 Decode 级联阻塞的性能对照。UBX 以对应 U16/U32 后端单独归档。
 
@@ -204,7 +316,7 @@ L04 历史 Q 为 A 臂 32/32、每卡抽 64 token，最大绝对误差 0.0002441
 
 [UBX EP16 运行预设](../experiments/megamoe/scripts/configs/ubx_ep16_target.json) · [UBX EP32 运行预设](../experiments/megamoe/scripts/configs/ubx_ep32_target.json) · [掩盖率采集](../experiments/megamoe/scripts/ubx_overlap_quickstart.md)
 
-U16 为单机 EP16 MTE。U32 为双机 EP32 MTE+RoCE。按各 case 所在表的“方法”列选择。
+U4、U8、U16 分别取 .84 上 4、8、16 张卡使用本机 MTE。U32 为双机 EP32 MTE+RoCE。小 EP 的 JSON、采样卡号见[分平台 EP 验收矩阵](#分平台-ep-验收矩阵)。
 
 ### U16 与 U32 启动准备
 
@@ -241,7 +353,7 @@ python3 "$RUN" --run-config "$PREFILL_JSON" --compare-prefill-cascade
 
 [950POD 运行预设](../experiments/megamoe/scripts/configs/950pod_target.json) · [同窗对照说明](../experiments/megamoe/scripts/paired_benchmark.md)
 
-P32 为四台各 8 卡的 EP32，B05 主地址 177.22.21.1。P8 为 B05 单机 8 卡。
+P4/P8 为 B05 单机 4/8 卡，P16 为两台各 8 卡，P32 为四台各 8 卡。B05 主地址为 177.22.21.1。
 
 ### P32 与 P8 启动准备
 
@@ -293,7 +405,25 @@ export DEEPEP_SHMEM_ENDPOINT="tcp://${MASTER}:29180"
 
 ### UBX 与 950POD 显存复测
 
-每台先记录空载，再同步采集每卡数据，区分权重和 workspace 准备后的常驻点、稳定执行时的峰值及退出前快照。使用同一批物理卡和一致采样周期。各臂单独运行。当前级联性能工具的两臂共驻显存仅供共驻诊断，级联单臂峰值待独立入口。
+每个 Case 的 M 栏填写 **整卡采样峰值（GiB）、峰值占用率（%）、对应 rank 和有效卡数**。UBX、950POD 的精度作业默认采样，正式性能、级联计时与 timer 作业默认关闭。部署包含 `device_memory.py` 的 wheel 到参与节点，再用同版启动脚本。对比同一批物理卡，并记录运行前空载情况，整卡读数包含同卡其他进程。
+
+从仓库根目录独立复测 L01 的显存，替换 JSON 即可用于 L02–L06：
+
+```bash
+python experiments/megamoe/scripts/run_megamoe.py --run-config experiments/megamoe/scripts/configs/l0/L01.json --only memory
+```
+
+K、C、D 等其他 Case 复制各自的性能 JSON，在外层设置 `"mode": "perf"`、`"perf_scope": "memory"`、`"profile_memory_peak": true`、`"timer": false` 并指定新的输出目录，保留该 Case 的模型、拓扑和融合或级联开关。直接 torchrun 运行 benchmark 时对应参数为 `--mode perf --perf-scope memory --profile-memory-peak`。显存轮执行预热及正式次数的 forward，跳过性能计时和 profiler。
+
+每个 rank 在共享初始化及各 BS 执行期间，按 **10 ms** 间隔并在阶段首尾读取设备总量和剩余量。峰值占用率取该卡采到的最大已用字节 / 设备总字节 × 100%。短于采样间隔的尖峰可能漏采，可用 `case_periodic_sample_count` 核对该 BS 执行期间取得的周期样本数。同一进程测试多个 BS 时，共同的初始化峰值计入各 BS，前一 BS 留存的张量和分配器缓存也可能影响后续读数。需要独立比较时，每次只配置一个 BS。
+
+| 回填项 | 数据位置及口径 |
+| --- | --- |
+| 每卡峰值和阶段 | `rank_<r>/bs_<B>/resources.json` 的 `device_memory_peak`。读 `peak_used_gib`、`peak_used_pct`、`sample_count`。普通 benchmark 的 `setup_peak_used_bytes` 和 `case_peak_used_bytes` 分别表示准备阶段和本 BS 执行阶段的采样最高值。 |
+| 全组最紧的卡 | 同文件 `device_memory_peak_group`。记录 `max_peak_used_bytes`、`max_peak_used_pct` 和各自对应的 rank，同时记录 `min_headroom_bytes` 与 `rank_count`。L0 还把该对象和原始报告路径写到 `run-summary.json` 的对应 job。 |
+| 显存归属 | 单独的 GELU、SwiGLU 融合作业分别回填。双参考、融合与级联对照、950POD 配对基准按报告的共驻范围填写。原有 `device_free_after_case_bytes` 继续表示结束快照，Torch 的 allocated/reserved 单独记录。 |
+
+需要设备侧采样日志时，可在每个节点额外留存：
 
 ```bash
 while true; do date -Iseconds; npu-smi info; sleep 1; done > "$HBM_LOG"
@@ -303,9 +433,9 @@ while true; do date -Iseconds; npu-smi info; sleep 1; done > "$HBM_LOG"
 
 ### HBM 显存带宽采集
 
-UBX U16/U32、950POD P8/P32 均按 Case、构建和臂单独采集，保留每个 rank 的 profiler 数据、设备 ID、时钟域、采样周期、正式轮及 kernel 名。HBM 读写以十进制 GB/s 表示。M 的显存峰值以 GiB 表示，C 的有效带宽按通信 payload/通信时长计算。
+两平台各 EP 均按 Case、构建和臂单独采集，保留每个 rank 的 profiler 数据、设备 ID、时钟域、采样周期、正式轮及 kernel 名。HBM 读写以十进制 GB/s 表示。M 的显存峰值以 GiB 表示，C 的有效带宽按通信 payload/通信时长计算。
 
-1. 在独立输出目录运行同参数的正式性能配置，timer 关闭。核对正式轮数、每轮窗口数及 `profiling.json`。对融合臂取同一设备同一轮的首末融合 kernel；对级联取该臂一次 forward 的完整设备跨度。EP16、EP32 和 EP8 分别核对 16、32 和 8 个 rank。
+1. 在独立输出目录运行同参数的正式性能配置，timer 关闭。核对正式轮数、每轮窗口数及 `profiling.json`。对融合臂取同一设备同一轮的首末融合 kernel，级联取该臂一次 forward 的完整设备跨度。核对参与的 rank 数等于该组 EP。
 2. 检查各 rank 的 `ASCEND_PROFILER_OUTPUT/ascend_pytorch_profiler_*.db` 是否有 `HBM` 及同设备时钟的任务时间。用相邻采样区间积分，先汇总该设备各 HBM 分片，再对有效卡汇总，并登记分母、样本数和异常处理。缺少时间戳或轮次对应关系时，全程 `hbm_*.csv` 的 Average 仅能作为整段 profile 的观察记录。[CANN 显存读写速率字段](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/devaids/Profiling/atlasprofiling_16_0084.html)
 3. 重采时先检查本机 `msprof --help` 支持的设备级 `--sys-hardware-mem` 和 `--sys-hardware-mem-freq`；B05 b112 的 HBM 采样最高 100 Hz。短 Decode 可在同一臂安排连续稳定的重复批次，记录起止和迭代次数，以批次报告设备带宽。需要单个 kernel 的主存访问数据时，另开 PMU profiling，B05 可选 `AiCMetrics.Memory` 并检查实际导出的主存读写字段，按 AI Core 边界单列。UBX 以该机 CANN 版本的实采字段和分片数为准。[CANN 系统硬件采样参数](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910beta2/devaids/Profiling/atlasprofiling_16_0012.html)
 
@@ -391,7 +521,7 @@ Case 表的 **P / C / Q / M / H** 分别对应性能、通信、精度、显存�
 | --- | --- | --- |
 | P 性能 | kernel 总时延、设备跨度、同步 E2E（µs），输入吞吐（token/s）。级联另记加速比。 | 关闭 timer 做正式计时。kernel 取 `profiling.json.rank_max_mean_us`，同步 E2E 取 `host_e2e.rank_max_mean_us`，吞吐取 `host_e2e.global_input_tokens_per_second`。分别记录各自的正式轮数。加速比按级联耗时 / 融合耗时。 |
 | C 通信 | Dispatch、Combine、总掩盖率（%），有效带宽（GB/s）及字节和时间口径。 | 独立打点。仅比较相同后端、事件范围和采样 rank 的结果。分子为通信与计算交集，分母为通信时长。总通信先合并两段区间，再计算占比。级联有可比独立 trace 时另记。 |
-| M 显存 | 每卡常驻和设备峰值（GiB），汇总峰值 rank。另记 PyTorch allocated/reserved 峰值、workspace、对称缓冲区。 | 融合、级联、A/B 和各分支分别起独立进程。当前原生 benchmark 可追加 --perf-scope host，关闭 profiler 和 timer。结束剩余量填作结束快照。 |
+| M 显存 | 每卡常驻量、整卡采样峰值（GiB、%）、峰值 rank、最小余量和有效卡数。另记 PyTorch allocated/reserved 峰值、workspace、对称缓冲区。 | 按[显存复测](#ubx-与-950pod-显存复测)读取各 Case 的 resources.json。分臂比较使用独立作业，级联对照的共驻值单列。 |
 | H 显存带宽 | 记录单卡 HBM 读、写及同一时段读写合计（GB/s），注明有效 rank 数、正式轮次及采样范围。 | 从设备 HBM 计数器取数。分臂汇总有效卡均值，附单卡值；容量、通信 payload 带宽另填 M、C。[采集方法](#hbm-显存带宽采集) |
 | Q 精度 | 通过 rank 数、校验 token 数、最大误差、专家计数及最终结论。 | 独立运行 accuracy。当前融合与 CPU Golden、独立 NPU 精度级联按 --dual-reference 误差预算比较。所有 rank 的 `passed`、`finite`、`counts_equal` 和 `cascade_counts_equal` 均通过，另记 `checked_tokens`、`bad_elements` 和融合对 CPU 的 `max_abs_error`。保存三方指标。 |
 
@@ -420,7 +550,7 @@ K 组有 18 个 SwiGLU Prefill 用例待同激活实测。首轮 wheel 的 Prefi
 
 ## 仓基准与 Decode 用例
 
-R 组全部使用 P32 和 N 方法。C 组使用 P8，Decode 对照用 W 方法，首轮 C01/C02 的独立融合数据用 N 方法。BS 均为每卡 token 数。
+下表的原始 R 组使用 P32 和 N 方法，原始 C 组使用 P8，Decode 对照用 W 方法，首轮 C01/C02 的独立融合数据用 N 方法。扩展拓扑沿用表内每卡 BS、模型和激活，按[分平台 EP 验收矩阵](#分平台-ep-验收矩阵)生成运行 JSON。
 
 ### 仓基准回归
 
@@ -539,7 +669,9 @@ SwiGLU 的 A8W4/A8W8 在 BS4096 的整批对称区超限。A8W4 可用 G 方法�
 
 L01–L06 的运行 JSON 见下表。在对应平台从仓库根目录使用[统一入口](../experiments/megamoe/scripts/run_megamoe.py)执行，例如 UBX 节点 0 上运行 `python3 experiments/megamoe/scripts/run_megamoe.py --run-config experiments/megamoe/scripts/configs/l0/L01.json`。追加 `--plan` 查看计划，使用 `--only perf` 或 `--only accuracy` 可分别运行性能或精度。L04–L06 在 950POD 环境运行。
 
-UBX 从 `90.90.93.84` 启动，两台各自在本机 Python 环境安装同一份 UBX wheel。若需固定 `.188` 的解释器，在 L01–L03 JSON 外层填写该节点解释器绝对路径 `peer_python`。B05 从 `177.22.21.1` 启动，默认使用 os1/os2/os7/os8 和预设中已归档的 K37 修复环境；测试新构建时将 wheel 安装到选用的共享环境。各节点需能访问相同路径的代码和输出，并允许主节点通过 SSH 拉起。每次调用自动创建 `benchmark-runs/L0x-*/`（可用 `RUN_BASE` 指定共享目录）。按 `run-summary.json` 回填各阶段结果，UBX 首窗对照见 `native-overlap.json`。只跑 GELU 融合与 Prefill 级联可用 `--only prefill`。
+UBX 从 `90.90.93.84` 启动，两台各自在本机 Python 环境安装同一份 UBX wheel。若需固定 `.188` 的解释器，在 L01–L03 JSON 外层填写该节点解释器绝对路径 `peer_python`。B05 从 `177.22.21.1` 启动，默认使用 os1/os2/os7/os8 和预设中已归档的 K37 修复环境。测试新构建时将 wheel 安装到选用的共享环境。各节点需能访问相同路径的代码和输出，并允许主节点通过 SSH 拉起。
+
+自动输出目录按 `benchmark-runs/<Case>-<平台>-ep<卡数>-<精度>-<运行类型>-YYYYMMDD-HHMMSS/` 命名，时间取启动节点本地时间。例如 `L04-950pod-ep32-a8w4-perf-20261124-143005/`。运行类型与 `--only` 一致，默认完整验收标为 `full`。同秒同名时追加 `-02`、`-03`。用 `RUN_BASE` 更换父目录，或在 JSON 中用 `output_dir` 指定完整路径。按本轮目录的 `run-summary.json` 回填结果，UBX 首窗对照见 `native-overlap.json`。只跑 GELU 融合与 Prefill 级联可用 `--only prefill`。
 
 L04 的融合性能使用同窗 A/B 配对，另存 `paired/paired.json`。L04、L05 的 SwiGLU 全量双参考和 L05 的 SwiGLU 融合性能受整批对称区容量限制。950POD 的全窗掩盖率仍需两臂逐窗补采。预设会执行可运行的阶段，完成后如仍有上述缺项，清单运行状态为 `partial`，退出码为 3。其他运行故障会在具体阶段记录 `failed`。独立设备显存采样和 HBM 计数器采集仍按下方验收口径回填。
 

@@ -30,7 +30,7 @@ cd /mnt/share/l00911701/DeepEP-UBX
 SCRIPTS=experiments/megamoe/scripts
 source "$SCRIPTS/ubx_env.sh"
 mkdir -p "$PWD/benchmark-runs"
-OUT=$(mktemp -d "$PWD/benchmark-runs/ubx-overlap-ep${EP}.XXXXXX")
+OUT=$(mktemp -d "$PWD/benchmark-runs/ubx-ep${EP}-${PRECISION}-overlap-$(date +%Y%m%d-%H%M%S)-XXXXXX")
 echo "$OUT"
 ```
 
@@ -102,7 +102,13 @@ python run_megamoe.py --run-config configs/l0/L01.json
 
 默认先跑 GELU 提前加权、SwiGLU Finalize 加权各自的全量双参考，再测两臂融合性能、汇总首窗掩盖率，最后比较 GELU 融合与 Prefill 级联。每卡 39,280 个 token，EP32、H4096、I1536、E800、K25。只跑性能可在命令末尾加 `--only perf`，只跑精度加 `--only accuracy`，只比较 GELU 级联加 `--only prefill`，预览可加 `--plan`。L02（A8W8）和 L03（A4W4）直接替换文件名。
 
-每次运行在仓库的 `benchmark-runs/` 下新建目录，可用 `RUN_BASE` 指定其他共享盘路径。下表的 `$OUT` 指终端打印的本次输出目录。`run-summary.json` 记录各阶段状态和输出位置。完整的设备显存峰值、HBM 带宽按清单另行采集。
+每次运行在仓库的 `benchmark-runs/` 下新建目录，可用 `RUN_BASE` 指定其他共享盘路径。目录名包含 Case、平台、EP、精度、运行类型和启动节点本地时间。例如 `L01-ubx-ep32-a8w4-perf-20261124-143005/` 是性能轮，`L01-ubx-ep32-a8w4-memory-20261124-151200/` 是显存轮，默认完整运行标为 `full`。同一秒启动相同配置时，从第二次起追加 `-02`、`-03`。下表的 `$OUT` 指终端打印的本次输出目录。`run-summary.json` 记录各阶段状态、输出位置及已采集的整卡 HBM 峰值。精度默认采样，正式性能默认关闭。
+
+若在性能轮显式追加 `--profile-memory-peak`，目录标为 `perf-hbm`。单独复测 GELU、SwiGLU 融合及 GELU Prefill 对照的运行期间显存占比：
+
+```bash
+python run_megamoe.py --run-config configs/l0/L01.json --only memory
+```
 
 | 检查项 | 结果位置（相对 `$OUT`） | 如何判断 |
 | --- | --- | --- |
@@ -110,7 +116,7 @@ python run_megamoe.py --run-config configs/l0/L01.json
 | 融合 A/B 耗时 | `{gelu,swiglu}/perf-w4a8/rank_0/bs_39280/profiling.json` | kernel 取 `rank_max_mean_us`，同步 E2E 取 `host_e2e.rank_max_mean_us`，目标 E2E A/B ≤ 1。 |
 | D / C / Total 掩盖率 | `native-overlap.json` | 比较两臂相同首窗和相同采样 rank 的本地阶段。目标 `gelu_minus_swiglu_pp.Total >= 0`，单位为百分点。 |
 | A 融合与 Prefill 级联 | `gelu-prefill/perf-w4a8/rank_0/bs_39280/prefill_comparison.json` | 记录两臂耗时及级联 / 融合加速比。 |
-| 显存占用及 HBM 带宽 | 各臂的 `resources.json`、单臂设备采样和 HBM profiler 原始数据 | 分别登记设备峰值（GiB）及 HBM 读、写带宽（GB/s），按[转测清单](../../../docs/megamoe-topk32-gelu-a4w4-test-checklist.md)的采集口径补齐。 |
+| 整卡 HBM 峰值和占比 | `run-summary.json` 对应 job 的 `device_memory_peak_group`；逐卡明细在各臂的 `resources.json` | `max_peak_used_pct` 和 `max_peak_used_pct_rank` 给出占比最高的卡，`min_headroom_bytes` 给出观察到的最小剩余量。Prefill 对照按两臂共驻登记。HBM 读写带宽另按[转测清单](../../../docs/megamoe-topk32-gelu-a4w4-test-checklist.md#hbm-显存带宽采集)采集。 |
 
 ## B05 的 84.50% 和 58.48% 怎么算
 

@@ -727,6 +727,89 @@ def test_urma_a4w4_fails_before_any_launch(capsys):
     assert "URMA 暂不支持 W4A4" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(("machine", "ep_size", "stage", "override"), [
+    ("ubx", 16, None, True), ("ubx", 32, "prefill", False),
+    ("950pod", 8, "decode", True), ("950pod", 32, None, False),
+])
+def test_memory_only_launch_reads_resources_without_timing_reports(tmp_path, monkeypatch, capsys,
+                                                                  machine, ep_size, stage, override):
+    model = "ep32_roce_decode" if stage == "decode" else "target_gelu_k25"
+    spec = json.loads((launcher.CONFIG_DIR / f"{model}.json").read_bytes())
+    data = dict(schema_version=1, machine=machine, ep_size=ep_size, config=spec, mode="perf", precision="w8a8",
+                master_addr="192.0.2.1", output_dir="run", perf_scope="memory", profile_memory_peak=not override)
+    if machine == "ubx" and ep_size == 32:
+        data["node_ip"] = ["192.0.2.1", "192.0.2.2"]
+    if stage:
+        data[f"compare_{stage}_cascade"] = True
+    path = tmp_path / "case.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    launched = []
+
+    def run_logged(command, env, log):
+        assert "--module" in command and "--timer" not in command and "--golden-dir" not in command
+        assert "--profile-memory-peak" in command and "--no-profile-memory-peak" not in command
+        assert command[command.index("--perf-scope") + 1] == "memory"
+        if stage:
+            assert f"--compare-{stage}-cascade" in command
+        output = Path(command[command.index("--output-dir") + 1])
+        spec = json.loads(Path(command[command.index("--config") + 1]).read_bytes())
+        node = next((int(opt.split("=")[1]) for opt in command if opt.startswith("--node-rank=")), 0)
+        size = launcher.POD_RANKS if machine == "950pod" else launcher.LOCAL_RANKS
+        for rank in range(node * size, (node + 1) * size):
+            directory = output / f"rank_{rank}"
+            case = directory / f"bs_{spec['bs_values'][0]}"
+            case.mkdir(parents=True)
+            manifest = dict(backend="mte_roce" if machine == "ubx" and ep_size == 32 else "mte",
+                            ep_size=ep_size, config=spec, mode="perf", perf_scope="memory", profile_memory_peak=True,
+                            rank=rank, ranks_per_node=size, routing="balanced", input="fp8")
+            if stage:
+                manifest[f"compare_{stage}_cascade"] = True
+            (directory / "manifest.json").write_text(json.dumps(manifest))
+            summary = dict(rank_count=ep_size, max_peak_used_bytes=2**30, max_peak_used_rank=3,
+                           max_peak_used_pct=25, max_peak_used_pct_rank=3)
+            (case / "resources.json").write_text(json.dumps(dict(device_memory_peak_group=summary)))
+        launched.append(node)
+
+    def run_stage(label, scripts, logs, **kwargs):
+        for script in scripts.values():
+            assert launcher.entrypoint(shlex.split(script.splitlines()[-1])[3:]) == 0
+
+    monkeypatch.setenv("DEEPEP_950POD_BOOTSTRAPPED", "1")
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(launcher, "run_stage", run_stage)
+    monkeypatch.setattr(launcher, "run_logged", run_logged)
+    assert launcher.entrypoint(["--run-config", str(path), *(["--profile-memory-peak"] if override else [])]) == 0
+    assert launched == ([0, 1] if machine == "ubx" and ep_size == 32 else [0])
+    assert "1.00 GiB (rank 3)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("preset", ["950pod_target.json", "ubx_ep16_target.json"])
+def test_memory_switch_overrides_config_across_bootstrap(tmp_path, monkeypatch, capsys, preset):
+    data = launcher.read_run_config(launcher.SCRIPT.parent / "configs" / preset)
+    data.update(mode="accuracy", precision="a8w4", profile_memory_peak=True)
+    path = tmp_path / "case.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.delenv("DEEPEP_950POD_BOOTSTRAPPED", raising=False)
+    monkeypatch.delenv("UBX_CANN_LOADED")
+
+    class ExecAttempt(Exception):
+        pass
+
+    def execute(executable, command, env):
+        assert command[-3:] == ["--run-config", str(path), "--no-profile-memory-peak"]
+        raise ExecAttempt
+
+    monkeypatch.setattr(launcher.os, "execvpe", execute)
+    with pytest.raises(ExecAttempt):
+        launcher.entrypoint(["--run-config", str(path), "--no-profile-memory-peak"])
+    assert launcher.entrypoint(["--run-config", str(path), "--no-profile-memory-peak", "--plan"]) == 0
+    assert json.loads(capsys.readouterr().out)["profile_memory_peak"] is False
+    path.write_text(json.dumps(dict(data, profile_memory_peak=1)), encoding="utf-8")
+    with pytest.raises(SystemExit, match="2"):
+        launcher.entrypoint(["--run-config", str(path), "--plan"])
+    assert "profile_memory_peak" in capsys.readouterr().err
+
+
 def test_run_json_sources_requested_cann_before_selected_python(tmp_path, monkeypatch):
     source = tmp_path / "launch.json"
     source.write_text(json.dumps(dict(schema_version=1, mode="perf", python=sys.executable,

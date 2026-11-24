@@ -104,8 +104,8 @@ def _urma_window_capacity(
 _MTE_MAX_WINDOW_TOKENS = 2048
 
 
-def _ubx_mte_capacity(group, ext, backend, world, local_experts, tokens, topk, hidden,
-                      intermediate, activation, mma_type, weight_mode, shared):
+def _native_mte_capacity(group, ext, backend, world, local_experts, tokens, topk, hidden,
+                         intermediate, activation, mma_type, weight_mode, shared):
     """Select one physical window that fits the kernel tiling and HBM on every rank."""
     eligible, error = [], None
     try:
@@ -331,11 +331,11 @@ class SymmBuffer:
                         and (mma_type, activation) != ("fp8xfp4", "swiglu")):
                     raise ValueError("MTE+RoCE shared experts require W4A8 SwiGLU or A4W4")
             if local_mte and not pod_a4w4_mte:
-                if size != 16 or ranks_per_node not in (0, 16):
+                if size not in (4, 8, 16) or ranks_per_node not in (0, size):
                     if mma_type == "fp4xfp4":
-                        raise ValueError("MTE A4W4 requires 16 ranks on one host or EP8/16/32 with 8 ranks per host")
-                    raise ValueError("UBX local MTE requires all 16 ranks on one host")
-                ranks_per_node = 16
+                        raise ValueError("MTE A4W4 requires EP4/8/16 on one host or EP16/32 with 8 ranks per host")
+                    raise ValueError("Local MTE requires EP4/8/16 on one host")
+                ranks_per_node = size
             if self._urma_windowed:
                 local_ranks = min(size, 16)
                 if ranks_per_node not in (0, local_ranks):
@@ -425,23 +425,28 @@ class SymmBuffer:
             ))
 
         self._native_capacity = num_max_tokens_per_rank
-        if roce or local_mte:
-            self._native_capacity = _ubx_mte_capacity(
+        capacity = None
+        oversized_mte = False
+        if self._backend_name == "mte" and not local_mte:
+            capacity = heap_bytes(num_max_tokens_per_rank)
+            oversized_mte = capacity > _MEGAMOE_PROFILES["mte"].maximum_capacity
+        if oversized_mte and activation == "gelu" and not num_shared_experts:
+            self._native_capacity = _mte_window_capacity(
+                group, ext, size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden,
+                intermediate_hidden, mma_type,
+            )
+        elif roce or local_mte or (oversized_mte and size in (4, 8, 16)):
+            self._native_capacity = _native_mte_capacity(
                 group, ext, self._backend_name, size, num_experts // size, num_max_tokens_per_rank, num_topk,
                 hidden, intermediate_hidden, activation, mma_type, topk_weights_type, num_shared_experts,
             )
-            self._windowed = self._native_capacity < num_max_tokens_per_rank
         elif self._urma_windowed:
             self._native_capacity = _urma_window_capacity(
                 group, ext, size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
                 mma_type, activation=activation, window_tokens=urma_window_tokens,
             )
-        capacity = heap_bytes(self._native_capacity)
-        if self._backend_name == "mte" and not local_mte and activation == "gelu" and not num_shared_experts and capacity > _MEGAMOE_PROFILES["mte"].maximum_capacity:
-            self._windowed = True
-            self._native_capacity = _mte_window_capacity(
-                group, ext, size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, mma_type
-            )
+        self._windowed = self._urma_windowed or self._native_capacity < num_max_tokens_per_rank
+        if capacity is None or self._native_capacity < num_max_tokens_per_rank:
             capacity = heap_bytes(self._native_capacity)
         self._lock = threading.Lock()
         self._device = torch.device(f"npu:{npu_api().current_device()}")

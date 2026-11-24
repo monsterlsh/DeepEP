@@ -1,13 +1,12 @@
 # Copyright (c) 2026, Lu Lu
 
-"""Expand one EP32 acceptance case into the existing single-workload launchers."""
+"""Expand an L-series acceptance case into its platform's workload launchers."""
 
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 
 if __package__:
     from . import run_megamoe as runner
@@ -20,11 +19,24 @@ else:
 def case_jobs(data, selection):
     pod = data["machine"] == "950pod"
     precision = data["precision"]
-    native_b_limited = pod and precision in ("a8w4", "a8w8")
+    native_b_limited = pod and data["ep_size"] == 32 and precision in ("a8w4", "a8w8")
     jobs = []
+    memory_only = selection == "memory"
+    configured_peak = runner.configured_memory_peak(data)
+    if memory_only and configured_peak is False:
+        raise ValueError("L0 memory 要求 profile_memory_peak=true")
+    if not memory_only and data.get("perf_scope") == "memory":
+        raise ValueError("L0 独立显存诊断请使用 --only memory")
 
     def add(name, kind, arm=None, reason=None):
         job = dict(name=name, kind=kind, status="unsupported" if reason else "planned")
+        if memory_only:
+            job.update(name=f"{name}-memory", kind="memory", workload=kind)
+        if kind != "overlap":
+            job["profile_memory_peak"] = data.get("profile_memory_peak", memory_only or kind == "accuracy")
+            if job["profile_memory_peak"]:
+                job["memory_scope"] = {"accuracy": "fused_and_accuracy_reference", "perf": "fused",
+                                       "paired": "gelu_and_swiglu", "prefill": "fused_and_prefill_cascade"}[kind]
         if arm:
             job["arm"] = arm
         if reason:
@@ -37,31 +49,62 @@ def case_jobs(data, selection):
             if native_b_limited and arm == "swiglu":
                 reason = "950POD SwiGLU 的整批对称区超限；此精度尚无同窗的全量双参考入口。"
             add(f"{arm}-accuracy", "accuracy", arm, reason)
-    if selection in ("both", "perf"):
+    if selection in ("both", "perf", "memory"):
         add("gelu", "perf", "gelu")
-        if native_b_limited and precision == "a8w4":
-            add("paired", "paired", "gelu")
-        else:
+        if not (native_b_limited and precision == "a8w4"):
             reason = "950POD A8W8 SwiGLU 的整批对称区超限，配对分窗入口仅支持 A8W4。" if native_b_limited else None
             add("swiglu", "perf", "swiglu", reason)
+        if pod and precision == "a8w4":
+            add("paired", "paired", "gelu")
+    if selection in ("both", "perf"):
         if pod:
-            if precision == "a4w4":
+            if precision == "a4w4" or (precision == "a8w4" and not native_b_limited):
                 add("native-overlap", "overlap")
-            add("all-window-overlap", "overlap", reason="950POD 全窗验收需两臂逐窗打点；原生 timer 只保留首窗。")
+            reason = ("950POD MTE A8W8 没有设备 timer，无法计算掩盖率。" if precision == "a8w8" else
+                      "950POD 全窗验收需两臂逐窗打点；原生 timer 只保留首窗。")
+            add("all-window-overlap", "overlap", reason=reason)
         else:
-            add("native-overlap", "overlap")
-    if selection in ("both", "perf", "prefill"):
+            reason = "本机 MTE A8W8 没有设备 timer，无法计算掩盖率。" if data["backend"] == "mte" and precision == "a8w8" else None
+            add("native-overlap", "overlap", reason=reason)
+    if selection in ("both", "perf", "prefill", "memory"):
         add("gelu-prefill", "prefill", "gelu")
     return jobs
 
 
 def job_config(base, job, root):
     model = dict(base["config"]["model"], activation=job["arm"], topk_weights_type=int(job["arm"] == "gelu"))
-    accuracy = job["kind"] == "accuracy"
-    timing = job["kind"] == "perf" and (base["machine"] == "ubx" or base["precision"] != "a8w8")
-    return dict(base, config=dict(base["config"], model=model), output_dir=str(root / job["name"]),
-                mode="accuracy" if accuracy else "perf", dual_reference=accuracy, check_tokens=0,
-                timer=timing, compare_prefill_cascade=job["kind"] == "prefill")
+    workload = job.get("workload", job["kind"])
+    accuracy = workload == "accuracy"
+    timing = job["kind"] == "perf" and (base["backend"] == "mte_roce" or base["precision"] != "a8w8")
+    config = dict(base, config=dict(base["config"], model=model), output_dir=str(root / job["name"]),
+                  mode="accuracy" if accuracy else "perf", dual_reference=accuracy, check_tokens=0,
+                  timer=timing, compare_prefill_cascade=workload == "prefill",
+                  profile_memory_peak=job["profile_memory_peak"])
+    if job["kind"] == "memory":
+        config["perf_scope"] = "memory"
+    if accuracy and base["machine"] == "ubx" and base["ep_size"] <= runner.LOCAL_RANKS:
+        # This acceptance run must own the per-rank accuracy and memory reports it archives.
+        config["force_npu"] = True
+    return config
+
+
+def memory_result(cfg, paired):
+    directory = Path(cfg["output_dir"])
+    if paired:
+        path = directory / "paired.json"
+    else:
+        run = cfg["mode"]
+        if cfg["machine"] == "ubx":
+            run += "-" + runner.parse_precision(cfg["precision"])
+        bs = cfg["config"]["bs_values"][0]
+        path = directory / run / "rank_0" / f"bs_{bs}" / "resources.json"
+    report = json.loads(path.read_text(encoding="utf-8"))
+    summary = report.get("device_memory_peak_group")
+    if (not isinstance(summary, dict) or summary.get("rank_count") != cfg["ep_size"]
+            or not {"max_peak_used_bytes", "max_peak_used_rank", "max_peak_used_pct", "max_peak_used_pct_rank",
+                    "min_headroom_bytes", "min_headroom_rank"} <= summary.keys()):
+        raise ValueError(f"{path} 缺少 EP{cfg['ep_size']} 全组显存峰值统计")
+    return dict(device_memory_peak_group=summary, device_memory_peak_report=str(path))
 
 
 def write_json(path, data):
@@ -71,6 +114,13 @@ def write_json(path, data):
 def collect_overlap(base, root):
     pod = base["machine"] == "950pod"
     perf = "perf" if pod else "perf-" + runner.parse_precision(base["precision"])
+    if base["ep_size"] < 32:
+        windows = {
+            arm: json.loads((root / arm / perf / "rank_0/manifest.json").read_text(encoding="utf-8"))["window_tokens"]
+            for arm in ("gelu", "swiglu")
+        }
+        if windows["gelu"] != windows["swiglu"]:
+            return dict(status="unsupported", window_tokens=windows, reason="两臂实测首窗大小不同，无法验收同窗掩盖率")
     result = root / "native-overlap.json"
     argv = [runner.SCRIPT.with_name("compare_ubx_native_overlap.py"),
             "--gelu", root / "gelu" / perf, "--swiglu", root / "swiglu" / perf, "--output", result]
@@ -98,17 +148,21 @@ def run_l0(path, data, *, only=None, plan=False):
     precision = data.get("precision")
     matrix = [(machine, p) for machine in ("ubx", "950pod") for p in ("a8w4", "a8w8", "a4w4")]
     cases = {f"L{i:02}": pair for i, pair in enumerate(matrix, 1)}
+    ep = data.get("ep_size")
     if (data.get("suite") != "l0" or not isinstance(case, str)
-            or cases.get(case) != (data.get("machine"), precision) or data.get("ep_size") != 32):
-        raise ValueError("L01–L06 依次使用 UBX、950POD 的 EP32 A8W4 / A8W8 / A4W4 预设")
+            or cases.get(case) != (data.get("machine"), precision) or type(ep) is not int or ep not in (4, 8, 16, 32)):
+        raise ValueError("L01–L06 分别使用 UBX 或 950POD 的 A8W4 / A8W8 / A4W4 和 EP4/8/16/32")
     spec = data.get("config")
     if not isinstance(spec, dict) or spec.get("schema_version") != 1 or not isinstance(spec.get("model"), dict):
         raise ValueError("L0 需包含 schema_version=1 的内嵌模型 config")
     if spec.get("bs_values") != [39280] or "bs" in data:
         raise ValueError("L0 按每卡 39280 token 验收，请使用 config.bs_values=[39280]")
+    shape = dict(hidden=4096, intermediate_hidden=1536, num_experts=800, num_topk=25, num_shared_experts=0)
+    if any(spec["model"].get(key) != value for key, value in shape.items()):
+        raise ValueError("L0 验收固定 H4096 / I1536 / E800 / K25 / S0")
     selection = only or data.get("mode", "both")
-    if selection not in ("both", "perf", "accuracy", "prefill"):
-        raise ValueError("L0 支持 both、accuracy、perf、prefill")
+    if selection not in ("both", "perf", "accuracy", "prefill", "memory"):
+        raise ValueError("L0 支持 both、accuracy、perf、prefill、memory")
     if type(data.get("plan", False)) is not bool:
         raise ValueError("plan 必须为布尔值")
     plan = plan or data.get("plan", False)
@@ -127,20 +181,33 @@ def run_l0(path, data, *, only=None, plan=False):
     root = (path.parent / Path(explicit).expanduser()).resolve() if explicit else base_dir / f"{case}-RUN"
     nodes = data.get("nodes")
     pod = base["machine"] == "950pod"
-    if not pod and (base.get("backend") != "mte_roce" or "node_rank" in base or "stage" in base or nodes is not None):
-        raise ValueError("UBX L0 需要双机自动启动的 mte_roce 配置")
+    if not pod:
+        backend = "mte_roce" if ep == 32 else "mte"
+        if base.get("backend") != backend or "node_rank" in base or "stage" in base or nodes is not None:
+            raise ValueError(f"UBX EP{ep} L0 需要 {backend} 自动启动配置")
+        if ep == 32:
+            nodes = base["node_ip"]
+        else:
+            nodes = [base["master_addr"]]
+    # Preserve the E800 workload in the acceptance matrix even where it cannot launch.
+    if shape["num_experts"] // ep > 128:
+        reason = f"E800 / EP{ep} = {shape['num_experts'] // ep} 个本地专家，超过每 rank 的原生上限 128"
+        if not plan:
+            raise ValueError(reason)
+        for job in jobs:
+            job.update(status="unsupported", reason=reason)
     for job in jobs:
         if job["status"] == "unsupported" or job["kind"] == "overlap":
             continue
         cfg = job_config(base, job, root)
         if pod:
-            launch = run_pod_paired if job["kind"] == "paired" else run_pod_job
+            launch = run_pod_paired if job.get("workload", job["kind"]) == "paired" else run_pod_job
             launch(cfg, root / "configs", nodes=nodes, plan=True)
         else:
             runner.parse_args(["--run-config", str(path)], cfg)
 
     summary = dict(case=case, machine=base["machine"], backend=base.get("backend"), precision=precision,
-                   ep_size=base["ep_size"], nodes=nodes if pod else base["node_ip"],
+                   ep_size=ep, nodes=nodes,
                    tokens_per_rank=spec["bs_values"][0], selection=selection, jobs=jobs)
     if base.get("peer_python"):
         summary["peer_python"] = base["peer_python"]
@@ -151,8 +218,11 @@ def run_l0(path, data, *, only=None, plan=False):
     if explicit:
         root.mkdir(parents=True, exist_ok=False)
     else:
-        base_dir.mkdir(parents=True, exist_ok=True)
-        root = Path(tempfile.mkdtemp(prefix=f"{case}-", dir=base_dir))
+        stage = "full" if selection == "both" else selection
+        if base.get("profile_memory_peak") and selection in ("both", "perf", "prefill"):
+            stage += "-hbm"
+        label = f"{case}-{base['machine']}-ep{base['ep_size']}-{precision}-{stage}"
+        root = runner.create_run_directory(base_dir, label)
     configs = root / "configs"
     configs.mkdir()
     write_json(configs / "case.json", data)
@@ -176,17 +246,23 @@ def run_l0(path, data, *, only=None, plan=False):
                 src = configs / f"{name}.json"
                 write_json(src, cfg)
                 job.update(config=str(src), output_dir=cfg["output_dir"])
+                paired_job = job.get("workload", job["kind"]) == "paired"
                 if pod:
-                    launch = run_pod_paired if job["kind"] == "paired" else run_pod_job
+                    launch = run_pod_paired if paired_job else run_pod_job
                     launch(cfg, configs, nodes=nodes)
-                    if job["kind"] == "paired":
+                    if paired_job:
                         result = root / name / "paired.json"
-                        paired = json.loads(result.read_text(encoding="utf-8"))["host_e2e"]
-                        job.update(result=str(result), median_pair_e2e_ratio=paired["median_pair_ratio"],
-                                   e2e_target_met=paired["passed_median_pair_ratio_le_one"])
+                        job["result"] = str(result)
+                        if selection != "memory":
+                            paired = json.loads(result.read_text(encoding="utf-8"))["host_e2e"]
+                            job.update(median_pair_e2e_ratio=paired["median_pair_ratio"],
+                                       e2e_target_met=paired["passed_median_pair_ratio_le_one"])
                 else:
                     subprocess.run([sys.executable, str(runner.SCRIPT), "--run-config", str(src)], check=True)
-            job["status"] = "completed"
+                if cfg["profile_memory_peak"]:
+                    job.update(memory_result(cfg, paired_job))
+            if job["status"] == "running":
+                job["status"] = "completed"
         except (OSError, ValueError, KeyError, subprocess.CalledProcessError, KeyboardInterrupt) as exc:
             job.update(status="failed", error=str(exc))
             summary["status"] = "failed"

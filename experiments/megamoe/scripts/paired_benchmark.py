@@ -62,7 +62,7 @@ def paired_report(rounds_by_rank, bs):
     )
 
 
-def run_rounds(calls, group, torch, count, stage, cold):
+def run_rounds(calls, group, torch, count, stage, cold, *, measure=True):
     from deep_ep_experimental.megamoe.performance import flush_l2_before_call
 
     samples = []
@@ -73,11 +73,14 @@ def run_rounds(calls, group, torch, count, stage, cold):
                 flush_l2_before_call()
             torch.npu.synchronize()
             group.barrier(f"{stage} pair {index} {arm}")
-            start = perf_counter_ns()
+            if measure:
+                start = perf_counter_ns()
             calls[arm]()
             torch.npu.synchronize()
-            current[arm] = (perf_counter_ns() - start) / 1000
-        samples.append(current)
+            if measure:
+                current[arm] = (perf_counter_ns() - start) / 1000
+        if measure:
+            samples.append(current)
     return samples
 
 
@@ -412,12 +415,19 @@ def main():
     parser.add_argument("--pairs", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=2, help="Warmup pairs before host E2E")
     parser.add_argument("--profile", action="store_true", help="Repeat alternating pairs under NPU profiler separately")
+    parser.add_argument("--profile-memory-peak", action=argparse.BooleanOptionalAction, default=None,
+                        help="Sample this rank's whole-device memory use from setup through the last forward or profile")
+    parser.add_argument("--memory-only", action="store_true",
+                        help="Sample memory during alternating forwards and omit timing and kernel profiling")
     parser.add_argument("--cold-l2", action="store_true", help="Flush device L2 before both arms, outside timing")
     parser.add_argument("--swiglu-weight-mode", type=int, choices=[0, 1], default=0)
     parser.add_argument("--require-no-regression", action="store_true",
                         help="Exit nonzero after writing results if median paired host GELU/SwiGLU is greater than one")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    if args.memory_only and (args.profile or args.require_no_regression or args.cold_l2 or args.profile_memory_peak is False):
+        parser.error("--memory-only requires memory sampling with cache flushing, kernel profiling and latency gates disabled")
+    sample_peak = args.memory_only or bool(args.profile_memory_peak)
     if args.pairs < 2 or args.warmup < 1:
         parser.error("Use at least two alternating pairs and one warmup pair")
     if args.stage_mte_window and args.bs < args.stage_mte_window:
@@ -443,7 +453,7 @@ def main():
         if backend != "mte" and not args.isolated_arm:
             raise ValueError("Use --isolated-arm to compare the two public UBX runtimes in separate jobs")
         spec = (config, args.pairs, args.warmup, args.routing, args.cold_l2, args.profile, args.swiglu_weight_mode,
-                args.isolated_arm, args.require_no_regression, args.stage_mte_window)
+                args.isolated_arm, args.require_no_regression, args.stage_mte_window, sample_peak, args.memory_only)
         if any(peer != list(spec) for peer in group.all_gather(list(spec), "paired benchmark settings")):
             raise ValueError("All ranks must use identical paired benchmark settings")
         directory = args.output_dir / f"rank_{rank}"
@@ -451,44 +461,70 @@ def main():
         hosts = group.all_gather(socket.gethostname(), "benchmark hosts")
         devices = group.all_gather(physical_device(), "physical NPU mapping")
         torch.npu.reset_peak_memory_stats()
-        buffer, calls, windows, layout = (isolated_call(args, config, backend, group, torch, api) if args.isolated_arm
-                                         else prepare_calls(args, config, group, torch, api))
-        started_at = datetime.now(timezone.utc).isoformat()
-        run_rounds(calls, group, torch, args.warmup, "warmup", args.cold_l2)
-        host = run_rounds(calls, group, torch, args.pairs, "host", args.cold_l2)
-        report = dict(
-            config=config, backend=backend, world=group.size(), ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
-            hosts_by_rank=hosts, devices_by_rank=devices, started_at=started_at,
-            recorded_at=datetime.now(timezone.utc).isoformat(), isolated_arm=args.isolated_arm,
-            bs=args.bs, routing=args.routing, warmup_pairs=args.warmup, formal_pairs=args.pairs,
-            cache="flush_before_each_arm" if args.cold_l2 else "steady_state_no_flush",
-            input="same_buffered_fp8_e4m3_codes_and_e8m0_scales", routes="same_int32_ids_and_fp32_weights",
-            weights="identical_gmm2_and_gelu_gmm1_from_swiglu_gate", windows=windows, layout=layout,
-            torch=str(torch.__version__), torch_npu=str(torch_npu.__version__),
-            build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
-        )
-        def summarize(samples, stage):
-            rows = group.all_gather(samples, stage)
-            return dict(per_rank=rows) if args.isolated_arm else paired_report(rows, args.bs)
+        with ExitStack() as monitors:
+            if sample_peak:
+                from deep_ep_experimental.megamoe.device_memory import DeviceMemorySampler, summarize_device_memory_peaks
+                sampler = monitors.enter_context(DeviceMemorySampler(torch.npu, torch.npu.current_device()))
+            buffer, calls, windows, layout = (isolated_call(args, config, backend, group, torch, api) if args.isolated_arm
+                                             else prepare_calls(args, config, group, torch, api))
+            started_at = datetime.now(timezone.utc).isoformat()
+            run_rounds(calls, group, torch, args.warmup, "warmup", args.cold_l2, measure=False)
+            host = run_rounds(calls, group, torch, args.pairs, "memory" if args.memory_only else "host",
+                              args.cold_l2, measure=not args.memory_only)
+            report = dict(
+                config=config, backend=backend, world=group.size(), ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
+                hosts_by_rank=hosts, devices_by_rank=devices, started_at=started_at,
+                recorded_at=datetime.now(timezone.utc).isoformat(), isolated_arm=args.isolated_arm,
+                bs=args.bs, routing=args.routing, warmup_pairs=args.warmup, formal_pairs=0 if args.memory_only else args.pairs,
+                profile_memory_peak=sample_peak,
+                cache="flush_before_each_arm" if args.cold_l2 else "steady_state_no_flush",
+                input="same_buffered_fp8_e4m3_codes_and_e8m0_scales", routes="same_int32_ids_and_fp32_weights",
+                weights="identical_gmm2_and_gelu_gmm1_from_swiglu_gate", windows=windows, layout=layout,
+                torch=str(torch.__version__), torch_npu=str(torch_npu.__version__),
+                build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
+            )
+            def summarize(samples, stage):
+                rows = group.all_gather(samples, stage)
+                return dict(per_rank=rows) if args.isolated_arm else paired_report(rows, args.bs)
 
-        report["host_e2e"] = summarize(host, "paired host timing")
-        free, total = torch.npu.mem_get_info(torch.npu.current_device())
-        report["resources_by_rank"] = group.all_gather(dict(
-            device_total_bytes=total, device_free_after_host_bytes=free,
-            torch_peak_allocated_bytes=torch.npu.max_memory_allocated(),
-            torch_peak_reserved_bytes=torch.npu.max_memory_reserved(),
-            symmetric_bytes=buffer.symmetric_buffer_bytes,
-        ), "paired memory statistics")
-        path = args.output_dir / ("isolated.json" if args.isolated_arm else "paired.json")
+            if args.memory_only:
+                report["memory_pairs"] = args.pairs
+            else:
+                report["host_e2e"] = summarize(host, "paired host timing")
+            free, total = torch.npu.mem_get_info(torch.npu.current_device())
+            resources = dict(
+                device_total_bytes=total, device_free_after_host_bytes=free,
+                torch_peak_allocated_bytes=torch.npu.max_memory_allocated(),
+                torch_peak_reserved_bytes=torch.npu.max_memory_reserved(),
+                symmetric_bytes=buffer.symmetric_buffer_bytes,
+            )
+            report["resources_by_rank"] = group.all_gather(resources, "paired memory statistics")
+            path = args.output_dir / ("isolated.json" if args.isolated_arm else "paired.json")
+            if args.profile:
+                if rank == 0:
+                    # Preserve host timing even if the subsequent kernel trace fails.
+                    path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+                samples = profile_pairs(calls, group, torch, args.pairs, windows, directory / "profiler", args.cold_l2)
+                report["kernel_sum"] = summarize(samples, "paired kernel sums")
+            torch.npu.synchronize()
+        if sample_peak:
+            peak = sampler.report()
+            peak["scope"] = args.isolated_arm or "gelu_and_swiglu"
+            peak["phases"] = ["setup", "warmup", "alternating_forwards"]
+            if args.profile:
+                peak["phases"].append("kernel_profile")
+            peaks = group.all_gather(peak, "paired device memory peaks")
+            for row, local_peak in zip(report["resources_by_rank"], peaks):
+                row["device_memory_peak"] = local_peak
+            summary = summarize_device_memory_peaks(peaks)
+            report["device_memory_peak_group"] = summary
+            case = directory / f"bs_{args.bs}"
+            case.mkdir()
+            local = dict(report["resources_by_rank"][rank], device_memory_peak_group=summary)
+            (case / "resources.json").write_text(json.dumps(local, indent=2), encoding="utf-8")
         if rank == 0:
-            path.write_text(json.dumps(report, indent=2))
-            print(f"[PERF] {path}", flush=True)
-        if args.profile:
-            samples = profile_pairs(calls, group, torch, args.pairs, windows, directory / "profiler", args.cold_l2)
-            report["kernel_sum"] = summarize(samples, "paired kernel sums")
-            if rank == 0:
-                path.write_text(json.dumps(report, indent=2))
-        torch.npu.synchronize()
+            path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            print(f"[{'MEMORY' if args.memory_only else 'PERF'}] {path}", flush=True)
         group.barrier("paired benchmark done")
         buffer.destroy()
         del calls

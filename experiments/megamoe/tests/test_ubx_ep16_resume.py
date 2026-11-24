@@ -63,6 +63,7 @@ def ubx(tmp_path, monkeypatch):
             return command[command.index(name) + 1]
 
         if "--module" not in command:
+            assert not {"--profile-memory-peak", "--no-profile-memory-peak"} & set(command)
             # This test runs the real CPU Golden from source without installing an NPU wheel.
             original(command, dict(env, PYTHONPATH=os.pathsep.join(map(str, source_paths))), log)
             state.prepared.append(json.loads(Path(option("--summary")).read_text(encoding="utf-8")))
@@ -72,6 +73,7 @@ def ubx(tmp_path, monkeypatch):
         assert "--rdzv-backend=c10d" in command and "--standalone" not in command
         assert option("--module") == f"{launcher.MODULE}.benchmark"
         mode = option("--mode")
+        sampled = ("--profile-memory-peak" in command or (mode == "accuracy" and "--no-profile-memory-peak" not in command))
         case = load_config(option("--config"), str(bs))
         state.launches.append((mode, case["model"]["mma_type"]))
         if state.fail_launch:
@@ -81,8 +83,12 @@ def ubx(tmp_path, monkeypatch):
             batch = directory / f"bs_{bs}"
             batch.mkdir(parents=True)
             manifest = dict(mode=mode, backend="urma", config=case, input="fp8", rank=rank, ep_size=world,
-                            routing=option("--routing"), dual_reference=False)
+                            routing=option("--routing"), dual_reference=False, profile_memory_peak=sampled)
             (directory / "manifest.json").write_text(json.dumps(manifest))
+            if sampled:
+                peak = dict(device_memory_peak=dict(peak_used_bytes=rank, sample_count=4),
+                            device_memory_peak_group=dict(rank_count=world, max_peak_used_bytes=world - 1))
+                (batch / "resources.json").write_text(json.dumps(peak))
             if mode == "accuracy":
                 rows = [dict(passed=True, counts_equal=True, finite=True, cumulative_counts_equal=True,
                              policy="cpu_mixed_error", checked_token_count=bs, total_tokens=bs, check_tokens=0, rank=r)
@@ -151,3 +157,11 @@ def test_cold_cache_checks_device_before_generating_golden(ubx):
     assert ubx.device_checks == [0]
     assert not ubx.launches and not list(ubx.golden.rglob("*.npz"))
     assert all(entry["generated"] == [] for entry in ubx.prepared)
+
+
+def test_unsampled_accuracy_cannot_replace_sampled_result(ubx):
+    ubx.run("accuracy", "w4a8", "--no-profile-memory-peak")
+    ubx.run("accuracy", "w4a8")
+    ubx.run("accuracy", "w4a8", "--profile-memory-peak")
+    assert len(ubx.launches) == 2
+    assert [entry["generated"] for entry in ubx.prepared if entry["generated"]] == [ubx.ranks]

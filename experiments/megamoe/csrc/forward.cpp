@@ -440,10 +440,10 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     const std::string resolved_mma_type = mma_type.empty() ? (is_a8w4 ? "fp8xfp4" : "fp8xfp8") : mma_type;
     TORCH_CHECK(resolved_mma_type == "fp8xfp4" || resolved_mma_type == "fp8xfp8" || resolved_mma_type == "fp4xfp4",
                 "mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4");
-    TORCH_CHECK(!is_a4w4_ ||
-                    (backend == "mte" && ((world == 16 && ranks_per_node == 16) ||
-                                            (ranks_per_node == 8 && (world == 8 || world == 16 || world == 32)))),
-                 "MTE A4W4 requires EP16 on one host or EP8/16/32 with 8 ranks per host");
+    const bool single_host = ranks_per_node == world && (world == 4 || world == 8 || world == 16);
+    const bool pod_hosts = ranks_per_node == 8 && (world == 16 || world == 32);
+    TORCH_CHECK(!is_a4w4_ || (backend == "mte" && (single_host || pod_hosts)),
+                "MTE A4W4 requires EP4/8/16 on one host or EP16/32 with 8 ranks per host");
     TORCH_CHECK(is_a8w4_ == (resolved_mma_type == "fp8xfp4") && is_a4w4_ == (resolved_mma_type == "fp4xfp4"),
                 "is_a8w4 and mma_type describe different matrix modes");
     TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
@@ -853,8 +853,9 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
     const std::string resolved_mma_type = mma_type.empty() ? "fp8xfp8" : mma_type;
     TORCH_CHECK(resolved_mma_type == "fp8xfp4" || resolved_mma_type == "fp8xfp8" || resolved_mma_type == "fp4xfp4",
                 "mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4");
-    TORCH_CHECK(resolved_mma_type != "fp4xfp4" || (backend == "mte" && (world == 8 || world == 16 || world == 32)),
-                "MTE A4W4 sizing requires EP8, EP16 or EP32");
+    TORCH_CHECK(resolved_mma_type != "fp4xfp4" ||
+                    (backend == "mte" && (world == 4 || world == 8 || world == 16 || world == 32)),
+                "MTE A4W4 sizing requires EP4, EP8, EP16 or EP32");
     if (backend == "urma") {
         TORCH_CHECK(resolved_mma_type == "fp8xfp4" || (mma_type == "fp8xfp8" && windowed && (world == 16 || world == 32)),
                     "URMA requires routed FP8xFP4 or windowed EP16/EP32 FP8xFP8");

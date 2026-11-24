@@ -14,7 +14,6 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
 from uuid import uuid4
 
 SCRIPT = Path(__file__).resolve()
@@ -22,6 +21,7 @@ sys.path.insert(0, str(SCRIPT.parent))
 from ubx_accuracy_cache import AccuracyCache, cache_key, file_lock  # noqa: E402
 from ubx_multinode import node_script, run_stage  # noqa: E402
 from paired_benchmark import order as pair_order  # noqa: E402
+from run_directory import create_run_directory  # noqa: E402
 
 sys.path.pop(0)
 
@@ -35,6 +35,7 @@ POD_PYTHON = "/opt/miniconda3/envs/lsx/bin/python"
 POD_CANN_ENV = "/home/cann/b112/cann-9.2.0/set_env.sh"
 TIMER_RANKS_PER_NODE = 4
 MMA_TYPES = {"w4a8": "fp8xfp4", "w8a8": "fp8xfp8", "w4a4": "fp4xfp4"}
+PRECISION_ALIASES = {"a8w4": "w4a8", "a8w8": "w8a8", "a4w4": "w4a4"}
 MODES = ("accuracy", "perf", "both", "compare")
 ROUTINGS = ("balanced", "skewed", "random", "random-balanced")
 FORWARDED_ENV = (
@@ -88,7 +89,27 @@ def parse_precision(value):
     name = value.casefold()
     if name == "w8a4":
         raise argparse.ArgumentTypeError("FP4 激活 × FP8 权重暂不支持；FP8 激活 × FP4 权重请选择 a8w4")
-    return {"a8w4": "w4a8", "a8w8": "w8a8", "a4w4": "w4a4"}.get(name, name)
+    return PRECISION_ALIASES.get(name, name)
+
+
+def workload_run_label(machine, args, model, precisions):
+    precision = "+".join(name for name, internal in PRECISION_ALIASES.items() if internal in precisions)
+    mode = "accuracy-perf" if args.mode == "both" else args.mode
+    if getattr(args, "golden_only", False) or getattr(args, "stage", None) == "prepare":
+        mode = "golden"
+    elif args.perf_scope != "all":
+        mode = args.perf_scope
+    if args.cascade_stage:
+        mode += f"-{args.cascade_stage}"
+    if args.timer and args.perf_scope == "all":
+        mode += "-timer"
+    if args.profile_memory_peak and args.mode in ("both", "perf", "compare") and args.perf_scope != "memory":
+        mode += "-hbm"
+    activation = model.get("activation", "swiglu")
+    weight = "early" if model.get("topk_weights_type", WEIGHT_MODE[activation]) else "late"
+    arm = "ab" if args.mode == "compare" else f"{activation}-{weight}"
+    return (f"{machine}-ep{args.ep_size}-{args.backend}-{precision}-{mode}-{arm}"
+            f"-k{model['num_topk']}-bs{args.bs}-{args.routing}")
 
 
 def comparison_settings(config):
@@ -117,6 +138,8 @@ def validate_geometry(model, ep_size):
     experts = model["num_experts"]
     if type(experts) is not int or experts <= 0 or experts % ep_size:
         raise ValueError(f"专家数必须为正整数且能被 EP{ep_size} 整除")
+    if experts // ep_size > 128:
+        raise ValueError(f"EP{ep_size} 每个 rank 最多支持 128 个路由专家，当前为 {experts // ep_size}")
     topk = model["num_topk"]
     if type(topk) is not int or not 1 <= topk <= min(32, experts):
         raise ValueError("TopK 必须在 1..32 且不能超过全局专家数")
@@ -127,6 +150,29 @@ def add_cascade_arguments(parser):
     for stage in CASCADE_STAGES:
         options.add_argument(f"--compare-{stage}-cascade", action="store_true",
                              help=f"在 perf 中对照融合与 {stage.capitalize()} 小算子级联")
+
+
+def add_memory_argument(parser):
+    parser.add_argument("--profile-memory-peak", action=argparse.BooleanOptionalAction, default=None,
+                        help="采集设备 HBM 使用峰值，默认精度开启、性能关闭")
+
+
+def memory_option(value, *, mode=None):
+    # Formal perf also has no sampler in older wheels that predate this option.
+    if value is None or (mode == "perf" and value is False):
+        return []
+    return ["--profile-memory-peak" if value else "--no-profile-memory-peak"]
+
+
+def configured_memory_peak(data):
+    if "profile_memory_peak" in data and type(data["profile_memory_peak"]) is not bool:
+        raise ValueError("profile_memory_peak 必须为布尔值")
+    return data.get("profile_memory_peak")
+
+
+def validate_memory_scope(args):
+    if args.perf_scope == "memory" and (args.mode != "perf" or args.profile_memory_peak is not True or args.timer):
+        raise ValueError("perf_scope=memory 要求 mode=perf、profile_memory_peak=true、timer=false")
 
 
 def cascade_stage(args):
@@ -188,7 +234,7 @@ def run_config_arguments(path, parser, argv, cli, data=None):
         if data is None:
             data = read_run_config(path)
         supported = strings | integers | flags | env_types.keys() | {
-            "schema_version", "machine", "node_ip", "peer_output_dir", "comparison",
+            "schema_version", "machine", "node_ip", "peer_output_dir", "comparison", "profile_memory_peak",
         }
         if unknown := sorted(data.keys() - supported):
             raise ValueError(f"未知运行配置字段 {unknown}")
@@ -212,6 +258,10 @@ def run_config_arguments(path, parser, argv, cli, data=None):
                     value = python_command(value, path.parent)
                 env_name = "UBX_CANN_SETUP" if key == "cann_env" else key.upper()
                 environment[env_name] = str(int(value)) if type(value) is bool else str(value)
+            elif key == "profile_memory_peak":
+                peak = configured_memory_peak(data)
+                if cli.profile_memory_peak is None:
+                    arguments.extend(memory_option(peak))
             elif option in present or key in ("mode", "precision") and getattr(cli, key) is not None:
                 continue
             elif key == "config" and "--inline-config" in present:
@@ -256,9 +306,9 @@ def parse_args(argv, run_config=None):
                         help="显式指定时适用于所选模式。省略时精度测两种，性能测 W4A8")
     parser.add_argument("--precision", dest="precision_option", type=parse_precision, choices=("all", *MMA_TYPES),
                         help="显式选择 w8a8、w4a8（a8w4）、w4a4（a4w4）或 all")
-    parser.add_argument("--ep-size", type=int, choices=(16, 32), default=16)
+    parser.add_argument("--ep-size", type=int, choices=(4, 8, 16, 32), default=16)
     parser.add_argument("--backend", choices=("urma", "mte", "mte_roce"), default="urma",
-                        help="默认 URMA；mte 为单机 EP16，mte_roce 为双机 EP32")
+                        help="默认 URMA；mte 为单机 EP4/8/16，mte_roce 为双机 EP32")
     parser.add_argument("--activation", choices=("gelu", "swiglu"), help="覆盖模型激活函数")
     parser.add_argument("--input", choices=("fp8", "fp4"), help="默认按激活精度选 FP8 或 packed FP4")
     node = parser.add_mutually_exclusive_group()
@@ -284,7 +334,7 @@ def parse_args(argv, run_config=None):
     parser.add_argument("--timer", action="store_true", help="另采一次首窗设备 trace，默认每台 4 个 rank")
     parser.add_argument("--force", action="store_true", help="强制重跑 CPU Golden 和 NPU 精度")
     parser.add_argument("--force-cpu", action="store_true", help="强制重新生成 CPU Golden")
-    parser.add_argument("--force-npu", action="store_true", help="EP16 跳过 NPU 精度缓存")
+    parser.add_argument("--force-npu", action="store_true", help="单机跳过 NPU 精度缓存")
     parser.add_argument("--pairs", type=int, help="compare 的独立交替 A/B 正式作业对数，默认 8")
     comparison_action = parser.add_mutually_exclusive_group()
     comparison_action.add_argument("--plan", action="store_true", help="compare 仅显示支持矩阵和执行顺序")
@@ -295,8 +345,9 @@ def parse_args(argv, run_config=None):
                         help="compare 有退化、证据不全或基线不支持时返回非零")
     parser.add_argument("--comparison-arm", choices=WEIGHT_MODE,
                         help="在 accuracy 或 perf 中单测 GELU 提前加权或 SwiGLU Finalize 加权")
-    parser.add_argument("--perf-scope", choices=("all", "host", "timer"), default="all", help=argparse.SUPPRESS)
+    parser.add_argument("--perf-scope", choices=("all", "host", "timer", "memory"), default="all", help=argparse.SUPPRESS)
     parser.add_argument("--paired-weights", action="store_true", help=argparse.SUPPRESS)
+    add_memory_argument(parser)
     add_cascade_arguments(parser)
     args = parser.parse_args(argv)
     run_environment = {}
@@ -316,29 +367,39 @@ def parse_args(argv, run_config=None):
         parser.error("位置精度参数与 --precision 二选一")
     args.precision = args.precision_option or args.precision
 
+    try:
+        validate_memory_scope(args)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.perf_scope == "memory" and (args.comparison_arm or args.paired_weights):
+        parser.error("perf_scope=memory 要求独立作业，请关闭 A/B 参数")
     roce = args.backend == "mte_roce"
     if roce and args.ep_size != 32:
         parser.error("MTE+RoCE 需要 --ep-size 32，两台各 16 卡")
-    if args.backend == "mte" and args.ep_size != 16:
-        parser.error("本机 MTE 需要 --ep-size 16")
+    if args.backend == "mte" and args.ep_size > LOCAL_RANKS:
+        parser.error("本机 MTE 需要 --ep-size 4、8 或 16")
+    if args.backend == "urma" and args.ep_size < LOCAL_RANKS:
+        parser.error("此启动器的 URMA 入口支持 EP16/32，小规模单机测试请使用 MTE")
     if args.backend != "urma":
         if args.mode == "compare" or args.comparison_arm is not None or args.paired_weights:
             parser.error("MTE 和 MTE+RoCE 使用独立精度/性能轮，A/B 参数适用于 URMA")
-        if args.perf_scope != "all":
-            parser.error("MTE 和 MTE+RoCE 使用默认性能采样范围")
+        if args.perf_scope not in ("all", "memory"):
+            parser.error("MTE 和 MTE+RoCE 支持 perf_scope=all 或 memory")
     elif args.precision == "w4a4":
-        parser.error("URMA 暂不支持 W4A4。EP16 使用 --backend mte，EP32 使用 --backend mte_roce")
+        parser.error("URMA 暂不支持 W4A4。单机使用 --backend mte，EP32 使用 --backend mte_roce")
     if args.peer_python is not None:
         if args.ep_size != 32 or args.node_ip is None or args.node_rank is not None:
             parser.error("peer_python 只适用于 UBX EP32 自动启动")
         if not args.peer_python.startswith("/"):
             parser.error("peer_python 必须是 node1 上的 Linux 绝对路径")
-    if args.ep_size == 16:
+    args.ranks_per_node = min(args.ep_size, LOCAL_RANKS)
+    args.nnodes = args.ep_size // args.ranks_per_node
+    if args.nnodes == 1:
         if args.node_ip or args.node_rank is not None or args.stage:
             parser.error("--node-ip、--node-rank、--stage 适用于 EP32")
         if args.master_addr is None:
             if args.run_config is not None:
-                parser.error("UBX EP16 需要在 JSON 中设置 master_addr")
+                parser.error(f"UBX EP{args.ep_size} 需要在 JSON 中设置 master_addr")
             args.master_addr = "127.0.0.1"
         args.node_rank = 0
     else:
@@ -347,7 +408,7 @@ def parse_args(argv, run_config=None):
         if args.stage and args.output_dir is None:
             parser.error("手动 EP32 需指定 --output-dir")
         if args.force_npu:
-            parser.error("EP32 的 NPU 测试每次实测，--force-npu 适用于 EP16")
+            parser.error("EP32 的 NPU 测试每次实测，--force-npu 适用于单机")
         if args.node_rank is None:
             if args.node_ip is None:
                 parser.error("自动启动 UBX EP32 需要设置 node_ip")
@@ -459,8 +520,8 @@ def parse_args(argv, run_config=None):
         parser.error("--window-tokens 用于 compare")
     selected = set(args.accuracy_precisions) | set(args.perf_precisions)
     if args.cascade_stage:
-        if args.timer or args.perf_scope != "all" or args.paired_weights or args.comparison_arm is not None:
-            parser.error("小算子级联对照使用独立性能报告，请关闭 timer、perf-scope 和 GELU/SwiGLU A/B 参数")
+        if args.timer or args.perf_scope not in ("all", "memory") or args.paired_weights or args.comparison_arm is not None:
+            parser.error("小算子级联对照支持 perf_scope=all 或 memory，请关闭 timer 和 GELU/SwiGLU A/B 参数")
         try:
             validate_cascade_comparison(args.cascade_stage, model, args.bs, args.mode, selected, args.dual_reference)
         except ValueError as error:
@@ -474,11 +535,11 @@ def parse_args(argv, run_config=None):
     return args
 
 
-def ubx_timer_ranks(ep_size):
-    count = min(TIMER_RANKS_PER_NODE, LOCAL_RANKS)
+def sampled_timer_ranks(ep_size, ranks_per_node):
+    count = min(TIMER_RANKS_PER_NODE, ranks_per_node)
     return [
-        node_offset + sample * LOCAL_RANKS // count
-        for node_offset in range(0, ep_size, LOCAL_RANKS)
+        node_offset + sample * ranks_per_node // count
+        for node_offset in range(0, ep_size, ranks_per_node)
         for sample in range(count)
     ]
 
@@ -502,7 +563,7 @@ def comparison_plan(args):
         ))
     return dict(
         schema="ubx_ab_plan_v1", ep_size=args.ep_size, bs=args.bs, routing=args.routing, config=config,
-        arms=args.arm_models, pairs=pairs, cases=cases, timer_ranks=ubx_timer_ranks(args.ep_size),
+        arms=args.arm_models, pairs=pairs, cases=cases, timer_ranks=sampled_timer_ranks(args.ep_size, args.ranks_per_node),
         window_tokens=min(args.bs, args.window_tokens or 256),
         measurement_order=["formal_host_e2e", "first_window_timer", "report"],
     )
@@ -573,12 +634,12 @@ def case_args(args, precision, config):
 
 
 def prepare_golden(python, env, args, precision, config, *, reuse_only=False):
-    first = args.node_rank * LOCAL_RANKS
+    first = args.node_rank * args.ranks_per_node
     summary = args.output_dir / f"golden-{precision}-node{args.node_rank}.json"
     command = [
         python, "-P", str(SCRIPT.with_name("ubx_prepare_golden.py")), *case_args(args, precision, config),
         "--golden-dir", env["GOLDEN_DIR"], "--check-tokens", args.check_tokens, "--ep-size", str(args.ep_size),
-        "--ranks", f"{first}-{first + LOCAL_RANKS - 1}", "--workers", args.golden_workers,
+        "--ranks", f"{first}-{first + args.ranks_per_node - 1}", "--workers", args.golden_workers,
         "--chunk-tokens", "128", "--summary", str(summary),
     ]
     if reuse_only:
@@ -621,8 +682,20 @@ def cascade_perf_lines(case_dir, stage):
     return [*lines, f"[{stage.upper()} PERF] 全组报告 {path}"]
 
 
+def memory_peak_lines(case_dir, world):
+    path = case_dir / "resources.json"
+    summary = json.loads(path.read_bytes())["device_memory_peak_group"]
+    if summary["rank_count"] != world:
+        raise ValueError(f"{path} 缺少 EP{world} 全组显存峰值统计")
+    return [
+        f"[HBM] 全组峰值 {summary['max_peak_used_bytes'] / 2**30:.2f} GiB (rank {summary['max_peak_used_rank']})，"
+        f"最高占用率 {summary['max_peak_used_pct']:.2f}% (rank {summary['max_peak_used_pct_rank']})",
+        f"[HBM] 报告 {path}",
+    ]
+
+
 def report_lines(directory, args, mode, precision):
-    rank_dir = directory / f"rank_{args.node_rank * LOCAL_RANKS}"
+    rank_dir = directory / f"rank_{args.node_rank * args.ranks_per_node}"
     manifest_path = rank_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest["backend"] != args.backend or manifest["ep_size"] != args.ep_size:
@@ -633,9 +706,13 @@ def report_lines(directory, args, mode, precision):
     case_dir = rank_dir / f"bs_{args.bs}"
     if mode == "accuracy":
         return [f"[ACCURACY] 全组报告 {case_dir / 'accuracy.json'}"]
+    if args.cascade_stage and manifest.get(f"compare_{args.cascade_stage}_cascade") is not True:
+        raise ValueError(f"{manifest_path} 缺少 {args.cascade_stage.capitalize()} 级联对照运行标记")
+    if args.perf_scope == "memory":
+        if manifest.get("perf_scope") != "memory" or manifest.get("profile_memory_peak") is not True:
+            raise ValueError(f"{manifest_path} 缺少 HBM 专项采集标记")
+        return memory_peak_lines(case_dir, args.ep_size)
     if args.cascade_stage:
-        if manifest.get(f"compare_{args.cascade_stage}_cascade") is not True:
-            raise ValueError(f"{manifest_path} 缺少 {args.cascade_stage.capitalize()} 级联对照运行标记")
         return cascade_perf_lines(case_dir, args.cascade_stage)
     if args.perf_scope == "timer":
         return [f"[TIMER] 诊断目录 {directory}"]
@@ -659,11 +736,11 @@ def report_lines(directory, args, mode, precision):
 def run_case(python, env, args, mode, precision, config):
     name = f"{mode}-{precision}"
     output = args.output_dir / name
-    if (output / f"rank_{args.node_rank * LOCAL_RANKS}").exists():
+    if (output / f"rank_{args.node_rank * args.ranks_per_node}").exists():
         raise ValueError(f"{output} 已有本节点的报告，请指定新的 --output-dir")
-    extra = []
+    extra = memory_option(args.profile_memory_peak, mode=mode)
     if mode == "accuracy":
-        extra = ["--golden-dir", env["GOLDEN_DIR"], "--check-tokens", args.check_tokens]
+        extra.extend(("--golden-dir", env["GOLDEN_DIR"], "--check-tokens", args.check_tokens))
         if args.dual_reference:
             extra.append("--dual-reference")
     if args.backend != "urma":
@@ -675,9 +752,9 @@ def run_case(python, env, args, mode, precision, config):
     if args.cascade_stage:
         extra.append(f"--compare-{args.cascade_stage}-cascade")
     if args.timer:
-        ranks = ",".join(map(str, ubx_timer_ranks(args.ep_size)))
+        ranks = ",".join(map(str, sampled_timer_ranks(args.ep_size, args.ranks_per_node)))
         extra.extend(("--timer", "--timer-ranks", ranks))
-    if args.ep_size == 16:
+    if args.nnodes == 1:
         rendezvous = [
             "--nnodes=1", "--rdzv-backend=c10d", f"--rdzv-endpoint={args.master_addr}:0",
             f"--local-addr={args.master_addr}", f"--rdzv-id={uuid4()}",
@@ -690,7 +767,7 @@ def run_case(python, env, args, mode, precision, config):
         ]
     command = [
         python, "-c", "from torch.distributed.run import main; main()", *rendezvous,
-        f"--nproc-per-node={LOCAL_RANKS}", "--max-restarts=0", "--module", f"{MODULE}.benchmark",
+        f"--nproc-per-node={args.ranks_per_node}", "--max-restarts=0", "--module", f"{MODULE}.benchmark",
         *case_args(args, precision, config), "--mode", mode, "--output-dir", str(output), *extra,
     ]
     print(f"[UBX] node{args.node_rank} {mode} {MMA_TYPES[precision]}", flush=True)
@@ -711,9 +788,11 @@ def run_single_accuracy(python, env, args, precision, config, check_device):
 
     def cache_entry(golden, runtime):
         backend = {"backend": args.backend} if args.backend != "urma" else {}
+        # Unsampled accuracy can still reuse existing pre-sampler cache entries.
+        peak = {"profile_memory_peak": True} if args.profile_memory_peak is not False else {}
         return AccuracyCache(args.output_dir.parent, dict(
             inputs, config=golden["config"], golden=golden["identity"], runtime=runtime,
-            dual_reference=args.dual_reference, **backend,
+            dual_reference=args.dual_reference, **backend, **peak,
         ))
 
     with file_lock(lock_path):
@@ -739,6 +818,8 @@ def run_single_accuracy(python, env, args, precision, config, check_device):
                     f"[UBX] 复用 {precision.upper()} NPU 精度结果",
                     *report_lines(previous, args, "accuracy", precision),
                 ]
+                if args.profile_memory_peak is not False:
+                    lines.append(f"[HBM] 复用报告 {previous / 'rank_0' / f'bs_{args.bs}' / 'resources.json'}")
                 message = "\n".join(lines) + "\n"
                 (args.output_dir / f"accuracy-{precision}-node0.log").write_text(message, encoding="utf-8")
                 print(message, end="", flush=True)
@@ -781,6 +862,8 @@ def orchestrate(args, env):
             argv.append("--force-cpu")
         if stage == "run" and args.timer:
             argv.append("--timer")
+        if stage == "run":
+            argv.extend(memory_option(args.profile_memory_peak))
         if args.topk is not None:
             argv.extend(("--topk", str(args.topk)))
         if args.comparison_arm is not None:
@@ -859,14 +942,19 @@ def main(argv=None, run_config=None):
     args = parse_args(argv, run_config)
     if args.plan:
         plan = comparison_plan(args) if args.mode == "compare" else dict(
-            machine="ubx", backend=args.backend, ep_size=args.ep_size, node_ip=args.node_ip,
+            machine="ubx", backend=args.backend, ep_size=args.ep_size, ranks_per_node=args.ranks_per_node,
+            nnodes=args.nnodes, node_ip=args.node_ip,
             master_addr=args.master_addr, master_port=args.master_port, shmem_port=args.shmem_port,
             mode=args.mode, accuracy_precisions=args.accuracy_precisions, perf_precisions=args.perf_precisions,
-            timer_ranks=ubx_timer_ranks(args.ep_size) if args.timer else [],
+            timer_ranks=sampled_timer_ranks(args.ep_size, args.ranks_per_node) if args.timer else [],
             routing=args.routing, config=dict(args.spec, model=case_model(args), bs_values=[args.bs]),
         )
         if args.cascade_stage:
             plan[f"compare_{args.cascade_stage}_cascade"] = True
+        if args.profile_memory_peak is not None:
+            plan["profile_memory_peak"] = args.profile_memory_peak
+        if args.perf_scope == "memory":
+            plan["perf_scope"] = args.perf_scope
         if args.peer_python:
             plan["peer_python"] = args.peer_python
         print(json.dumps(plan, indent=2, ensure_ascii=False))
@@ -890,9 +978,8 @@ def main(argv=None, run_config=None):
     env["DEEPEP_SHMEM_ENDPOINT"] = f"tcp://{args.master_addr}:{args.shmem_port}"
     if args.output_dir is None:
         base = Path(env.get("RUN_BASE") or REPO_ROOT / "benchmark-runs").resolve()
-        base.mkdir(parents=True, exist_ok=True)
-        workload = args.activation or args.spec["model"].get("activation", "swiglu")
-        args.output_dir = Path(tempfile.mkdtemp(prefix=f"ubx-ep{args.ep_size}-{workload}-{args.routing}-", dir=base))
+        label = workload_run_label("ubx", args, case_model(args), args.accuracy_precisions + args.perf_precisions)
+        args.output_dir = create_run_directory(base, label)
     else:
         args.output_dir = args.output_dir.resolve()
         args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -905,7 +992,7 @@ def main(argv=None, run_config=None):
         if check_native_timer and args.timer and args.stage != "prepare":
             extra.append("1")
         subprocess.run(
-            [python, "-P", DEVICE_CHECK, str(LOCAL_RANKS), str(int(precision == "w8a8" and args.backend == "urma")), *extra],
+            [python, "-P", DEVICE_CHECK, str(args.ranks_per_node), str(int(precision == "w8a8" and args.backend == "urma")), *extra],
             env=env, check=True,
         )
 
@@ -917,7 +1004,7 @@ def main(argv=None, run_config=None):
 
     for precision in args.accuracy_precisions:
         config = config_for(args, precision)
-        if args.ep_size == 16:
+        if args.nnodes == 1:
             run_single_accuracy(python, env, args, precision, config, check_device)
         else:
             check_device(precision)
@@ -953,10 +1040,12 @@ def pod_settings(path, data):
         run_base=os.environ.get("RUN_BASE") or str(REPO_ROOT / "benchmark-runs"), output_dir="",
         python=os.environ.get("PYTHON") or "", base_python=os.environ.get("BASE_PYTHON") or POD_PYTHON,
         cann_env=os.environ.get("CANN_ENV") or POD_CANN_ENV, backend="mte",
-        golden_only=False, skip_golden=False, plan=False, timer=False,
+        golden_only=False, skip_golden=False, plan=False, timer=False, perf_scope="all",
         compare_decode_cascade=False, compare_prefill_cascade=False,
     )
-    unknown = data.keys() - settings.keys() - {"schema_version", "machine", "mode", "precision", "config", "bs"}
+    unknown = data.keys() - settings.keys() - {
+        "schema_version", "machine", "mode", "precision", "config", "bs", "profile_memory_peak",
+    }
     if unknown:
         raise ValueError(f"950POD 运行配置不支持字段 {sorted(unknown)}")
     for name, default in settings.items():
@@ -970,16 +1059,24 @@ def pod_settings(path, data):
                 value = str((path.parent / Path(value).expanduser()).resolve())
             settings[name] = value
     args = argparse.Namespace(**settings)
+    args.profile_memory_peak = configured_memory_peak(data)
     args.cascade_stage = cascade_stage(args)
     args.machine, args.mode, args.precision = data["machine"], data["mode"], parse_precision(data["precision"])
+    if args.perf_scope not in ("all", "memory"):
+        raise ValueError("950POD 支持 perf_scope=all 或 memory")
+    validate_memory_scope(args)
     if args.backend != "mte" or args.mode not in {"accuracy", "perf"} or args.precision not in {*MMA_TYPES, "all"}:
         raise ValueError("950POD 使用 MTE，mode 支持 accuracy 或 perf，precision 支持 a8w4、a8w8、a4w4 或 all")
-    if args.ep_size not in (8, 16, 32) or not 0 <= args.node_rank < args.ep_size // POD_RANKS:
-        raise ValueError("950POD 支持 EP8/16/32，每机 8 卡，node_rank 从 0 开始")
+    if args.ep_size not in (4, 8, 16, 32):
+        raise ValueError("950POD 支持 EP4/8/16/32")
+    args.ranks_per_node = min(args.ep_size, POD_RANKS)
+    args.nnodes = args.ep_size // args.ranks_per_node
+    if not 0 <= args.node_rank < args.nnodes:
+        raise ValueError(f"950POD EP{args.ep_size} 需要 {args.nnodes} 台节点，node_rank 从 0 开始")
     if not args.master_addr:
         raise ValueError("950POD 需要在 JSON 中设置 master_addr")
     args.master_addr = IPv4Address(args.master_addr)
-    if args.ep_size > POD_RANKS and (not args.output_dir or args.master_addr.is_loopback):
+    if args.nnodes > 1 and (not args.output_dir or args.master_addr.is_loopback):
         raise ValueError("950POD 多机需要 output_dir 和其他节点可访问的 master_addr")
     if any(not 1024 <= port <= 65535 for port in (args.master_port, args.shmem_port)) or args.master_port == args.shmem_port:
         raise ValueError("torchrun 和 SHMEM 端口必须不同且在 1024..65535")
@@ -1022,14 +1119,16 @@ def pod_settings(path, data):
 
 
 def pod_perf_report(args, output, first, spec, precision):
-    for rank in range(first, first + POD_RANKS):
+    for rank in range(first, first + args.ranks_per_node):
         rank_dir = output / f"rank_{rank}"
         manifest_path = rank_dir / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         expected = dict(backend="mte", mode="perf", ep_size=args.ep_size, rank=rank,
-                        ranks_per_node=POD_RANKS, routing=args.routing, input=input_kind(precision))
+                        ranks_per_node=args.ranks_per_node, routing=args.routing, input=input_kind(precision))
         if args.cascade_stage:
             expected[f"compare_{args.cascade_stage}_cascade"] = True
+        if args.perf_scope == "memory":
+            expected.update(perf_scope="memory", profile_memory_peak=True)
         if any(manifest.get(key) != value for key, value in expected.items()):
             raise ValueError(f"{manifest_path} 与本轮 950POD 性能配置不符")
         settings = manifest["config"]
@@ -1038,8 +1137,9 @@ def pod_perf_report(args, output, first, spec, precision):
         ):
             raise ValueError(f"{manifest_path} 的模型或 BS 与本轮配置不符")
         case_dir = rank_dir / f"bs_{args.bs}"
-        if args.cascade_stage:
-            lines = cascade_perf_lines(case_dir, args.cascade_stage)
+        if args.perf_scope == "memory" or args.cascade_stage:
+            lines = (memory_peak_lines(case_dir, args.ep_size) if args.perf_scope == "memory"
+                     else cascade_perf_lines(case_dir, args.cascade_stage))
             if rank == first:
                 summary = lines
             continue
@@ -1051,7 +1151,7 @@ def pod_perf_report(args, output, first, spec, precision):
             raise ValueError(f"{report_path} 的 kernel、host_e2e 时延和吞吐必须为有限正值")
         if rank == first:
             summary = (report_path, host["rank_max_mean_us"], host["global_input_tokens_per_second"])
-    if args.cascade_stage:
+    if args.perf_scope == "memory" or args.cascade_stage:
         return "\n".join(summary)
     path, latency, throughput = summary
     return f"[PERF] 最慢 rank 的同步端到端均值 {latency / 1000:.3f} ms，全组吞吐量 {throughput:,.0f} token/s\n[PERF] 全组报告 {path}"
@@ -1071,8 +1171,8 @@ def run_pod_case(args, precision, python, env, first):
         # Bound each CPU invocation to at most one full rank of selected rows.
         batch = args.bs // min(args.check_tokens or args.bs, args.bs)
         with (args.output_dir / f"golden-{label}.log").open("w", encoding="utf-8") as log:
-            for start in range(first, first + POD_RANKS, batch):
-                last = min(start + batch, first + POD_RANKS) - 1
+            for start in range(first, first + args.ranks_per_node, batch):
+                last = min(start + batch, first + args.ranks_per_node) - 1
                 run_logged([*command, "--ranks", f"{start}-{last}"], env, log)
     if args.golden_only:
         return
@@ -1082,17 +1182,20 @@ def run_pod_case(args, precision, python, env, first):
     output = args.output_dir / (f"{args.mode}-{precision}" if args.precision == "all" else args.mode)
     command = [
         python, "-I", "-c", "from torch.distributed.run import main; main()", "--rdzv-backend=static",
-        f"--nnodes={args.ep_size // POD_RANKS}", f"--nproc-per-node={POD_RANKS}", f"--node-rank={args.node_rank}",
+        f"--nnodes={args.nnodes}", f"--nproc-per-node={args.ranks_per_node}", f"--node-rank={args.node_rank}",
         f"--master-addr={args.master_addr}", f"--master-port={args.master_port}", "--max-restarts=0",
         *([f"--rdzv-id={args.rdzv_id}"] if args.rdzv_id else []),
         "--module", f"{MODULE}.benchmark", *options, "--mode", args.mode, "--output-dir", str(output),
+        *memory_option(args.profile_memory_peak, mode=args.mode),
     ]
     if args.mode == "accuracy" and args.dual_reference:
         command.append("--dual-reference")
+    if args.perf_scope != "all":
+        command.extend(("--perf-scope", args.perf_scope))
     if args.cascade_stage:
         command.append(f"--compare-{args.cascade_stage}-cascade")
     if args.timer:
-        ranks = range(0, args.ep_size, POD_RANKS // TIMER_RANKS_PER_NODE)
+        ranks = sampled_timer_ranks(args.ep_size, args.ranks_per_node)
         command.extend(("--timer", "--timer-ranks", ",".join(map(str, ranks))))
     with (args.output_dir / f"{args.mode}-{label}.log").open("w", encoding="utf-8") as log:
         run_logged(command, env, log)
@@ -1114,12 +1217,14 @@ def run_pod_case(args, precision, python, env, first):
 def run_pod(path, data):
     args = pod_settings(path, data)
     if args.plan:
-        print(json.dumps(vars(args), default=str, indent=2, ensure_ascii=False))
+        plan = dict(vars(args), timer_ranks=sampled_timer_ranks(args.ep_size, args.ranks_per_node) if args.timer else [])
+        print(json.dumps(plan, default=str, indent=2, ensure_ascii=False))
         return 0
     if not os.environ.get("DEEPEP_950POD_BOOTSTRAPPED"):
         env = dict(os.environ, DEEPEP_950POD_BOOTSTRAPPED="1")
         base_lib = str(Path(args.base_python).parent.parent / "lib")
         extra = [f"--compare-{args.cascade_stage}-cascade"] if args.cascade_stage else []
+        extra.extend(memory_option(args.profile_memory_peak))
         os.execvpe("bash", ["bash", "-c", POD_BOOTSTRAP, "950pod-env", args.cann_env, args.python, base_lib,
                            str(SCRIPT), "--run-config", str(path), *extra], env)
 
@@ -1129,16 +1234,16 @@ def run_pod(path, data):
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS"):
         env[name] = "1"
     if not args.golden_only:
-        subprocess.run([python, "-I", "-c", POD_DEVICE_CHECK, str(POD_RANKS)], env=env, check=True)
+        subprocess.run([python, "-I", "-c", POD_DEVICE_CHECK, str(args.ranks_per_node)], env=env, check=True)
     if args.output_dir:
         args.output_dir = Path(args.output_dir)
         args.output_dir.mkdir(parents=True, exist_ok=True)
     else:
         base = Path(args.run_base).resolve()
-        base.mkdir(parents=True, exist_ok=True)
-        args.output_dir = Path(tempfile.mkdtemp(prefix="950pod-gelu-", dir=base))
-    first = args.node_rank * POD_RANKS
-    print(f"[950 POD] EP{args.ep_size} rank {first}-{first + POD_RANKS - 1} {path.name} "
+        label = workload_run_label("950pod", args, args.spec["model"], args.precisions)
+        args.output_dir = create_run_directory(base, label)
+    first = args.node_rank * args.ranks_per_node
+    print(f"[950 POD] EP{args.ep_size} rank {first}-{first + args.ranks_per_node - 1} {path.name} "
           f"B{args.bs} {args.routing}\n[950 POD] 输出目录 {args.output_dir}", flush=True)
     for precision in args.precisions:
         run_pod_case(args, precision, python, env, first)
@@ -1155,12 +1260,16 @@ def entrypoint(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--run-config", required=True, type=Path, help="包含机型和全部测试参数的 JSON")
     parser.add_argument("--plan", action="store_true", help="只打印运行计划")
-    parser.add_argument("--only", choices=("accuracy", "perf", "prefill"), help="仅运行 L0 清单中选定的阶段")
+    parser.add_argument("--only", choices=("accuracy", "perf", "prefill", "memory"), help="仅运行 L0 清单中选定的阶段")
+    add_memory_argument(parser)
     add_cascade_arguments(parser)
     args = parser.parse_args(argv)
     path = args.run_config.resolve()
     try:
         data = read_run_config(path)
+        configured_memory_peak(data)
+        if args.profile_memory_peak is not None:
+            data["profile_memory_peak"] = args.profile_memory_peak
         stage = cascade_stage(args)
         if "suite" in data:
             if stage:
@@ -1191,6 +1300,7 @@ def entrypoint(argv=None):
         if data["machine"] == "ubx":
             data.setdefault("backend", "mte_roce" if data.get("ep_size") == 32 else "mte")
             extra = [f"--compare-{stage}-cascade"] if stage else []
+            extra.extend(memory_option(args.profile_memory_peak))
             return cli(["--run-config", str(path), *extra], data)
         return run_pod(path, data)
     except subprocess.CalledProcessError as error:

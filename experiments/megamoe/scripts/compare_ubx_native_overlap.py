@@ -28,7 +28,7 @@ else:
         sys.path.pop(0)
 
 
-TOPOLOGIES = {"mte": (16, "shmem_mte"), "mte_roce": (32, "shmem_mte_roce")}
+TRANSPORT = {"mte": "shmem_mte", "mte_roce": "shmem_mte_roce"}
 TIMER_MODES = {
     "mte": {"fp8xfp4": ("w4a8", "fp8"), "fp4xfp4": ("w4a4", "fp4")},
     "mte_roce": {"fp8xfp4": ("w4a8", "fp8"), "fp8xfp8": ("w8a8", "fp8"), "fp4xfp4": ("w4a4", "fp4")},
@@ -52,13 +52,17 @@ def positive_number(value):
 def read_job(root, arm, *, platform="ubx"):
     first = read_json(root / "rank_0" / "manifest.json")
     backend = first["backend"]
-    require(backend in TOPOLOGIES, f"{root}: expected native UBX mte or mte_roce")
-    world, transport = TOPOLOGIES[backend]
-    local = 16
+    require(backend in TRANSPORT, f"{root}: expected mte or mte_roce")
+    transport = TRANSPORT[backend]
+    world = first["ep_size"]
+    require(type(world) is int and world in (4, 8, 16, 32), f"{root}: invalid EP size")
     if platform == "950pod":
         require(backend == "mte", f"{root}: 950POD requires MTE")
-        world, local = 32, 8
-    elif platform != "ubx":
+        local = min(8, world)
+    elif platform == "ubx":
+        local = min(16, world)
+        require((world == 32) == (backend == "mte_roce"), f"{root}: UBX backend disagrees with EP size")
+    else:
         raise ValueError(f"Unknown platform {platform!r}")
     config = first["config"]
     model = config["model"]
@@ -84,7 +88,7 @@ def read_job(root, arm, *, platform="ubx"):
             and len(set(timers)) == len(timers) and {rank // local for rank in timers} == set(range(world // local)),
             f"{root}: invalid sample rank list or missing node coverage")
     if platform == "950pod":
-        require(sorted(timers) == list(range(0, world, 2)), f"{root}: expected four even-numbered timer ranks per 950POD node")
+        require(sorted(timers) == list(range(0, world, local // 4)), f"{root}: expected four evenly spaced timer ranks per 950POD node")
     run_id = first["run_id"]
     require(isinstance(run_id, str) and run_id not in ("", "none"), f"{root}: missing benchmark run ID")
     build = first["build"]

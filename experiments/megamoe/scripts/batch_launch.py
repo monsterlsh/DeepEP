@@ -4,7 +4,6 @@
 """Launch MegaMoE on explicitly configured hosts sharing one checkout."""
 
 import argparse
-from datetime import datetime
 import getpass
 import ipaddress
 import json
@@ -17,9 +16,12 @@ import signal
 import subprocess
 import sys
 import time
-import uuid
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from run_directory import create_run_directory  # noqa: E402
+
+sys.path.pop(0)
 
 
 def select_hosts(config, ep, master=None, ranks_per_node=8):
@@ -127,6 +129,7 @@ def make_plan(args):
         input=args.input,
         routing=args.routing,
         mode=args.mode,
+        prepare_only=args.prepare_only,
         timer=not args.no_timer,
         parse_timer=not args.no_timer and args.parse_timer is not False,
         wheel=wheel,
@@ -141,6 +144,16 @@ def make_plan(args):
         conda_env=environment["CONDA_ENV"],
         ascend_env=environment["ASCEND_ENV"],
     )
+
+
+def batch_run_label(plan):
+    model = plan["config"]["model"]
+    precision = {"fp8xfp4": "a8w4", "fp8xfp8": "a8w8", "fp4xfp4": "a4w4"}[model.get("mma_type", "fp8xfp4")]
+    mode = "prepare" if plan["prepare_only"] else plan["mode"]
+    activation = model.get("activation", "swiglu")
+    batches = plan["config"]["bs_values"]
+    batch = f"bs{batches[0]}" if len(batches) == 1 else f"bs{min(batches)}-{max(batches)}-n{len(batches)}"
+    return f"batch-ep{plan['ep_size']}-{precision}-{mode}-{activation}-k{model['num_topk']:d}-{batch}"
 
 
 def remote_script(plan, run_dir, rank, stage, bs=None):
@@ -432,10 +445,9 @@ def main(argv=None):
     # 共享 checkout 只允许本入口的一项部署/测试，避免并行安装和编译互相覆盖。
     with (runs / ".batch.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        tag = f"ep{plan['ep_size']}_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
-        run_dir = runs / tag
-        (run_dir / "logs").mkdir(parents=True)
-        plan["run_id"] = tag
+        run_dir = create_run_directory(runs, batch_run_label(plan), mode=0o777, unique_id=True)
+        (run_dir / "logs").mkdir()
+        plan["run_id"] = run_dir.name
         (run_dir / "launch.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
         (run_dir / "case.json").write_text(json.dumps(plan["config"], indent=2), encoding="utf-8")
         password = None

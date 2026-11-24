@@ -18,7 +18,16 @@ CASES=experiments/megamoe/scripts/configs
 python3 "$RUN" --run-config "$CASES/ubx_ep32_target.json"
 ```
 
-每份运行 JSON 的 `_comments` 都有中文启动命令和字段说明。`_comments.可选值` 列出当前预设支持的枚举，并按后端列出 `mode`、`precision` 和 `timer` 的选项。脚本读取时会忽略这段注释。设置 `"plan": true` 可预览解析结果。正式执行时删掉该字段或设为 `false`。
+通用预设的 `_comments` 包含字段说明和可选值。设置 `"plan": true` 或追加 `--plan` 可预览解析结果。
+
+按验收清单测 EP4、EP8、EP16，可先列出场景，再生成一份运行 JSON。例如在 UBX 的 .84 上测 EP4 的 TopK25 GELU Finalize 加权 A8W4。两平台的每组参数、限制和多机命令见[分平台 EP 验收矩阵](../../docs/megamoe-topk32-gelu-a4w4-test-checklist.md#分平台-ep-验收矩阵)。
+
+```bash
+MATRIX=experiments/megamoe/scripts/acceptance_cases.py
+python3 "$MATRIX" list --machine ubx --ep-size 4 --case K01
+python3 "$MATRIX" generate --machine ubx --ep-size 4 --case K01 --phase perf --output K01-ubx-ep4-perf.json
+python3 "$RUN" --run-config K01-ubx-ep4-perf.json
+```
 
 ### UBX GELU 与 SwiGLU 精度和性能
 
@@ -45,12 +54,16 @@ bash experiments/megamoe/scripts/build_ubx.sh
 | `config.model.intermediate_hidden` | 激活后的专家中间维度，SwiGLU 的 GMM1 输出宽度为该值的两倍 | `2048` |
 | `config.model.num_shared_experts` | 共享专家数 | `0` |
 | `config.bs_values` | 每卡 token 数，填一个值 | `[257]` |
+| `profile_memory_peak` | 逐卡采样 HBM 已用容量。精度默认开启，性能默认关闭 | `true` / `false` |
+
+独立显存轮可用 `python experiments/megamoe/scripts/run_megamoe.py --run-config experiments/megamoe/scripts/configs/l0/L01.json --only memory`。L01–L06 均使用这个入口。各 BS 的 `resources.json` 保存逐 rank 峰值和全组最小余量。通用 JSON 和直接 torchrun 的用法见[单 case 显存复测](../../docs/megamoe-topk32-gelu-a4w4-test-checklist.md#ubx-与-950pod-显存复测)。
 
 `config` 还包含 `warmup`、`iters`、`seed` 和 `alignment`。外层 `routing` 选择路由数据分布。复用同一份 GELU 预设时，可在复制的 JSON 外层设 `"activation": "swiglu"` 切换到 SwiGLU Finalize 加权。外层 `topk` 和 `bs` 可覆盖内嵌值。EP32 自动拉起时脚本向两台节点传递同一份内嵌模型。
 
 - 四份 UBX JSON 默认 `mode=both`、`precision=all`，先测精度，再测性能。单测时将 `mode` 设为 `accuracy` 或 `perf`，将 `precision` 设为 `a8w4`、`a8w8` 或 `a4w4`。也接受 `w4a8`、`w8a8`、`w4a4`。A4W4 使用 packed FP4 激活与 FP4 权重。
 - JSON 中的 `topk` 可设为 1–32，`routing` 可选 `balanced`、`skewed`、`random` 或 `random-balanced`。`check_tokens=0` 全量比对，正数按每卡抽查。`dual_reference=true` 加做 NPU 级联比对。`weighting=early|late` 选择量化前或 Finalize 加权。
 - 运行 JSON 可指定 `golden_dir`、`run_base`、`output_dir`、`python`、`cann_env`。相对路径以运行 JSON 所在目录为起点。
+- 省略 `output_dir` 时，单项作业按实际平台、EP、后端、精度、任务、激活与加权、TopK、每卡 BS、路由和启动时间命名，例如 `ubx-ep16-mte-a8w4-perf-gelu-early-k25-bs4096-balanced-20261124-143005/`。L0 清单使用较短的 Case 目录名，例如 `L01-ubx-ep32-a8w4-memory-20261124-143005/`。实际路径见启动日志。
 - EP16 的 JSON 用 `master_addr` 设置本机地址，预设为 `127.0.0.1`。EP32 的 JSON 在 `node_ip` 填两台机器的 IPv4，预设为 `["90.90.93.84", "90.90.93.188"]`。从第一台启动，脚本会通过 SSH 拉起第二台。默认取第一项作为 torchrun 和 SHMEM 的主地址，也可以在 JSON 显式设置 `master_addr`。
 - EP32 手动运行时，两台的 JSON 分别设 `node_rank` 为 `0`、`1`，填相同的 `master_addr`、`output_dir`，并移除 `node_ip`。精度先在两台运行 `stage=prepare`，再在两台运行 `stage=run`。性能直接设 `stage=run`。
 - EP16 可复用通过校验的 CPU Golden 和 NPU 精度报告。`force_cpu: true` 重算 Golden，`force_npu: true` 重测 NPU，`force: true` 重跑两段。EP32 的 NPU 精度每轮实测。
@@ -420,7 +433,7 @@ CPU Golden 缓存位于 `benchmark-golden/`，相同配置可复用。
 流水分析根据独立采集的设备 timer 数据，生成流水 JSON 和阶段耗时报告，默认解析主节点 rank0～7。
 
 终端输出各 BS 的 `[PERF]` 耗时或 `[ACCURACY SUMMARY]` 精度摘要，结果保存至：
-`benchmark-runs/ep<EP>_<时间>_<编号>/`。
+`benchmark-runs/batch-ep<EP>-<精度>-<模式>-<激活>-k<TopK>-bs<BS>-YYYYMMDD-HHMMSS-<8位随机编号>/`。多 BS 记录最小值、最大值和个数（如 `bs96-4096-n2`），完整列表见 `case.json`。各节点用含随机编号的目录名核对共享挂载。
 
 | 目录内文件 | 内容 |
 | --- | --- |

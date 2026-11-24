@@ -109,6 +109,9 @@ class AccuracyCache:
         expected.update(mode="accuracy", backend=self.identity.get("backend", "urma"), input=self.identity.get("input", "fp8"))
         if "build" in self.identity:
             expected["build"] = self.identity["build"]
+        sampled = self.identity.get("profile_memory_peak") is True
+        if sampled:
+            expected["profile_memory_peak"] = True
         digest = hashlib.sha256()
         group_report = None
         for rank in range(expected["ep_size"]):
@@ -128,6 +131,17 @@ class AccuracyCache:
             elif report_data != group_report:
                 raise ValueError(f"Ranks disagree on the group accuracy report: {report_path}")
             digest.update(hashlib.sha256(manifest_data).digest())
+            if sampled:
+                resources_path = report_path.with_name("resources.json")
+                resources_data = resources_path.read_bytes()
+                resources = json.loads(resources_data)
+                peak = resources["device_memory_peak"]
+                summary = resources["device_memory_peak_group"]
+                local, maximum = peak["peak_used_bytes"], summary["max_peak_used_bytes"]
+                if (type(local) is not int or type(maximum) is not int or not 0 <= local <= maximum
+                        or peak["sample_count"] < 2 or summary["rank_count"] != expected["ep_size"]):
+                    raise ValueError(f"Missing or invalid peak HBM measurement: {resources_path}")
+                digest.update(hashlib.sha256(resources_data).digest())
         digest.update(hashlib.sha256(group_report).digest())
         return digest.hexdigest()
 

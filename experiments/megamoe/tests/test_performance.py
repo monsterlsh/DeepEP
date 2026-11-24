@@ -322,8 +322,11 @@ def test_paired_perf_weight_fixture_shares_swiglu_gate_and_gmm2(mma_type):
             np.testing.assert_array_equal(actual, array)
 
 
-@pytest.mark.parametrize(("scope", "roce"), [("host", False), ("timer", False), ("all", True)])
-def test_benchmark_runs_separate_host_and_timer_scopes(tmp_path, monkeypatch, scope, roce):
+@pytest.mark.parametrize(("scope", "roce", "sample_peak"), [
+    ("host", False, None), ("timer", False, None), ("all", True, None), ("host", False, True),
+    ("memory", True, True),
+])
+def test_benchmark_runs_separate_host_and_timer_scopes(tmp_path, monkeypatch, scope, roce, sample_peak):
     from deep_ep import _machine, _runtime
     from deep_ep_experimental.megamoe import api, backend, benchmark, urma_trace
 
@@ -352,9 +355,15 @@ def test_benchmark_runs_separate_host_and_timer_scopes(tmp_path, monkeypatch, sc
             pass
 
     tensor = Tensor()
+    memory_queries = []
+
+    def read_device_memory(device):
+        memory_queries.append(device)
+        return 500, 800
+
     torch = SimpleNamespace(
         npu=SimpleNamespace(reset_peak_memory_stats=lambda: None, synchronize=lambda: None,
-                            mem_get_info=lambda device: (500, 800), current_device=lambda: 0,
+                            mem_get_info=read_device_memory, current_device=lambda: 0, set_device=lambda device: None,
                             max_memory_allocated=lambda: 150, max_memory_reserved=lambda: 200),
         from_numpy=lambda value: tensor, empty=lambda *args, **kwargs: tensor,
         zeros=lambda *args, **kwargs: tensor, exp=lambda *args, **kwargs: tensor,
@@ -394,14 +403,30 @@ def test_benchmark_runs_separate_host_and_timer_scopes(tmp_path, monkeypatch, sc
 
     monkeypatch.setattr(benchmark, "collect_profile", collect_profile)
     args = SimpleNamespace(mode="perf", perf_scope=scope, paired_weights=not roce, input="fp8", routing="balanced",
-                           backend="mte_roce" if roce else None, timer=roce or scope == "timer",
+                           profile_memory_peak=sample_peak,
+                           backend="mte_roce" if roce else None, timer=scope in ("timer", "all"),
                            timer_ranks=[0], check_tokens=0, relative_rmse=0.02,
                            output_dir=tmp_path / "run")
     benchmark.run(args, config, group)
     rank_dir = args.output_dir / "rank_0"
     case = rank_dir / "bs_4"
     manifest = json.loads((rank_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["profile_memory_peak"] is bool(sample_peak)
+    assert manifest["dual_reference"] is False
+    resources = json.loads((case / "resources.json").read_text(encoding="utf-8"))
+    if sample_peak:
+        peak = resources["device_memory_peak"]
+        assert peak["peak_used_bytes"] == peak["setup_peak_used_bytes"] == peak["case_peak_used_bytes"] == 300
+        assert peak["peak_used_pct"] == 37.5 and peak["scope"] == "fused"
+        assert resources["device_memory_peak_group"]["rank_count"] == world
+    else:
+        assert "device_memory_peak" not in resources and "device_memory_peak_group" not in resources
+        assert memory_queries == [0]  # Only the original end-of-case snapshot.
     assert manifest["perf_scope"] == scope and manifest["paired_weights"] is not roce
+    if scope == "memory":
+        assert calls == [None] * (config["warmup"] + config["iters"]) and not (allocations or exports)
+        assert not any((case / name).exists() for name in ("profiling.json", "performance.json", "kernel_samples.json"))
+        return
     if roce:
         assert manifest["backend"] == "mte_roce"
         assert calls == [None] * 8 + [timer] and allocations == [8] and exports == [timer]

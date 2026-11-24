@@ -77,15 +77,14 @@ def roce_raw(arm):
     return raw
 
 
-def job(tmp_path, arm, backend, *, identity=False, precision="w4a8", pod=False):
-    world, transport = overlap.TOPOLOGIES[backend]
-    local = 16
-    if pod:
-        world, local = 32, 8
+def job(tmp_path, arm, backend, *, identity=False, precision="w4a8", pod=False, ep=None):
+    world = ep or (32 if pod or backend == "mte_roce" else 16)
+    transport = overlap.TRANSPORT[backend]
+    local = min(world, 8 if pod else 16)
     mma_type, input_kind = {"w4a8": ("fp8xfp4", "fp8"), "w8a8": ("fp8xfp8", "fp8"),
                             "w4a4": ("fp4xfp4", "fp4")}[precision]
     root = tmp_path / arm / f"perf-{precision}"
-    sample = list(range(0, world, 2 if pod else local))
+    sample = list(range(0, world, local // 4 if pod else local))
     config = dict(bs_values=[80], seed=1234, iters=2, warmup=1, alignment=dict(rows=4, cols=4, repeats=1),
                   model=dict(activation=arm, topk_weights_type=int(arm == "gelu"),
                              mma_type=mma_type,
@@ -185,8 +184,19 @@ def test_950pod_first_window_uses_four_nodes_and_all_even_ranks(tmp_path, monkey
     data = overlap.read_json(manifest)
     data["timer_ranks"].remove(30)
     write(manifest, data)
-    with pytest.raises(ValueError, match="four even-numbered timer ranks"):
+    with pytest.raises(ValueError, match="four evenly spaced timer ranks"):
         overlap.compare(a, b, platform="950pod")
+
+
+@pytest.mark.parametrize("platform, ep", [("ubx", 4), ("ubx", 8), ("950pod", 4), ("950pod", 8), ("950pod", 16)])
+def test_small_ep_overlap_uses_manifest_topology(tmp_path, monkeypatch, platform, ep):
+    a, b = (job(tmp_path, arm, "mte", identity=True, pod=platform == "950pod", ep=ep)
+            for arm in ("gelu", "swiglu"))
+    monkeypatch.setattr(overlap, "binary_spans", lambda path, size, decode: decode(mte_raw(path.parents[3].name)))
+    report = overlap.compare(a, b, platform=platform)
+    local = min(ep, 8 if platform == "950pod" else 16)
+    assert (report["case"]["ep_size"], report["case"]["ranks_per_node"]) == (ep, local)
+    assert report["physical_mapping"] == "verified"
 
 
 def test_incomplete_selected_roce_trace_fails(tmp_path):

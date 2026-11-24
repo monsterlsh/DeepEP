@@ -840,7 +840,7 @@ def test_a8w8_activation_modes_reach_native(backend, activation):
 
 
 def test_a4w4_rejects_unsupported_topology(backend):
-    with pytest.raises(ValueError, match="16 ranks on one host"):
+    with pytest.raises(ValueError, match="EP4/8/16 on one host"):
         api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, mma_type="fp4xfp4")
 
 
@@ -895,7 +895,7 @@ def test_pod_a4w4_rejects_noncontiguous_hosts(backend, monkeypatch):
                        backend="mte", mma_type="fp4xfp4")
 
 
-@pytest.mark.parametrize("transport,world", [("mte", 16), ("mte_roce", 32)])
+@pytest.mark.parametrize("transport,world", [("mte", 4), ("mte", 8), ("mte", 16), ("mte_roce", 32)])
 @pytest.mark.parametrize(("mma", "shared_experts"), [("fp8xfp4", 0), ("fp8xfp8", 0), ("fp4xfp4", 0), ("fp4xfp4", 1)])
 @pytest.mark.parametrize("activation,weight_mode", [("gelu", 1), ("swiglu", 0)])
 def test_ubx_mx_window_and_tail_forward(backend, monkeypatch, transport, world, mma, shared_experts, activation, weight_mode):
@@ -914,8 +914,9 @@ def test_ubx_mx_window_and_tail_forward(backend, monkeypatch, transport, world, 
         return ext.Plan(example, intermediate, k, experts, ep, width, mma == "fp8xfp4", shared,
                         16, ffts, address, capacity, backend="mte_roce", **kwargs)
     monkeypatch.setattr(ext, "RocePlan", roce_plan, raising=False)
-    local, tokens, topk, h, i = 2, 35, 32, 1024, 256
-    b = api.SymmBuffer(backend.group_type(world), local * world, tokens, topk, h, i, ranks_per_node=16,
+    local, tokens, topk, h, i = max(2, 32 // world), 35, 32, 1024, 256
+    monkeypatch.setattr(api, "_host_boot_id", lambda: "local-host")
+    b = api.SymmBuffer(backend.group_type(world), local * world, tokens, topk, h, i, ranks_per_node=min(world, 16),
                        backend=transport, mma_type=mma, activation=activation, num_shared_experts=shared_experts)
     try:
         cols = i if activation == "gelu" else 2 * i
@@ -963,8 +964,44 @@ def test_ubx_mx_window_and_tail_forward(backend, monkeypatch, transport, world, 
             assert ("validate_timer", timer, transport) in backend.events
         assert b._plan.topk_weights_type == b._tail_plan.topk_weights_type == weight_mode
         assert b._plan.mma_type == b._tail_plan.mma_type == mma
-        np.testing.assert_array_equal(stats.data, [6, 9])
+        np.testing.assert_array_equal(stats.data, 3 * (np.arange(local) + 2))
         assert np.all(y.data == 3)
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize("world,ranks_per_node", [(4, 4), (8, 8), (16, 8), (32, 8)])
+@pytest.mark.parametrize("shared_experts", [0, 1])
+def test_auto_mte_swiglu_heap_limit_by_topology(backend, monkeypatch, world, ranks_per_node, shared_experts):
+    tokens = 513
+
+    def heap(ep, local, rows, k, hidden, **kwargs):
+        assert ep == world and local == 384 // world and k == 6
+        return (2 << 30) if rows > 256 else (2 << 20)
+
+    def scratch(*args, **options):
+        assert options["activation"] == "swiglu" and options["shared_experts"] == shared_experts
+        return 4096
+
+    monkeypatch.setattr(backend.ext, "buffer_size", heap)
+    monkeypatch.setattr(backend.ext, "mte_plan_bytes", scratch, raising=False)
+    if world == 32:
+        # EP32 still reserves its original full-batch heap for this baseline.
+        def runtime(group, capacity, *args, **kwargs):
+            assert capacity == 2 << 30
+            raise ValueError("MTE symmetric heap limit")
+
+        monkeypatch.setattr(api, "_MegaRuntime", runtime)
+        with pytest.raises(ValueError, match="MTE symmetric heap limit"):
+            api.SymmBuffer(backend.group_type(world), 384, tokens, 6, 5120, 2304, ranks_per_node=ranks_per_node,
+                           num_shared_experts=shared_experts)
+        return
+    b = api.SymmBuffer(backend.group_type(world), 384, tokens, 6, 5120, 2304, ranks_per_node=ranks_per_node,
+                       num_shared_experts=shared_experts)
+    try:
+        assert b.num_forward_windows(tokens) == 3 and b._runtime.native.capacity == 2 << 20
+        b.prepare(tokens)
+        assert b._plan.bs == 256 and b._tail_plan.bs == 1
     finally:
         b.destroy()
 

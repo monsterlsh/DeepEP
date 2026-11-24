@@ -8,7 +8,7 @@ import sys
 
 import pytest
 
-from experiments.megamoe.scripts import run_megamoe as launcher
+from experiments.megamoe.scripts import l0_suite, run_megamoe as launcher
 
 
 PRESETS = launcher.SCRIPT.parent / "configs" / "l0"
@@ -90,6 +90,153 @@ def test_l0_filters_select_disjoint_accuracy_and_performance_jobs(plan, case):
     assert names("--only", "prefill") == ["gelu-prefill"]
 
 
+@pytest.mark.parametrize("case,machine,precision,mma", CASES)
+def test_memory_plans_match_supported_forward_jobs(plan, case, machine, precision, mma):
+    jobs = plan(case, "--only", "memory")["jobs"]
+    perf = plan(case, "--only", "perf")["jobs"]
+    expected = [j for j in perf if j["kind"] != "overlap"]
+    assert [j["name"] for j in jobs] == [j["name"] + "-memory" for j in expected]
+    assert [j["status"] for j in jobs] == [j["status"] for j in expected]
+    assert all(j["kind"] == "memory" and j["profile_memory_peak"] for j in jobs)
+    assert not any(j["profile_memory_peak"] for j in expected)
+    assert jobs[-1]["memory_scope"] == "fused_and_prefill_cascade"
+    if case == "L04":
+        assert jobs[1]["memory_scope"] == "gelu_and_swiglu"
+    assert all(j["profile_memory_peak"] for j in plan(case, "--only", "accuracy")["jobs"])
+
+
+GROUP_PEAK = dict(rank_count=32, max_peak_used_bytes=100, max_peak_used_rank=30, max_peak_used_pct=10,
+                  max_peak_used_pct_rank=30, min_headroom_bytes=900, min_headroom_rank=30)
+
+
+@pytest.mark.parametrize("ep", [4, 8, 16])
+@pytest.mark.parametrize("case,machine,precision,mma", CASES)
+def test_small_l0_plan_keeps_shape_and_arm_requirements(tmp_path, capsys, ep, case, machine, precision, mma):
+    data = launcher.read_run_config(PRESETS / f"{case}.json")
+    data.update(ep_size=ep, backend="mte")
+    if machine == "ubx":
+        hosts = [data.pop("node_ip")[0]]
+        data["master_addr"] = hosts[0]
+    else:
+        hosts = data["nodes"][:max(1, ep // 8)]
+        data["nodes"] = hosts
+    path = tmp_path / "case.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert launcher.entrypoint(["--run-config", str(path), "--plan"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert (report["ep_size"], report["nodes"], report["tokens_per_rank"]) == (ep, hosts, 39280)
+    jobs = {j["name"]: j for j in report["jobs"]}
+    if ep == 4:
+        assert all(j["status"] == "unsupported" and "200" in j["reason"] for j in jobs.values())
+        with pytest.raises(ValueError, match="每 rank 的原生上限 128"):
+            l0_suite.run_l0(path, data)
+    else:
+        assert jobs["gelu"]["status"] == jobs["gelu-accuracy"]["status"] == jobs["gelu-prefill"]["status"] == "planned"
+        assert jobs["swiglu-accuracy"]["status"] == jobs["swiglu"]["status"] == "planned"
+        if machine == "ubx":
+            assert l0_suite.job_config(data, jobs["gelu-accuracy"], tmp_path)["force_npu"]
+        if case == "L04":
+            assert jobs["paired"]["status"] == jobs["native-overlap"]["status"] == "planned"
+        if case == "L02":
+            assert jobs["native-overlap"]["status"] == "unsupported"
+            assert not l0_suite.job_config(data, jobs["gelu"], tmp_path)["timer"]
+
+
+def test_different_native_windows_leave_small_ep_partial_and_continue_prefill(tmp_path, monkeypatch):
+    base = launcher.read_run_config(PRESETS / "L01.json")
+    base.pop("node_ip")
+    base.update(ep_size=8, master_addr="127.0.0.1", backend="mte", output_dir=str(tmp_path / "reports"))
+
+    def run(command, *, check):
+        config = launcher.read_run_config(Path(command[command.index("--run-config") + 1]))
+        width = 128 if config["config"]["model"]["activation"] == "swiglu" else 256
+        rank = Path(config["output_dir"]) / "perf-w4a8/rank_0"
+        rank.mkdir(parents=True)
+        (rank / "manifest.json").write_text(json.dumps(dict(window_tokens=width)), encoding="utf-8")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert l0_suite.run_l0(tmp_path / "case.json", base, only="perf") == 3
+    summary = json.loads((tmp_path / "reports/run-summary.json").read_text(encoding="utf-8"))
+    jobs = {j["name"]: j for j in summary["jobs"]}
+    assert summary["status"] == "partial" and jobs["gelu-prefill"]["status"] == "completed"
+    assert jobs["native-overlap"]["status"] == "unsupported"
+    assert jobs["native-overlap"]["window_tokens"] == {"gelu": 256, "swiglu": 128}
+
+
+def mock_resource_file(config):
+    run = config["mode"]
+    if config["machine"] == "ubx":
+        run += "-" + launcher.parse_precision(config["precision"])
+    path = Path(config["output_dir"]) / run / "rank_0/bs_39280/resources.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(dict(device_memory_peak_group=GROUP_PEAK)), encoding="utf-8")
+    return path
+
+
+def test_l05_memory_writes_scope_reports_and_skips_unsupported_arm(tmp_path, monkeypatch):
+    base = launcher.read_run_config(PRESETS / "L05.json")
+    base["output_dir"] = str(tmp_path / "reports")
+    calls = []
+
+    def launch(config, config_dir, *, nodes, plan=False):
+        assert config["profile_memory_peak"] and config["perf_scope"] == "memory"
+        assert not config["dual_reference"] and not config["timer"] and config["mode"] == "perf"
+        if not plan:
+            mock_resource_file(config)
+            calls.append(config["compare_prefill_cascade"])
+
+    monkeypatch.setattr(l0_suite, "run_pod_job", launch)
+    path = tmp_path / "case.json"
+    assert l0_suite.run_l0(path, base, only="memory") == 3
+    assert calls == [False, True]
+    summary = json.loads((tmp_path / "reports/run-summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "partial"
+    for job in summary["jobs"]:
+        if job["name"] == "swiglu-memory":
+            assert job["status"] == "unsupported" and "device_memory_peak_group" not in job
+        else:
+            assert job["status"] == "completed" and "e2e_target_met" not in job
+            path = Path(job["device_memory_peak_report"])
+            assert path.is_file() and path.parent.parent.parent.name == "perf"
+            assert job["device_memory_peak_group"]["max_peak_used_rank"] == 30
+
+
+def test_l0_rejects_absent_sample_and_conflicting_settings(tmp_path, monkeypatch):
+    base = launcher.read_run_config(PRESETS / "L01.json")
+    base["output_dir"] = str(tmp_path / "reports")
+    with pytest.raises(ValueError, match="profile_memory_peak"):
+        l0_suite.run_l0(tmp_path / "case.json", dict(base, profile_memory_peak=False), only="memory", plan=True)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: None)
+    with pytest.raises(FileNotFoundError, match="resources.json"):
+        l0_suite.run_l0(tmp_path / "case.json", base, only="memory")
+    report = json.loads((tmp_path / "reports/run-summary.json").read_text(encoding="utf-8"))
+    assert report["status"] == report["jobs"][0]["status"] == "failed"
+
+
+def test_l04_co_resident_pair_reports_memory_without_latency_gate(tmp_path, monkeypatch):
+    config = launcher.read_run_config(PRESETS / "L04.json")
+    config["output_dir"] = str(tmp_path / "reports")
+
+    def fused(cfg, config_dir, *, nodes, plan=False):
+        if not plan:
+            mock_resource_file(cfg)
+
+    def paired(cfg, config_dir, *, nodes, plan=False):
+        assert cfg["perf_scope"] == "memory" and cfg["profile_memory_peak"]
+        if not plan:
+            path = Path(cfg["output_dir"]) / "paired.json"
+            path.parent.mkdir()
+            path.write_text(json.dumps(dict(device_memory_peak_group=GROUP_PEAK)), encoding="utf-8")
+
+    monkeypatch.setattr(l0_suite, "run_pod_job", fused)
+    monkeypatch.setattr(l0_suite, "run_pod_paired", paired)
+    assert l0_suite.run_l0(tmp_path / "case.json", config, only="memory") == 0
+    report = json.loads((tmp_path / "reports/run-summary.json").read_text(encoding="utf-8"))
+    job = next(j for j in report["jobs"] if j["workload"] == "paired")
+    assert job["memory_scope"] == "gelu_and_swiglu" and "median_pair_e2e_ratio" not in job
+    assert Path(job["device_memory_peak_report"]) == Path(job["result"]) == tmp_path / "reports/paired-memory/paired.json"
+
+
 def test_ubx_execution_isolates_runs_and_preserves_arm_semantics(tmp_path, monkeypatch):
     monkeypatch.setenv("RUN_BASE", str(tmp_path))
     expected = {
@@ -110,6 +257,9 @@ def test_ubx_execution_isolates_runs_and_preserves_arm_semantics(tmp_path, monke
             arm, mode, timer, cascade = expected[path.stem]
             assert cfg["machine"] == "ubx" and cfg["backend"] == "mte_roce" and cfg["ep_size"] == 32
             assert cfg["mode"] == mode and cfg["timer"] == timer
+            assert cfg["profile_memory_peak"] == (mode == "accuracy")
+            if cfg["profile_memory_peak"]:
+                mock_resource_file(cfg)
             assert cfg["dual_reference"] == (mode == "accuracy")
             assert cfg["check_tokens"] == 0 and cfg["compare_prefill_cascade"] == cascade
             assert cfg["config"]["model"]["activation"] == arm
@@ -154,9 +304,11 @@ def test_ubx_failure_stops_remaining_jobs_and_keeps_run_summary(tmp_path, monkey
 
     def fail_second_stage(command, *, check):
         assert check
-        started.append(Path(command[command.index("--run-config") + 1]).stem)
+        path = Path(command[command.index("--run-config") + 1])
+        started.append(path.stem)
         if len(started) == 2:
             raise subprocess.CalledProcessError(17, command)
+        mock_resource_file(json.loads(path.read_text(encoding="utf-8")))
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(subprocess, "run", fail_second_stage)

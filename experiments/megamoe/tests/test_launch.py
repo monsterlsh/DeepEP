@@ -7,9 +7,11 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -56,6 +58,33 @@ def test_explicit_plan_preserves_rank_order_and_has_no_side_effects(configuratio
 def test_invalid_hosts_fail_before_launch(hosts):
     with pytest.raises(ValueError):
         launcher.select_hosts({"hosts": hosts}, 32)
+
+
+@pytest.mark.parametrize(("options", "expected"), [
+    ([], "batch-ep32-a8w4-perf-swiglu-k6-bs96-4096-n2"),
+    (["--prepare-only", "--bs-values", "128"], "batch-ep32-a8w4-prepare-swiglu-k6-bs128"),
+    (["--config", "target_gelu_k32", "--mode", "accuracy", "--bs-values", "96"],
+     "batch-ep32-a8w4-accuracy-gelu-k32-bs96"),
+])
+def test_batch_run_label_uses_resolved_case(configuration, options, expected):
+    plan = launcher.make_plan(launcher.parse_args([*configuration, *options]))
+    assert launcher.batch_run_label(plan) == expected
+
+
+def test_batch_preparation_passes_readable_unique_directory_to_workers(configuration, tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setitem(sys.modules, "fcntl", SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=lambda *_: None))
+    stages = []
+    monkeypatch.setattr(launcher, "run_stage", lambda plan, path, stage, **kw: stages.append((plan, path, stage)))
+    monkeypatch.setattr(launcher, "verify_nodes", lambda *_: None)
+    config = ROOT / "experiments/megamoe/python/deep_ep_experimental/megamoe/configs/deepseek_v4_pro.json"
+    launcher.main([*configuration, "--shared-code", str(tmp_path), "--config", str(config), "--prepare-only"])
+    plan, directory, _ = stages[0]
+    assert directory.parent == tmp_path / "benchmark-runs"
+    assert re.fullmatch(r"batch-ep32-a8w4-prepare-swiglu-k6-bs96-4096-n2-\d{8}-\d{6}-[0-9a-f]{8}", directory.name)
+    assert plan["run_id"] == directory.name
+    assert json.loads((directory / "launch.json").read_text()) == plan
+    assert all(path == directory for _, path, _ in stages)
 
 
 @pytest.mark.parametrize("ep,local", [(8, 8), (16, 8), (16, 16), (32, 8), (32, 16)])

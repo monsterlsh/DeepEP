@@ -4,6 +4,7 @@
 """Installed-package accuracy/performance runner. Launch with torchrun, not st/run.sh."""
 
 import argparse
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from functools import lru_cache
 import random
@@ -249,9 +250,12 @@ def main():
     parser.add_argument("--config", default="smoke", help="Packaged name or JSON path")
     parser.add_argument("--bs-values", help="Only model config override, e.g. 96,4096")
     parser.add_argument("--mode", choices=("accuracy", "perf"), default="accuracy")
-    parser.add_argument("--backend", choices=("mte", "mte_roce"), help="Select single-host EP16 MTE or two-host EP32 MTE+RoCE")
-    parser.add_argument("--perf-scope", choices=("all", "host", "timer"), default="all",
-                        help="Run all performance measures, synchronized host timing, or a separate device trace")
+    parser.add_argument("--profile-memory-peak", action=argparse.BooleanOptionalAction, default=None,
+                        help="Sample device-wide HBM usage during setup and execution (default: accuracy on, perf off)")
+    parser.add_argument("--backend", choices=("mte", "mte_roce"),
+                        help="Select single-host EP4/8/16 MTE, 8-rank-per-host POD A4W4 MTE, or two-host EP32 MTE+RoCE")
+    parser.add_argument("--perf-scope", choices=("all", "host", "timer", "memory"), default="all",
+                        help="Run all performance measures, host timing, timer tracing, or memory-only forwards")
     parser.add_argument("--paired-weights", action="store_true",
                         help="For performance comparisons, share SwiGLU gate and GMM2 weights with GELU")
     parser.add_argument("--urma-window-tokens", type=int, choices=(64, 128, 256),
@@ -287,6 +291,8 @@ def main():
         parser.error("--perf-scope timer requires --timer")
     if args.perf_scope == "host" and args.timer:
         parser.error("--perf-scope host cannot be combined with --timer")
+    if args.perf_scope == "memory" and (args.timer or args.paired_weights or args.profile_memory_peak is not True):
+        parser.error("--perf-scope memory requires --profile-memory-peak, with timer and paired weights disabled")
     cascade_kind = "decode" if args.compare_decode_cascade else ("prefill" if args.compare_prefill_cascade else None)
     if cascade_kind:
         try:
@@ -312,7 +318,7 @@ def main():
 def _validate_cascade_comparison(args, config, kind):
     if (
         args.mode != "perf" or args.timer or getattr(args, "dual_reference", False)
-        or getattr(args, "paired_weights", False) or getattr(args, "perf_scope", "all") != "all"
+        or getattr(args, "paired_weights", False) or getattr(args, "perf_scope", "all") not in ("all", "memory")
     ):
         raise ValueError(f"--compare-{kind}-cascade requires plain perf mode (timer off)")
     model = config["model"]
@@ -325,6 +331,11 @@ def _validate_cascade_comparison(args, config, kind):
 
 
 def run(args, config, group):
+    with ExitStack() as monitors:
+        _run(args, config, group, monitors)
+
+
+def _run(args, config, group, monitors):
     from .backend import select_backend
 
     requested_backend = getattr(args, "backend", None)
@@ -337,6 +348,9 @@ def run(args, config, group):
     rank, world = group.rank(), group.size()
     ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", world))
     perf_scope = getattr(args, "perf_scope", "all")
+    sample_peak = getattr(args, "profile_memory_peak", None)
+    if sample_peak is None:
+        sample_peak = args.mode == "accuracy"
     paired_weights = bool(getattr(args, "paired_weights", False))
     model = config["model"]
     compare_decode = bool(getattr(args, "compare_decode_cascade", False))
@@ -359,6 +373,7 @@ def run(args, config, group):
             args.check_tokens,
             args.relative_rmse,
             bool(getattr(args, "dual_reference", False)),
+            sample_peak,
             perf_scope,
             paired_weights,
             compare_decode,
@@ -410,7 +425,7 @@ def run(args, config, group):
     if config["model"]["num_experts"] % world:
         raise ValueError("Global experts must divide EP")
     device_identity = None
-    if perf_scope != "all":
+    if perf_scope in ("host", "timer"):
         from deep_ep._machine import physical_device
         from deep_ep._runtime import _host_boot_id
 
@@ -450,6 +465,8 @@ def run(args, config, group):
         config=config,
         input=args.input,
         mode=args.mode,
+        dual_reference=bool(getattr(args, "dual_reference", False)),
+        profile_memory_peak=sample_peak,
         perf_scope=perf_scope,
         paired_weights=paired_weights,
         routing=args.routing,
@@ -475,7 +492,6 @@ def run(args, config, group):
         manifest.update(
             implementation="consumer",
             precision="routed_w8" if mma_type == "fp8xfp8" else "routed_w4_shared_w8",
-            dual_reference=bool(getattr(args, "dual_reference", False)),
             wait_events=False,
             device_routing_in_kernel=True,
         )
@@ -486,6 +502,11 @@ def run(args, config, group):
         raise ValueError("MTE shared width must match routed width")
     if getattr(args, "dual_reference", False) and args.mode != "accuracy":
         raise ValueError("--dual-reference requires --mode accuracy")
+    if sample_peak:
+        from .device_memory import DeviceMemorySampler, combine_device_memory_samples, summarize_device_memory_peaks
+
+        device = torch.npu.current_device()
+        setup_sampler = monitors.enter_context(DeviceMemorySampler(torch.npu, device))
     buffer = SymmBuffer(
         group,
         num_max_tokens_per_rank=max(config["bs_values"]),
@@ -505,7 +526,8 @@ def run(args, config, group):
     )
     if cascade_kind:
         manifest[f"compare_{cascade_kind}_cascade"] = True
-        manifest["kernel_duration_scope"] = "all_forward_device_tasks"
+        if perf_scope == "all":
+            manifest["kernel_duration_scope"] = "all_forward_device_tasks"
     if compare_decode:
         manifest["decode_gmm1_operator"] = (
             "cann_ops_transformer.ops.grouped_matmul_activation_quant"
@@ -563,7 +585,8 @@ def run(args, config, group):
         from .performance import UrmaLaunchGuard
 
         alignment = config["alignment"]
-        guard = UrmaLaunchGuard(group, (alignment["rows"], alignment["cols"]), alignment["repeats"])
+        repeats = 0 if perf_scope == "memory" else alignment["repeats"]
+        guard = UrmaLaunchGuard(group, (alignment["rows"], alignment["cols"]), repeats)
         if compare_decode:
             from .decode_cascade import DecodeCascade
 
@@ -574,11 +597,18 @@ def run(args, config, group):
             perf_cascade = PrefillCascade(model, raw, host_group=group)
         else:
             guard.prepare_per_call_alignment()
-        manifest["alignment"] = guard.describe()
-        (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        if perf_scope != "memory":
+            manifest["alignment"] = guard.describe()
+            (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if sample_peak:
+        # Share the preparation samples; each BS gets its own measurement interval.
+        monitors.close()
+        setup_memory = setup_sampler.report()
     for bs in config["bs_values"]:
         case = rank_dir / f"bs_{bs}"
         case.mkdir()
+        if sample_peak:
+            case_sampler = monitors.enter_context(DeviceMemorySampler(torch.npu, device))
         torch.npu.reset_peak_memory_stats()
         x, ids, weights = inputs(config, rank, bs, args.routing, world=world)
         if args.input == "bf16":
@@ -614,7 +644,7 @@ def run(args, config, group):
         if urma and not cascade_kind:
             # Shared dimensions are inferred by native forward. Allocate its
             # workspace before profiling, using the same public call as MTE.
-            if args.mode == "perf":
+            if args.mode == "perf" and perf_scope != "memory":
                 flush_l2_before_call()
             call()
             torch.npu.synchronize()
@@ -647,14 +677,22 @@ def run(args, config, group):
                     f"batch_iterations={config['iters']}",
                     flush=True,
                 )
-        if not cascade_kind and not (urma and args.mode == "perf" and perf_scope == "all"):
+        if perf_scope != "memory" and not cascade_kind and not (urma and args.mode == "perf" and perf_scope == "all"):
             for _ in range(config["warmup"]):
                 if args.mode == "perf":
                     flush_l2_before_call()
                 call()
             torch.npu.synchronize()
             group.barrier(f"warmup BS={bs}")
-        if args.mode == "accuracy":
+        if perf_scope == "memory":
+            for _ in range(config["warmup"] + config["iters"]):
+                call()
+                if perf_cascade is not None:
+                    quantized = (buffer.x[:bs], buffer.x_sf[:bs]) if activation is None else None
+                    perf_cascade.forward(activation, buffer.topk_idx[:bs], buffer.topk_weights[:bs],
+                                         input_kind=args.input, quantized=quantized)
+                torch.npu.synchronize()
+        elif args.mode == "accuracy":
             stats = torch.full((model["num_experts"] // world,), 7, dtype=torch.int32, device="npu")
             call(stats=stats)
             counts = stats - 7
@@ -782,7 +820,7 @@ def run(args, config, group):
                     f"(last ceil(iters/2); kernel Duration; rank-min mean; timer off)",
                     flush=True,
                 )
-        if args.mode == "perf" and perf_scope != "timer" and not cascade_kind:
+        if args.mode == "perf" and perf_scope in ("all", "host") and not cascade_kind:
             if perf_scope == "host":
                 report = dict(windows_per_forward=windows_by_bs[bs])
                 performance_path = case / "performance.json"
@@ -841,6 +879,27 @@ def run(args, config, group):
             device_total_bytes=device_total,
             device_free_after_case_bytes=device_free,
         )
+        if sample_peak:
+            monitors.close()
+            case_memory = case_sampler.report()
+            peak = combine_device_memory_samples([setup_memory, case_memory])
+            peak["setup_peak_used_bytes"] = setup_memory["peak_used_bytes"]
+            peak["case_peak_used_bytes"] = case_memory["peak_used_bytes"]
+            peak["case_periodic_sample_count"] = case_memory["periodic_sample_count"]
+            peak["shared_process_across_bs"] = len(config["bs_values"]) > 1
+            peak["scope"] = "fused"
+            if cascade_kind:
+                peak["scope"] = f"fused_and_{cascade_kind}_cascade"
+            elif cascade is not None:
+                peak["scope"] = "fused_and_accuracy_reference"
+            resources["device_memory_peak"] = peak
+            peers = group.all_gather(peak, f"device memory peak BS={bs}")
+            summary = summarize_device_memory_peaks(peers)
+            resources["device_memory_peak_group"] = summary
+            if rank == 0:
+                print(f"[HBM] BS={bs} max used {summary['max_peak_used_bytes'] / 2**30:.2f} GiB "
+                      f"(rank {summary['max_peak_used_rank']}), max occupancy {summary['max_peak_used_pct']:.2f}% "
+                      f"(rank {summary['max_peak_used_pct_rank']})", flush=True)
         resources_path.write_text(json.dumps(resources, indent=2), encoding="utf-8")
         group.barrier(f"case complete BS={bs}")
     group.barrier("before SHMEM teardown")

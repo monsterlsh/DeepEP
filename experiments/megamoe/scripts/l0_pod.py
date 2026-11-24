@@ -21,9 +21,10 @@ def _settings(job, config_dir, nodes):
         raise ValueError("950POD nodes must be a list of IPv4 addresses in node-rank order")
     hosts = [str(IPv4Address(node)) for node in nodes]
     args = runner.pod_settings(config_dir / "job.json", job)
-    if (args.ep_size != 32 or len(hosts) != 4 or len(set(hosts)) != 4
+    count = args.ep_size // args.ranks_per_node
+    if (len(hosts) != count or len(set(hosts)) != count
             or hosts[0] != str(args.master_addr)):
-        raise ValueError("950POD EP32 requires four distinct nodes and nodes[0] must be master_addr")
+        raise ValueError(f"950POD EP{args.ep_size} requires {count} distinct node(s) and nodes[0] must be master_addr")
     return args
 
 
@@ -49,7 +50,7 @@ def _supervise(name, commands, args, nodes):
 
 
 def run_pod_job(job, config_dir, *, nodes, plan=False):
-    """Prepare each node's Golden, then start the four torchrun workers together."""
+    """Prepare each node's Golden, then start all torchrun workers together."""
     args = _settings(job, config_dir, nodes)
     if plan:
         return
@@ -69,7 +70,7 @@ def run_pod_job(job, config_dir, *, nodes, plan=False):
 
 
 def run_pod_paired(job, config_dir, *, nodes, plan=False):
-    """Collect eight alternating same-window A8W4 A/B pairs with separate kernel profiling."""
+    """Run the co-resident A8W4 pair with latency profiling or a memory-only diagnostic."""
     args = _settings(job, config_dir, nodes)
     model = args.spec["model"]
     if (args.mode != "perf" or args.precision != "w4a8" or args.cascade_stage
@@ -86,9 +87,12 @@ def run_pod_paired(job, config_dir, *, nodes, plan=False):
     run_id = uuid4().hex
     for rank in range(len(nodes)):
         commands.append([
-            "-I", "-m", "torch.distributed.run", "--nnodes=4", "--nproc-per-node=8", f"--node-rank={rank}",
+            "-I", "-m", "torch.distributed.run", f"--nnodes={len(nodes)}", f"--nproc-per-node={args.ranks_per_node}",
+            f"--node-rank={rank}",
             f"--master-addr={args.master_addr}", f"--master-port={args.master_port}", f"--rdzv-id={run_id}", "--max-restarts=0",
             runner.SCRIPT.with_name("paired_benchmark.py"), "--config", model_path, "--bs", str(args.bs),
-            "--routing", args.routing, "--pairs", "8", "--warmup", "2", "--profile", "--output-dir", out,
+            "--routing", args.routing, "--pairs", "8", "--warmup", "2", "--output-dir", out,
+            "--memory-only" if args.perf_scope == "memory" else "--profile",
+            *runner.memory_option(args.profile_memory_peak),
         ])
     _supervise("paired", commands, args, nodes)

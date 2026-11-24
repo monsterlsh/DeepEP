@@ -27,6 +27,74 @@ def test_pair_rank_max_before_ratio_and_throughput():
         paired.paired_report([[dict(gelu=0, swiglu=5)]], 100)
 
 
+@pytest.mark.parametrize("options,sampled,timed", [
+    (["--memory-only"], True, False),
+    (["--profile-memory-peak"], True, True),
+    (["--profile", "--profile-memory-peak"], True, True),
+    ([], False, True),
+])
+def test_paired_peak_covers_setup_and_both_arms(tmp_path, monkeypatch, options, sampled, timed):
+    from deep_ep import _machine
+    from deep_ep_experimental.megamoe import api, backend
+
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(_machine, "physical_device", lambda: 3)
+    monkeypatch.setattr(backend, "select_backend", lambda g: "mte")
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 2, all_gather=lambda x, label: [x, x],
+                            barrier=lambda label: None, close=lambda: None)
+    monkeypatch.setattr(api.StoreGroup, "from_env", lambda: group)
+    free = [1000]
+    npu = SimpleNamespace(current_device=lambda: 0, set_device=lambda device: None,
+                          mem_get_info=lambda device: (free[0], 1000), synchronize=lambda: None,
+                          max_memory_allocated=lambda: 1, max_memory_reserved=lambda: 2,
+                          reset_peak_memory_stats=lambda: None)
+    torch = SimpleNamespace(npu=npu, __version__="test", set_num_threads=lambda n: None)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(__version__="test"))
+    (tmp_path / "_build_info.json").write_text("{}")
+    monkeypatch.setattr(paired, "files", lambda package: tmp_path)
+    order = []
+
+    def prepare(*args):
+        free[0] = 800
+        def forward(arm):
+            order.append(arm)
+            free[0] -= 10
+        calls = {arm: lambda arm=arm: forward(arm) for arm in paired.ARMS}
+        buffer = SimpleNamespace(symmetric_buffer_bytes=40, destroy=lambda: None)
+        return buffer, calls, {"gelu": [16], "swiglu": [16]}, {}
+
+    monkeypatch.setattr(paired, "prepare_calls", prepare)
+    def profile(*args):
+        assert "--profile" in options
+        free[0] = 100
+        return [{"gelu": 1, "swiglu": 2}] * 2
+    monkeypatch.setattr(paired, "profile_pairs", profile)
+    if not timed:
+        monkeypatch.setattr(paired, "perf_counter_ns", lambda: pytest.fail("Unexpected host clock reading"))
+    monkeypatch.setattr(sys, "argv", ["paired_benchmark.py", "--bs", "16", "--pairs", "2", "--warmup", "1",
+                                      "--output-dir", str(tmp_path), *options])
+    paired.main()
+    assert order == ["gelu", "swiglu", "gelu", "swiglu", "swiglu", "gelu"]
+    report = json.loads((tmp_path / "paired.json").read_text())
+    assert ("host_e2e" in report) == timed and ("memory_pairs" in report) == (not timed)
+    assert ("kernel_sum" in report) == ("--profile" in options)
+    assert report["formal_pairs"] == (2 if timed else 0)
+    assert ("device_memory_peak_group" in report) == sampled
+    rank_path = tmp_path / "rank_0/bs_16/resources.json"
+    assert rank_path.exists() == sampled
+    if sampled:
+        rank = json.loads(rank_path.read_text())
+        assert rank["device_memory_peak_group"] == report["device_memory_peak_group"]
+        assert rank["device_memory_peak_group"]["rank_count"] == 2
+        peak = report["resources_by_rank"][0]["device_memory_peak"]
+        assert peak == rank["device_memory_peak"]
+        assert peak["scope"] == "gelu_and_swiglu" and peak["sample_count"] >= 2
+        assert ("kernel_profile" in peak["phases"]) == ("--profile" in options)
+        assert (peak["initial_used_bytes"], peak["peak_used_bytes"]) == (0, 900 if "--profile" in options else 260)
+
+
 @pytest.mark.parametrize("bs,staged,expected", [
     (257, None, [257]), (39280, None, [256] * 153 + [112]),
     (39280, 512, [512] * 76 + [368]), (39280, 1024, [1024] * 38 + [368]),
