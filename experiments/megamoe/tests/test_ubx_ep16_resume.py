@@ -45,7 +45,7 @@ def ubx(tmp_path, monkeypatch):
     def probe(command, *, env, **kwargs):
         assert command[0] == sys.executable and "PYTHON_EXEC" not in env
         assert not env.get("PYTHONPATH") and env["PYTHONNOUSERSITE"] == "1"
-        if "-c" in command:
+        if launcher.DEVICE_CHECK in command:
             state.device_checks.append(int(command[-1]))
             if state.fail_device:
                 raise subprocess.CalledProcessError(1, command)

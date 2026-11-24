@@ -50,13 +50,17 @@ for flag in ("mte_roce_enabled", "mte_roce_mx_enabled", "mte_roce_timer_enabled"
 PY
 ```
 
-若旧日志停在 `require_native("MegaMoE")` 并显示 `is not implemented in DeepEP`，说明当时导入的 `deep_ep` 目录缺少与当前 Python 匹配的 `_C`。若上面的隔离检查成功，使用更新后的 UBX 启动脚本重跑，启动器会过滤 `PYTHONPATH` 中的源码目录、空项和用户级包。若隔离检查也报同一错误，核对打印的解释器、安装路径以及 wheel 的 SHA-256，并用上面的安装命令将 node0 那份 wheel 装入该环境。
+如果 node1 的旧日志在 `require_native("MegaMoE")` 报 `is not implemented in DeepEP`，先把更新后的启动脚本同步到两台，再在主节点执行 L01。脚本会在加载扩展前打印节点名、实际 Python、wheel 安装目录及包路径。失败节点的日志末尾会显示在主节点终端。L01 首阶段的完整 node1 日志位于本次输出目录下的 `gelu-accuracy/launch-prepare-accuracy-w4a8-node1.log`。
+
+- 日志中的 Python 和安装 wheel 的 Python 路径不一致时，可在 L01 JSON 外层用 `peer_python` 填写 node1 安装 wheel 时使用的解释器绝对路径。
+- 若报 `resolves to … but this interpreter's wheel owns …`，检查该节点 Python 环境中指向旧 checkout 的可编辑安装、`.pth` 或 `sitecustomize.py`。即使使用 `python -I`，环境内的 `.pth` 也能将源码目录放在 wheel 前面。
+- 若报 `No compatible native extension`，按日志中的 Python 版本及 `found` 文件名核对 ABI，再使用该解释器的 `-m pip` 安装 node0 构建的 wheel。若报缺少共享库或 `undefined symbol`，按异常中的库名或符号核对 CANN 和 SHMEM 环境。
 
 ## 2. 生成 JSON 并启动
 
 ### 方案 A：用 `node_ip` 从主节点自动启动
 
-适用于 **90.90.93.84** 可以免交互 SSH 到 **90.90.93.188** 的环境。两台使用同一份 wheel、相同绝对路径的 checkout 和 Python。SSH 登录名或端口有差异时，在运行 JSON 外层填写 `ssh_user` 或 `ssh_port`。
+适用于 **90.90.93.84** 可以免交互 SSH 到 **90.90.93.188** 的环境。两台的 checkout 绝对路径相同，分别在本机的 `py311_tpr` 安装同一份 wheel。升级脚本后，在主节点重新执行下方的 `source` 命令。自动启动时，从节点从本机 Conda 选择 `py311_tpr`。若 SSH 会话找不到 Conda 或已激活的同名环境，会尝试主节点的 Python 路径。JSON 外层的 `python` 可为两台指定统一路径，`peer_python` 单独指定从节点路径。SSH 登录名或端口有差异时，填写 `ssh_user` 或 `ssh_port`。
 
 启动器会在各自节点加载本机的 CANN 和 Python 运行库环境。默认的 CANN 路径不同于预设时，可在 JSON 外层填写两台都可读的 `cann_env`。
 

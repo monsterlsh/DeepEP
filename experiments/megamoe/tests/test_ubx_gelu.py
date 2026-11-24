@@ -11,6 +11,7 @@ import pytest
 
 from deep_ep_experimental.megamoe.benchmark import default_timer_ranks
 from experiments.megamoe.scripts import run_megamoe as launcher
+from experiments.megamoe.scripts import ubx_device_check
 
 
 @pytest.fixture(autouse=True)
@@ -25,6 +26,31 @@ def test_default_urma_timer_ranks_cover_four_per_node():
     assert default_timer_ranks(16, 16, urma=True) == [0, 4, 8, 12]
     assert default_timer_ranks(32, 16, urma=True) == [0, 4, 8, 12, 16, 20, 24, 28]
     assert default_timer_ranks(32, 8, urma=False) == list(range(8))
+
+
+@pytest.mark.parametrize(("auto_python", "json_python", "peer_default"), [
+    (True, False, True), (False, False, False), (True, True, False),
+])
+def test_ep32_peer_resolves_automatic_python_locally(tmp_path, monkeypatch, auto_python, json_python, peer_default):
+    if auto_python:
+        monkeypatch.setenv("UBX_DEFAULT_PYTHON", sys.executable)
+    else:
+        monkeypatch.delenv("UBX_DEFAULT_PYTHON", raising=False)
+    cfg = launcher.read_run_config(launcher.SCRIPT.parent / "configs/ubx_ep32_target.json")
+    cfg.update(mode="perf", precision="a8w4", output_dir=str(tmp_path))
+    if json_python:
+        cfg["python"] = sys.executable
+    path = tmp_path / "job.json"
+    path.write_text(json.dumps(cfg), encoding="utf-8")
+    peers = []
+
+    def capture(stage, scripts, logs, **ssh):
+        assert "--peer-default" not in scripts[0]
+        peers.append("--peer-default" in scripts[1])
+
+    monkeypatch.setattr(launcher, "run_stage", capture)
+    assert launcher.entrypoint(["--run-config", str(path)]) == 0
+    assert peers == [peer_default]
 
 
 def test_timer_rank_override_is_rejected(capsys):
@@ -63,7 +89,7 @@ def test_perf_uses_selected_precision_and_fixed_timer_ranks(
     checks, launches = [], []
 
     def check_device(command, *, env, check):
-        assert command[:3] == [sys.executable, "-c", launcher.DEVICE_CHECK]
+        assert command[:3] == [sys.executable, "-P", launcher.DEVICE_CHECK]
         assert check is True
         checks.append(command[3:])
 
@@ -302,6 +328,7 @@ def test_ubx_ep16_a4w4_launches_fp4_timer(tmp_path, monkeypatch, suffix):
 
 
 def test_ubx_ep16_a4w4_timer_requires_instrumented_wheel(monkeypatch):
+    monkeypatch.setattr(ubx_device_check, "check_wheel_packages", lambda: None)
     npu = SimpleNamespace(device_count=lambda: 16, set_device=lambda rank: None)
     ext = SimpleNamespace(mte_a4w4_enabled=True, timer_enabled=True, __file__="mock-extension")
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(npu=npu))
@@ -311,9 +338,9 @@ def test_ubx_ep16_a4w4_timer_requires_instrumented_wheel(monkeypatch):
     monkeypatch.setitem(sys.modules, "deep_ep_experimental.megamoe.api", SimpleNamespace(_extension=lambda: ext))
     monkeypatch.setattr(sys, "argv", ["-c", "16", "0", "mte", "w4a4", "1"])
     with pytest.raises(SystemExit, match="单机 MTE W4A4 设备 timer"):
-        exec(launcher.DEVICE_CHECK, {})
+        ubx_device_check.main()
     ext.mte_a4w4_timer_enabled = True
-    exec(launcher.DEVICE_CHECK, {})
+    ubx_device_check.main()
 
 
 def test_run_json_forwards_resolved_settings_and_accepts_cli_overrides(tmp_path, monkeypatch):

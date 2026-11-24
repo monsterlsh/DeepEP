@@ -142,6 +142,8 @@ def run_l0(path, data, *, only=None, plan=False):
     summary = dict(case=case, machine=base["machine"], backend=base.get("backend"), precision=precision,
                    ep_size=base["ep_size"], nodes=nodes if pod else base["node_ip"],
                    tokens_per_rank=spec["bs_values"][0], selection=selection, jobs=jobs)
+    if base.get("peer_python"):
+        summary["peer_python"] = base["peer_python"]
     if plan:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0

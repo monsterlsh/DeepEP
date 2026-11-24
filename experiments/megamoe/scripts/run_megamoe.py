@@ -46,44 +46,7 @@ COMPARISON_REPORT = "comparison.json"
 CASCADE_STAGES = ("decode", "prefill")
 A8_PRECISIONS = ("w4a8", "w8a8")
 WEIGHT_MODE = {"gelu": 1, "swiglu": 0}
-DEVICE_CHECK = """
-import sys
-import socket
-import torch
-import torch_npu
-import deep_ep
-from deep_ep._machine import board_id, physical_device
-from deep_ep_experimental.megamoe.api import _extension
-
-print(f"[UBX] {socket.gethostname()} python={sys.executable} deep_ep={deep_ep.__file__}", flush=True)
-local, require_w8a8 = int(sys.argv[1]), sys.argv[2] == "1"
-backend = sys.argv[3] if len(sys.argv) > 3 else "urma"
-precision = sys.argv[4] if len(sys.argv) > 4 else None
-require_timer = len(sys.argv) > 5 and sys.argv[5] == "1"
-count = torch.npu.device_count()
-if count < local:
-    sys.exit(f"UBX 每机需要 {local} 张可见 NPU，当前只有 {count} 张。")
-torch.npu.set_device(0)
-board = board_id(physical_device())
-if board != 0x44:
-    sys.exit(f"可见设备 0 的板型为 0x{board:02x}，UBX 要求 0x44。")
-extension = _extension()
-if require_w8a8 and not getattr(extension, "urma_w8a8_enabled", False):
-    sys.exit("当前 MegaMoE wheel 未启用 UBX URMA W8A8。")
-if backend == "mte_roce" and not getattr(extension, "mte_roce_enabled", False):
-    sys.exit("当前 MegaMoE wheel 未启用 EP32 MTE+RoCE，请在两台主机安装同版本的新版 wheel。")
-if backend == "mte_roce" and not getattr(extension, "mte_roce_mx_enabled", False):
-    sys.exit("当前 MegaMoE wheel 未启用新版 MTE+RoCE 矩阵精度与分块支持。")
-if backend == "mte_roce" and require_timer and not getattr(extension, "mte_roce_timer_enabled", False):
-    sys.exit("MTE+RoCE 设备 timer 需要两台节点安装支持此功能并启用 DEEPEP_MEGAMOE_TIMER 的 wheel。")
-if backend == "mte" and precision == "w4a4":
-    if not getattr(extension, "mte_a4w4_enabled", False):
-        sys.exit("当前 MegaMoE wheel 未启用单机 MTE W4A4。")
-    if require_timer and not (getattr(extension, "timer_enabled", False) and
-                              getattr(extension, "mte_a4w4_timer_enabled", False)):
-        sys.exit("单机 MTE W4A4 设备 timer 需要安装启用此功能的 DEEPEP_MEGAMOE_TIMER wheel。")
-print(f"[UBX] MegaMoE wheel: {extension.__file__}", flush=True)
-"""
+DEVICE_CHECK = str(SCRIPT.with_name("ubx_device_check.py"))
 
 POD_BOOTSTRAP = r"""
 set -e
@@ -215,7 +178,7 @@ def python_command(value, directory):
 def run_config_arguments(path, parser, argv, cli, data=None):
     """Use the command parser for JSON options and keep explicit CLI overrides."""
     strings = {"mode", "precision", "backend", "activation", "weighting", "input", "stage", "master_addr",
-               "ssh_user", "config", "output_dir", "comparison_arm", "perf_scope"}
+               "ssh_user", "peer_python", "config", "output_dir", "comparison_arm", "perf_scope"}
     integers = {"ep_size", "node_rank", "master_port", "shmem_port", "ssh_port", "bs", "topk", "window_tokens", "pairs"}
     flags = {"timer", "force", "force_cpu", "force_npu", "plan", "report_only", "require_no_regression", "paired_weights",
              "compare_decode_cascade", "compare_prefill_cascade"}
@@ -308,6 +271,7 @@ def parse_args(argv, run_config=None):
     parser.add_argument("--shmem-port", type=int, default=29180, help="指定 SHMEM 引导端口")
     parser.add_argument("--ssh-user", default=os.environ.get("REMOTE_USER") or getpass.getuser())
     parser.add_argument("--ssh-port", type=int, default=os.environ.get("REMOTE_PORT", "22"))
+    parser.add_argument("--peer-python", help="UBX EP32 自动启动时使用的 node1 Python 绝对路径")
     model_source = parser.add_mutually_exclusive_group()
     model_source.add_argument("--config", help="配置名（如 target_gelu_k32）或模型 JSON 路径")
     model_source.add_argument("--inline-config", help=argparse.SUPPRESS)
@@ -364,6 +328,11 @@ def parse_args(argv, run_config=None):
             parser.error("MTE 和 MTE+RoCE 使用默认性能采样范围")
     elif args.precision == "w4a4":
         parser.error("URMA 暂不支持 W4A4。EP16 使用 --backend mte，EP32 使用 --backend mte_roce")
+    if args.peer_python is not None:
+        if args.ep_size != 32 or args.node_ip is None or args.node_rank is not None:
+            parser.error("peer_python 只适用于 UBX EP32 自动启动")
+        if not args.peer_python.startswith("/"):
+            parser.error("peer_python 必须是 node1 上的 Linux 绝对路径")
     if args.ep_size == 16:
         if args.node_ip or args.node_rank is not None or args.stage:
             parser.error("--node-ip、--node-rank、--stage 适用于 EP32")
@@ -783,8 +752,12 @@ def run_single_accuracy(python, env, args, precision, config, check_device):
 
 def orchestrate(args, env):
     extra_env = {name: env[name] for name in FORWARDED_ENV if name in env}
+    peer_default = (not args.peer_python and "PYTHON" not in args.run_environment
+                    and env.get("UBX_DEFAULT_PYTHON") == env["PYTHON"])
     if "PYTHON" in extra_env and os.sep in extra_env["PYTHON"]:
         extra_env["PYTHON"] = os.path.abspath(extra_env["PYTHON"])
+    # The explicit peer prefix may differ from an environment loaded by the SSH login.
+    peer_env = dict(extra_env, PYTHON=args.peer_python, UBX_CANN_LOADED="") if args.peer_python else extra_env
     print(f"[UBX] node0 本机 {args.node_ip[0]}，node1 SSH {args.ssh_user}@{args.node_ip[1]}", flush=True)
     stages = []
     for precision in args.accuracy_precisions:
@@ -821,7 +794,8 @@ def orchestrate(args, env):
         if args.cascade_stage:
             argv.append(f"--compare-{args.cascade_stage}-cascade")
         scripts = {
-            rank: node_script(REPO_ROOT, extra_env, ENV_SCRIPT, [*argv, "--node-rank", str(rank)])
+            rank: node_script(REPO_ROOT, peer_env if rank == 1 else extra_env, ENV_SCRIPT, [*argv, "--node-rank", str(rank)],
+                              peer_default=rank == 1 and peer_default)
             for rank in (0, 1)
         }
         label = f"{stage}-{mode}-{precision}"
@@ -893,6 +867,8 @@ def main(argv=None, run_config=None):
         )
         if args.cascade_stage:
             plan[f"compare_{args.cascade_stage}_cascade"] = True
+        if args.peer_python:
+            plan["peer_python"] = args.peer_python
         print(json.dumps(plan, indent=2, ensure_ascii=False))
         return 0
     if args.report_only:
@@ -929,7 +905,7 @@ def main(argv=None, run_config=None):
         if check_native_timer and args.timer and args.stage != "prepare":
             extra.append("1")
         subprocess.run(
-            [python, "-c", DEVICE_CHECK, str(LOCAL_RANKS), str(int(precision == "w8a8" and args.backend == "urma")), *extra],
+            [python, "-P", DEVICE_CHECK, str(LOCAL_RANKS), str(int(precision == "w8a8" and args.backend == "urma")), *extra],
             env=env, check=True,
         )
 

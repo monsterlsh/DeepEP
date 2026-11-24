@@ -539,7 +539,7 @@ SwiGLU 的 A8W4/A8W8 在 BS4096 的整批对称区超限。A8W4 可用 G 方法�
 
 L01–L06 的运行 JSON 见下表。在对应平台从仓库根目录使用[统一入口](../experiments/megamoe/scripts/run_megamoe.py)执行，例如 UBX 节点 0 上运行 `python3 experiments/megamoe/scripts/run_megamoe.py --run-config experiments/megamoe/scripts/configs/l0/L01.json`。追加 `--plan` 查看计划，使用 `--only perf` 或 `--only accuracy` 可分别运行性能或精度。L04–L06 在 950POD 环境运行。
 
-UBX 从 `90.90.93.84` 启动。B05 从 `177.22.21.1` 启动，默认使用 os1/os2/os7/os8 和预设内的共享 Python 环境。各节点需能访问相同路径的代码、wheel 环境和输出，并允许主节点通过 SSH 拉起。预设指向已归档的 K37 修复环境，测试新构建时应将同一 wheel 安装到选用的共享环境。每次调用自动创建 `benchmark-runs/L0x-*/`（可用 `RUN_BASE` 指定共享目录）。按 `run-summary.json` 回填各阶段结果，UBX 首窗对照见 `native-overlap.json`。只跑 GELU 融合与 Prefill 级联可用 `--only prefill`。
+UBX 从 `90.90.93.84` 启动，两台各自在本机 Python 环境安装同一份 UBX wheel。若需固定 `.188` 的解释器，在 L01–L03 JSON 外层填写该节点解释器绝对路径 `peer_python`。B05 从 `177.22.21.1` 启动，默认使用 os1/os2/os7/os8 和预设中已归档的 K37 修复环境；测试新构建时将 wheel 安装到选用的共享环境。各节点需能访问相同路径的代码和输出，并允许主节点通过 SSH 拉起。每次调用自动创建 `benchmark-runs/L0x-*/`（可用 `RUN_BASE` 指定共享目录）。按 `run-summary.json` 回填各阶段结果，UBX 首窗对照见 `native-overlap.json`。只跑 GELU 融合与 Prefill 级联可用 `--only prefill`。
 
 L04 的融合性能使用同窗 A/B 配对，另存 `paired/paired.json`。L04、L05 的 SwiGLU 全量双参考和 L05 的 SwiGLU 融合性能受整批对称区容量限制。950POD 的全窗掩盖率仍需两臂逐窗补采。预设会执行可运行的阶段，完成后如仍有上述缺项，清单运行状态为 `partial`，退出码为 3。其他运行故障会在具体阶段记录 `failed`。独立设备显存采样和 HBM 计数器采集仍按下方验收口径回填。
 

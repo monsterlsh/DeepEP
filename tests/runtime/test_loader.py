@@ -5,11 +5,51 @@
 
 import hashlib
 import json
+import sys
+from importlib import metadata
 from types import SimpleNamespace
 
 import pytest
 
 from deep_ep import _native
+
+
+@pytest.mark.parametrize("layout", ["checkout", "shadow", "wheel", "wrong_abi", "broken_link"])
+def test_missing_native_identifies_interpreter_and_package(tmp_path, monkeypatch, layout):
+    package = tmp_path / "checkout" / "deep_ep"
+    package.mkdir(parents=True)
+    (package.parent / "setup.py").touch()
+    (package.parent / "dependencies.lock.json").touch()
+    monkeypatch.setattr(_native, "__file__", str(package / "_native.py"))
+    wheel_package = tmp_path / "site-packages" / "deep_ep" if layout == "shadow" else package
+    dist = SimpleNamespace(read_text=lambda name: "Wheel-Version: 1.0", locate_file=lambda name: wheel_package)
+    monkeypatch.setattr(metadata, "distributions", lambda **kw: [dist] if layout in ("shadow", "wheel") else [])
+    if layout == "wrong_abi":
+        (package / "_C.for-another-python.so").touch()
+    if layout == "broken_link":
+        try:
+            (package / ("_C" + _native.EXTENSION_SUFFIXES[0])).symlink_to("absent-native-build")
+        except OSError:
+            pytest.skip("Source builds require symlink support")
+    _native._require_native_cached.cache_clear()
+    with pytest.raises(ImportError) as missing:
+        _native.require_native("MegaMoE")
+    message = str(missing.value)
+    assert all(part in message for part in (str(package), sys.executable, "_C" + _native.EXTENSION_SUFFIXES[0]))
+    if layout == "wrong_abi":
+        assert "_C.for-another-python.so" in message
+    elif layout == "broken_link":
+        assert "absent-native-build (broken symlink)" in message
+    if layout in ("shadow", "wheel"):
+        assert str(wheel_package) in message
+    if layout in ("checkout", "shadow"):
+        with pytest.raises(NotImplementedError, match="ElasticBuffer.dispatch is not implemented"):
+            _native.require_native("ElasticBuffer.dispatch")
+        with pytest.raises(NotImplementedError, match="Runtime.__init__ is not implemented"):
+            _native.require_native("Runtime.__init__")
+    else:
+        with pytest.raises(ImportError):
+            _native.require_native("ElasticBuffer.dispatch")
 
 
 def test_require_native_reuses_success_across_operations(monkeypatch):
@@ -28,6 +68,24 @@ def test_require_native_reuses_success_across_operations(monkeypatch):
         load.assert_called_once()
     finally:
         _native._require_native_cached.cache_clear()
+
+
+def test_dlopen_error_preserves_library_and_original_cause(tmp_path, monkeypatch):
+    origin = str(tmp_path / ("_C" + _native.EXTENSION_SUFFIXES[0]))
+    (tmp_path / "_build_info.json").write_text("{}")
+    monkeypatch.setattr(_native, "__file__", str(tmp_path / "_native.py"))
+    monkeypatch.setattr(_native.importlib.util, "find_spec", lambda name: SimpleNamespace(origin=origin))
+    monkeypatch.setattr(_native, "_load_bundled_shmem", lambda directory, info: directory / ".libs")
+    cause = ImportError("libascendcl.so: cannot open shared object file")
+
+    def fail(name):
+        raise cause
+
+    monkeypatch.setattr(_native.importlib, "import_module", fail)
+    with pytest.raises(ImportError) as caught:
+        _native._load_native.__wrapped__()
+    assert caught.value.__cause__ is cause
+    assert all(part in str(caught.value) for part in (str(cause), origin, sys.executable))
 
 
 @pytest.mark.parametrize("fault", [None, "origin", "protocol", "external", "missing", "source_link"])

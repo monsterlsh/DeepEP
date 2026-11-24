@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 
 import pytest
 
@@ -168,3 +169,31 @@ def test_ubx_failure_stops_remaining_jobs_and_keeps_run_summary(tmp_path, monkey
     assert jobs["gelu-accuracy"]["status"] == "completed"
     assert jobs["swiglu-accuracy"]["status"] == "failed" and "17" in jobs["swiglu-accuracy"]["error"]
     assert all(job["status"] == "planned" for name, job in jobs.items() if name not in started)
+
+
+def test_l01_passes_explicit_python_only_to_ssh_peer(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUN_BASE", str(tmp_path))
+    monkeypatch.setenv("UBX_CANN_LOADED", "test-cann")
+    remote_python = "/remote only/py311_tpr/bin/python"
+    config = launcher.read_run_config(PRESETS / "L01.json")
+    config.update(python=sys.executable, peer_python=remote_python)
+    path = tmp_path / "case.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    remote_targets = []
+
+    def capture(stage, scripts, logs, *, ssh_target, ssh_port):
+        assert remote_python not in scripts[0]
+        assert "export " + shlex.quote("PYTHON=" + remote_python) in scripts[1]
+        assert "--peer-default" not in scripts[1]
+        remote_targets.append(ssh_target)
+
+    def run_child(command, *, check):
+        derived = Path(command[command.index("--run-config") + 1])
+        assert launcher.read_run_config(derived)["peer_python"] == remote_python
+        assert launcher.entrypoint(["--run-config", str(derived)]) == 0
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(launcher, "run_stage", capture)
+    monkeypatch.setattr(subprocess, "run", run_child)
+    assert launcher.entrypoint(["--run-config", str(path), "--only", "prefill"]) == 0
+    assert len(remote_targets) == 1 and remote_targets[0].endswith("@" + config["node_ip"][1])

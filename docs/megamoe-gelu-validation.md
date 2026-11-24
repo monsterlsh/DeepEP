@@ -44,7 +44,7 @@ export LD_LIBRARY_PATH="$(dirname "$(dirname "$BASE_PYTHON")")/lib:${LD_LIBRARY_
 构建后按构建输出设置 `SHMEM_ROOT` 和 `LD_LIBRARY_PATH`。两侧安装环境均可运行以下检查。
 
 ```bash
-python -I -c 'from deep_ep._native import require_native; require_native("MegaMoE validation"); import torch, torch_npu; from deep_ep_experimental.megamoe import _C; print(_C.__file__); assert _C.api_protocol == 13'
+python -I -c 'import torch, torch_npu; from deep_ep_experimental.megamoe.api import _extension; print(_extension().__file__)'
 python -m pip install -r experiments/megamoe/tests/requirements.txt
 python -m pytest -q experiments/megamoe/tests
 ```

@@ -22,7 +22,7 @@ python3 "$RUN" --run-config "$CASES/ubx_ep32_target.json"
 
 ### UBX GELU 与 SwiGLU 精度和性能
 
-在仓库根目录执行。UBX 编译使用 `build_ubx.sh`。EP32 两台各 16 卡，在两台安装同一份 wheel 和匹配的 HNS_1825 SHMEM SDK。两台使用相同的源码和 Python 路径，配置节点 0 到节点 1 的免密 SSH，并打通 torchrun、SHMEM 引导端口及 NPU RoCE 数据面。
+在仓库根目录执行。UBX 编译使用 `build_ubx.sh`。EP32 两台各 16 卡，在两台安装同一份 wheel 和匹配的 HNS_1825 SHMEM SDK。两台使用相同的源码路径，各自选择本机的 `py311_tpr`，可在 JSON 外层用 `peer_python` 指定节点 1 的解释器绝对路径。配置节点 0 到节点 1 的免密 SSH，并打通 torchrun、SHMEM 引导端口及 NPU RoCE 数据面。
 
 ```bash
 bash experiments/megamoe/scripts/build_ubx.sh

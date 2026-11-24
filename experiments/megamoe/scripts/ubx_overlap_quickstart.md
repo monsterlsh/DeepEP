@@ -13,7 +13,7 @@
 
 ## 1. 准备机器和输出目录
 
-EP32 在 `90.90.93.84` 上操作，通过 SSH 拉起 `90.90.93.188`，每台 16 卡。两台使用相同绝对路径的 checkout、Python 环境和同一份开启设备 timer 的 **UBX wheel**。EP16 只用第一台的 16 卡。复测这次优化时，wheel 源码需包含提交 `4e68b94`。构建脚本默认开启 `DEEPEP_MEGAMOE_TIMER`。[UBX 编译安装](ubx_ep32_gelu_quickstart.md#1-离线编译并安装)
+EP32 在 `90.90.93.84` 上操作，通过 SSH 拉起 `90.90.93.188`，每台 16 卡。两台使用相同绝对路径的 checkout，在各自的 Python 环境中安装同一份开启设备 timer 的 **UBX wheel**。EP16 只用第一台的 16 卡。复测这次优化时，wheel 源码需包含提交 `4e68b94`。构建脚本默认开启 `DEEPEP_MEGAMOE_TIMER`。[UBX 编译安装](ubx_ep32_gelu_quickstart.md#1-离线编译并安装)
 
 主节点的 `experiments/megamoe/scripts/` 需包含配套的[原生掩盖率汇总工具](compare_ubx_native_overlap.py)。它从已保存的设备打点读取数据。
 

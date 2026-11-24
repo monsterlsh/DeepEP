@@ -33,6 +33,9 @@ def _extension():
     try:
         core = require_native("MegaMoE")
     except NotImplementedError as exc:
+        # Older core wheels used the API-only placeholder for a missing native file.
+        if not str(exc).startswith("MegaMoE is not implemented in DeepEP."):
+            raise
         import deep_ep
 
         raise ImportError(
@@ -46,7 +49,7 @@ def _extension():
     try:
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
-        raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
+        raise ImportError(f"Cannot load {__package__}._C with {sys.executable}: {error}") from error
     if getattr(extension, "api_protocol", None) != 13:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension

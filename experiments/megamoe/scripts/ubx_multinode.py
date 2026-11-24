@@ -3,6 +3,7 @@
 """Run one distributed stage on the local host and its SSH peers."""
 
 from contextlib import ExitStack
+from io import SEEK_END
 import shlex
 import subprocess
 import sys
@@ -46,17 +47,22 @@ wait "$child"
 """
 
 
-def node_script(work_dir, env, environment_script, argv):
+def node_script(work_dir, env, environment_script, argv, *, peer_default=False):
     """Load the runtime on the current node before executing its worker."""
     lines = ["set -e", f"cd -- {shlex.quote(str(work_dir))}"]
-    lines.extend(f"export {shlex.quote(f'{name}={value}')}" for name, value in env.items())
-    lines.extend([
-        'if [[ -z ${PYTHON:-} || -z ${UBX_CANN_LOADED:-} || '
-        '( -n ${UBX_CANN_SETUP:-} && $UBX_CANN_SETUP != "$UBX_CANN_LOADED" ) ]]; then',
-        f"    source {shlex.quote(str(environment_script))} --preserve-python",
-        "fi",
-        'exec "$PYTHON" ' + shlex.join(map(str, argv)),
-    ])
+    lines.extend(f"export {shlex.quote(f'{name}={value}')}" for name, value in env.items()
+                 if name != "PYTHON" or not peer_default)
+    source = f"source {shlex.quote(str(environment_script))}"
+    if peer_default:
+        lines.append(f"{source} --peer-default {shlex.quote(env['PYTHON'])}")
+    else:
+        lines.extend([
+            'if [[ -z ${PYTHON:-} || -z ${UBX_CANN_LOADED:-} || '
+            '( -n ${UBX_CANN_SETUP:-} && $UBX_CANN_SETUP != "$UBX_CANN_LOADED" ) ]]; then',
+            f"    {source} --preserve-python",
+            "fi",
+        ])
+    lines.append('exec "$PYTHON" ' + shlex.join(map(str, argv)))
     return "\n".join(lines)
 
 
@@ -82,6 +88,19 @@ def _stop_nodes(processes):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+
+
+def _log_tail(path):
+    # Distributed benchmark logs can be gigabytes. Bound both bytes read and console lines.
+    limit = 16 * 1024
+    try:
+        with path.open("rb") as log:
+            end = log.seek(0, SEEK_END)
+            log.seek(max(0, end - limit))
+            data = log.read(limit)
+    except OSError:
+        return ""
+    return "\n".join(data.decode("utf-8", errors="replace").splitlines()[-40:])
 
 
 def run_stage(stage, scripts, log_paths, *, ssh_target=None, ssh_targets=None, ssh_port=22):
@@ -110,6 +129,9 @@ def run_stage(stage, scripts, log_paths, *, ssh_target=None, ssh_targets=None, s
                             f"{stage} node{rank} 退出码 {status}，日志 {log_paths[rank]}",
                             file=sys.stderr, flush=True,
                         )
+                        tail = _log_tail(log_paths[rank])
+                        if tail:
+                            print(tail, file=sys.stderr, flush=True)
                         raise subprocess.CalledProcessError(status, process.args)
                     process.stdin.close()
                     del pending[rank]

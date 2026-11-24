@@ -25,21 +25,23 @@ def test_extension_loads_with_matching_core(monkeypatch):
     assert api._extension.__wrapped__() is extension
 
 
-@pytest.mark.parametrize("missing", [True, False], ids=["missing-core", "shmem-loader-error"])
-def test_extension_reports_native_load_failure(monkeypatch, missing):
+@pytest.mark.parametrize("failure", [
+    NotImplementedError("MegaMoE is not implemented in DeepEP."),
+    ImportError("SHMEM checksum mismatch"),
+    NotImplementedError("native runtime feature unavailable"),
+], ids=["legacy-missing-core", "shmem-loader-error", "native-feature-error"])
+def test_extension_reports_native_load_failure(monkeypatch, failure):
     import deep_ep
-
-    failure = (NotImplementedError("MegaMoE is not implemented in DeepEP")
-               if missing else ImportError("SHMEM checksum mismatch"))
 
     def require_native(name):
         assert name == "MegaMoE"
         raise failure
 
     monkeypatch.setattr(api, "require_native", require_native)
-    with pytest.raises(ImportError) as caught:
+    with pytest.raises((ImportError, NotImplementedError)) as caught:
         api._extension.__wrapped__()
-    if missing:
+    if str(failure) == "MegaMoE is not implemented in DeepEP.":
+        assert isinstance(caught.value, ImportError)
         assert caught.value.__cause__ is failure
         assert all(value in str(caught.value) for value in (sys.executable, deep_ep.__file__, "deep_ep._C", "-m pip"))
     else:
