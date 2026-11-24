@@ -62,18 +62,10 @@ T AlignUp(T value, T alignment)
     return CeilDiv(value, alignment) * alignment;
 }
 
-uint32_t ActivationInputElementsPerByte(const MegaMoeTilingData& t)
-{
-    return t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A4W4 ||
-                   t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A4W4_NZ
-               ? 2U
-               : 1U;
-}
-
 uint32_t DispatchCopyBytes(const MegaMoeTilingData& t)
 {
     return static_cast<uint32_t>(MegaMoeImpl::CalcQuantTokenScaleBytes(
-        t.h, ActivationInputElementsPerByte(t), t.topK, t.topkWeightsPrefetch != 0));
+        t.h, t.topK, t.topkWeightsPrefetch != 0));
 }
 
 MegaMoeDispatchBufferConfig DispatchConfig(const MegaMoeTilingData& t, uint32_t ub)
@@ -157,9 +149,7 @@ uint64_t HostFlagElements(const MegaMoeTilingData& t)
     const uint64_t wave_slots = waves * MegaMoeImpl::INT_CACHELINE;
     uint64_t count = static_cast<uint64_t>(t.moeExpertPerRank) *
                      (wave_slots + wave_slots + static_cast<uint64_t>(MegaMoeImpl::INT_CACHELINE) * t.aicNum);
-    const bool is_w4 = t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 ||
-                       t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A4W4 ||
-                       t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A4W4_NZ;
+    const bool is_w4 = t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4;
     if (is_w4 || (t.topoType == MegaMoeImpl::TOPO_TYPE_MTE && t.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT)) {
         // Pairwise GMM2/combine publishes one sequence per AIC.
         count += static_cast<uint64_t>(t.aicNum) * MegaMoeImpl::INT_CACHELINE;
@@ -254,7 +244,7 @@ void SetUnpermuteConfigs(MegaMoeTilingData& t, uint32_t ub)
 }
 
 MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t topk, int64_t local_experts,
-                             int64_t world, int64_t max_tokens, int64_t max_recv, bool is_a8w4, bool is_a4w4,
+                             int64_t world, int64_t max_tokens, int64_t max_recv, bool is_a8w4,
                              int64_t shared_experts, const PlatformInfo& p, int64_t topk_weights_type,
                              const std::string& activation)
 {
@@ -273,9 +263,7 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     t.blockAivNum = p.aiv;
     t.combineQuantMode = MegaMoeImpl::COMBINE_NO_QUANT;
     t.clampLimit = std::numeric_limits<float>::max();
-    t.groupedMatmulMode = is_a4w4 ? MegaMoeImpl::GROUPED_MATMUL_MODE_A4W4_NZ
-                                  : (is_a8w4 ? MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4
-                                             : MegaMoeImpl::GROUPED_MATMUL_MODE_GENERAL);
+    t.groupedMatmulMode = is_a8w4 ? MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 : MegaMoeImpl::GROUPED_MATMUL_MODE_GENERAL;
     t.topoType = MegaMoeImpl::TOPO_TYPE_MTE;
     t.sharedExpertNum = static_cast<uint32_t>(shared_experts);
     t.combineSyncSlotCountPerExpert = 0;
@@ -428,7 +416,6 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
       max_tokens_(max_tokens),
       shared_experts_(shared_experts),
       is_a8w4_(is_a8w4),
-      is_a4w4_(mma_type == "fp4xfp4"),
       windowed_(windowed),
       timeout_seconds_(timeout_seconds),
       activation_(activation),
@@ -438,16 +425,14 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     TORCH_CHECK(topk_weights_type_ == 0 || topk_weights_type_ == 1, "topk_weights_type must be 0 or 1");
     TORCH_CHECK(activation_ == "swiglu" || activation_ == "gelu", "activation must be 'swiglu' or 'gelu'");
     const std::string resolved_mma_type = mma_type.empty() ? (is_a8w4 ? "fp8xfp4" : "fp8xfp8") : mma_type;
-    TORCH_CHECK(resolved_mma_type == "fp8xfp4" || resolved_mma_type == "fp8xfp8" || resolved_mma_type == "fp4xfp4",
-                "mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4");
-    const bool single_host = ranks_per_node == world && (world == 4 || world == 8 || world == 16);
-    const bool pod_hosts = ranks_per_node == 8 && (world == 16 || world == 32);
-    TORCH_CHECK(!is_a4w4_ || (backend == "mte" && (single_host || pod_hosts)),
-                "MTE A4W4 requires EP4/8/16 on one host or EP16/32 with 8 ranks per host");
-    TORCH_CHECK(is_a8w4_ == (resolved_mma_type == "fp8xfp4") && is_a4w4_ == (resolved_mma_type == "fp4xfp4"),
+    TORCH_CHECK(resolved_mma_type == "fp8xfp4" || resolved_mma_type == "fp8xfp8",
+                "mma_type must be fp8xfp4 or fp8xfp8");
+    TORCH_CHECK(is_a8w4_ == (resolved_mma_type == "fp8xfp4"),
                 "is_a8w4 and mma_type describe different matrix modes");
     TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
     CheckTensor(example, 2, "plan input");
+    TORCH_CHECK(example.scalar_type() == torch::kBFloat16 || example.scalar_type() == c10::ScalarType::Float8_e4m3fn,
+                "Plan input must be BF16 or FP8 E4M3");
     TORCH_CHECK(example.size(0) > 0 && example.size(0) <= max_tokens, "BS outside allocated capacity");
     TORCH_CHECK(ranks_per_node == 0 || (ranks_per_node > 0 && world % ranks_per_node == 0),
                 "ranks_per_node must divide EP");
@@ -469,10 +454,10 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     } else {
         TORCH_CHECK(intermediate >= 256 && intermediate <= 4096 && intermediate % 128 == 0,
                     "Plan intermediate_hidden must be divisible by 128, in [256,4096]");
-        TORCH_CHECK(shared_experts >= 0 && shared_experts <= 8 && (is_a8w4_ || is_a4w4_ || shared_experts == 0),
-                    "MTE shared experts require A8W4 or A4W4, with count in [0,8]");
+        TORCH_CHECK(shared_experts >= 0 && shared_experts <= 8 && (is_a8w4_ || shared_experts == 0),
+                    "MTE shared experts require A8W4, with count in [0,8]");
     }
-    const int64_t input_hidden = example.size(1) * (is_a4w4_ ? 2 : 1);
+    const int64_t input_hidden = example.size(1);
     const auto required = buffer_size(world, experts, max_tokens, topk, input_hidden, backend, topk_weights_type_,
                                       resolved_mma_type, windowed_);
     TORCH_CHECK(symmetric_address != 0 && symmetric_bytes >= required, "MegaMoE symmetric buffer needs ", required,
@@ -505,7 +490,7 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     }
     if (!urma) {
         tiling_ = MakeTiling(example.size(0), input_hidden, intermediate * (activation_ == "gelu" ? 1 : 2), topk,
-                             experts, world, max_tokens, 0, is_a8w4_, is_a4w4_, shared_experts, platform_,
+                             experts, world, max_tokens, 0, is_a8w4_, shared_experts, platform_,
                              topk_weights_type_, activation_);
         tiling_.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
         static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
@@ -564,11 +549,10 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     CheckTensor(weight_scales2, 4, "weight_scales2");
     const bool prequantized = x_scales.has_value();
     const int64_t bs = x.size(0);
-    const int64_t h = x.size(1) * (is_a4w4_ && prequantized ? 2 : 1);
+    const int64_t h = x.size(1);
     const int64_t hidden = intermediate_ * (activation_ == "gelu" ? 1 : 2);
     const bool valid_bs = windowed_ ? (bs > 0 && bs <= max_tokens_) : bs == example_.size(0);
-    TORCH_CHECK(x.device() == example_.device() && valid_bs &&
-                    h == example_.size(1) * (is_a4w4_ ? 2 : 1),
+    TORCH_CHECK(x.device() == example_.device() && valid_bs && h == example_.size(1),
                 "Input shape/device differs from prepared plan");
     TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32 && topk_ids.sizes() == torch::IntArrayRef({bs, topk_}),
                 "topk_ids must be int32 [BS,TopK]");
@@ -579,10 +563,9 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                 "activation_clamp is only defined for SwiGLU");
     tiling_.clampLimit = std::min(activation_clamp, std::numeric_limits<float>::max());
     TORCH_CHECK(!urma || prequantized, "URMA requires prequantized FP8 input with E8M0 scales");
-    const auto input_type = prequantized ? (is_a4w4_ ? torch::kUInt8 : c10::ScalarType::Float8_e4m3fn)
-                                         : torch::kBFloat16;
+    const auto input_type = prequantized ? c10::ScalarType::Float8_e4m3fn : torch::kBFloat16;
     TORCH_CHECK(x.scalar_type() == input_type,
-                "x must be BF16, packed FP4 uint8, or FP8 E4M3 with E8M0 scales");
+                "x must be BF16 or FP8 E4M3 with E8M0 scales");
     if (prequantized) {
         if (urma && x_scales->dim() == 3) {
             CheckTensor(*x_scales, 3, "x_scales");
@@ -594,12 +577,11 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                         x_scales->sizes() == torch::IntArrayRef({bs, CeilDiv(h, int64_t{32})}),
                     "x_scales must be E8M0 [BS,H/32]");
     }
-    const bool is_w4 = is_a8w4_ || is_a4w4_;
-    const auto weight_type = is_w4 ? torch::kUInt8 : c10::ScalarType::Float8_e4m3fn;
+    const auto weight_type = is_a8w4_ ? torch::kUInt8 : c10::ScalarType::Float8_e4m3fn;
     TORCH_CHECK(weight1.scalar_type() == weight_type && weight2.scalar_type() == weight_type,
                 "Weights differ from prepared matrix mode");
-    TORCH_CHECK(weight1.sizes() == torch::IntArrayRef({experts_, hidden, is_w4 ? h / 2 : h}) &&
-                    weight2.sizes() == torch::IntArrayRef({experts_, h, is_w4 ? intermediate_ / 2 : intermediate_}),
+    TORCH_CHECK(weight1.sizes() == torch::IntArrayRef({experts_, hidden, is_a8w4_ ? h / 2 : h}) &&
+                    weight2.sizes() == torch::IntArrayRef({experts_, h, is_a8w4_ ? intermediate_ / 2 : intermediate_}),
                 "Routed weight shape differs from plan");
     TORCH_CHECK(weight_scales1.scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
                     weight_scales2.scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
@@ -630,7 +612,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                     "Shared intermediate is unsupported for the selected backend");
         const auto shared_type = urma ? c10::ScalarType::Float8_e4m3fn : torch::kUInt8;
         TORCH_CHECK(
-            (is_a8w4_ || is_a4w4_) && shared_weight1->scalar_type() == shared_type &&
+            is_a8w4_ && shared_weight1->scalar_type() == shared_type &&
                 shared_weight2->scalar_type() == shared_type &&
                 shared_weight1->sizes() ==
                     torch::IntArrayRef({shared_experts_, shared_i * (activation_ == "gelu" ? 1 : 2), urma ? h : h / 2}) &&
@@ -648,8 +630,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     uint64_t trace_capacity = 0;
     int64_t trace_elements = 0;
     if (timer) {
-        TORCH_CHECK(is_a8w4_ || (!urma && is_a4w4_) || (urma && windowed_ && !is_w4),
-                    "MegaMoE timer requires routed A8W4, MTE A4W4 or windowed URMA A8W8");
+        TORCH_CHECK(is_a8w4_ || (urma && windowed_),
+                    "MegaMoE timer requires routed A8W4 or windowed URMA A8W8");
         trace_elements = ValidateTimer(*timer, urma);
         if (urma) trace_capacity = trace_elements / kTraceRowElements - 1;
     }
@@ -714,7 +696,6 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         urma_args = &args;
     } else {
         mte = {is_a8w4_,
-               is_a4w4_,
                ptr(context_),
                ptr(x),
                opt(x_scales),
@@ -826,16 +807,15 @@ int64_t mte_plan_bytes(int64_t world, int64_t experts, int64_t tokens, int64_t c
     TORCH_CHECK(activation == "gelu" || activation == "swiglu", "activation must be 'swiglu' or 'gelu'");
     const bool gelu = activation == "gelu";
     const bool w4 = mma_type == "fp8xfp4";
-    const bool a4w4 = mma_type == "fp4xfp4";
     const int64_t weight_mode = topk_weights_type == -1 ? static_cast<int64_t>(gelu) : topk_weights_type;
     TORCH_CHECK(weight_mode == 0 || weight_mode == 1, "topk_weights_type must be 0 or 1");
-    TORCH_CHECK(shared_experts >= 0 && shared_experts <= 8 && (w4 || a4w4 || shared_experts == 0),
+    TORCH_CHECK(shared_experts >= 0 && shared_experts <= 8 && (w4 || shared_experts == 0),
                 "Plan shared experts require W4A8, with count in [0,8]");
     // Validate routed dimensions and MMA mode through the same entry point as Plan.
     buffer_size(world, experts, capacity, topk, hidden, "mte", weight_mode, mma_type, false);
     const auto platform = GetPlatformInfo();
     auto tiling = MakeTiling(tokens, hidden, intermediate * (gelu ? 1 : 2), topk, experts, world, capacity,
-                             0, w4, a4w4, shared_experts, platform, weight_mode, activation);
+                             0, w4, shared_experts, platform, weight_mode, activation);
     if (gelu && w4 && shared_experts == 0) {
         // A different tail can pass the UB guard even when the current shape misses it.
         // Budget the largest calibrated table for any tail at this capacity.
@@ -851,11 +831,8 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
     TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
     TORCH_CHECK(!windowed || backend == "urma", "Windowed native MegaMoE plans require URMA");
     const std::string resolved_mma_type = mma_type.empty() ? "fp8xfp8" : mma_type;
-    TORCH_CHECK(resolved_mma_type == "fp8xfp4" || resolved_mma_type == "fp8xfp8" || resolved_mma_type == "fp4xfp4",
-                "mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4");
-    TORCH_CHECK(resolved_mma_type != "fp4xfp4" ||
-                    (backend == "mte" && (world == 4 || world == 8 || world == 16 || world == 32)),
-                "MTE A4W4 sizing requires EP4, EP8, EP16 or EP32");
+    TORCH_CHECK(resolved_mma_type == "fp8xfp4" || resolved_mma_type == "fp8xfp8",
+                "mma_type must be fp8xfp4 or fp8xfp8");
     if (backend == "urma") {
         TORCH_CHECK(resolved_mma_type == "fp8xfp4" || (mma_type == "fp8xfp8" && windowed && (world == 16 || world == 32)),
                     "URMA requires routed FP8xFP4 or windowed EP16/EP32 FP8xFP8");
@@ -869,14 +846,12 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
                 "Invalid buffer shape");
     // The buffer outlives BS/weight-mode changes. Reserve the decode rail/count
     // layout as well; prefill continues to bind its original device offsets.
-    const uint32_t activation_elements_per_byte = resolved_mma_type == "fp4xfp4" ? 2U : 1U;
     const MegaMoeImpl::PeermemSizeParams params{tokens,
                                                 topk,
                                                 hidden,
                                                 experts,
                                                 world,
                                                 2,
-                                                activation_elements_per_byte,
                                                 topk_weights_type == 1,
                                                 false,
                                                 MegaMoeImpl::TOPO_TYPE_MTE,

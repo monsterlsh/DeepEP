@@ -1,6 +1,6 @@
 # UBX 上比较 GELU 和 SwiGLU 的通信掩盖率
 
-清单大用例 L01–L03 各有一份现成 JSON，可直接按 [L01 完整验收](#l01-完整验收)中的单条命令运行。下面第 1–3 节供自定义 EP 或单独分析融合 A/B 时使用。
+清单大用例 L01、L02 各有一份现成 JSON，可直接按 [L01 完整验收](#l01-完整验收)中的单条命令运行。下面第 1–3 节供自定义 EP 或单独分析融合 A/B 时使用。
 
 要看 GELU 调度优化在 UBX 上的效果，先跑下面的**原生路径**。EP16 使用单机 MTE，EP32 使用双机 MTE+RoCE。两组作业会给出同一批采样 rank 的**首窗本地阶段掩盖率**，以及每卡全部 39,280 个 token 的 **timer-off 端到端时延**。文末另有 URMA 的通信完成事件 A/B 验收命令。
 
@@ -9,7 +9,7 @@
 | A | GELU 后乘路由权重，再量化，`topk_weights_type=1` | 4096/1536 | 1536/4096 |
 | B | SwiGLU，在 Finalize 乘路由权重，`topk_weights_type=0` | 4096/3072 | 1536/4096 |
 
-两组默认用 A8W4、E800、TopK25、零共享专家、每卡 BS39280、`balanced` 路由和 seed 1234。EP16 MTE 和 EP32 MTE+RoCE 均可把下面的 `PRECISION` 改成 `a4w4`，两组都使用 packed MXFP4 输入与权重。EP16 需安装含 `mte_a4w4_timer_enabled` 的新 wheel 才能采集 A4W4 打点。
+两组默认用 A8W4、E800、TopK25、零共享专家、每卡 BS39280、`balanced` 路由和 seed 1234。EP32 MTE+RoCE 也可用 A8W8 采集首窗掩盖率。EP16 MTE 的 A8W8 支持精度和性能，设备 timer 暂不可用。
 
 ## 1. 准备机器和输出目录
 
@@ -24,7 +24,8 @@ EP=32
 PRECISION=a8w4
 case "$PRECISION" in
     a8w4) PERF_DIR=perf-w4a8 ;;
-    a4w4) PERF_DIR=perf-w4a4 ;;
+    a8w8) [ "$EP" = 32 ] || { echo "A8W8 设备 timer 需要 EP32 MTE+RoCE"; exit 1; }; PERF_DIR=perf-w8a8 ;;
+    *) echo "PRECISION 请选择 a8w4 或 a8w8"; exit 1 ;;
 esac
 cd /mnt/share/l00911701/DeepEP-UBX
 SCRIPTS=experiments/megamoe/scripts
@@ -118,7 +119,7 @@ cd /mnt/share/l00911701/DeepEP-UBX/experiments/megamoe/scripts
 python run_megamoe.py --run-config configs/l0/L01.json
 ```
 
-默认先跑 GELU 提前加权、SwiGLU Finalize 加权各自的全量双参考，再测两臂融合性能、汇总首窗掩盖率，最后比较 GELU 融合与 Prefill 级联。每卡 39,280 个 token，EP32、H4096、I1536、E800、K25。只跑性能可在命令末尾加 `--only perf`，只跑精度加 `--only accuracy`，只比较 GELU 级联加 `--only prefill`，预览可加 `--plan`。L02（A8W8）和 L03（A4W4）直接替换文件名。
+默认先跑 GELU 提前加权、SwiGLU Finalize 加权各自的全量双参考，再测两臂融合性能、汇总首窗掩盖率，最后比较 GELU 融合与 Prefill 级联。每卡 39,280 个 token，EP32、H4096、I1536、E800、K25。只跑性能可在命令末尾加 `--only perf`，只跑精度加 `--only accuracy`，只比较 GELU 级联加 `--only prefill`，预览可加 `--plan`。测 A8W8 时替换为 L02.json。
 
 每次运行在仓库的 `benchmark-runs/` 下新建目录，可用 `RUN_BASE` 指定其他共享盘路径。目录名包含 Case、平台、EP、精度、运行类型和启动节点本地时间。例如 `L01-ubx-ep32-a8w4-perf-20261124-143005/` 是性能轮，`L01-ubx-ep32-a8w4-memory-20261124-151200/` 是显存轮，默认完整运行标为 `full`。同一秒启动相同配置时，从第二次起追加 `-02`、`-03`。下表的 `$OUT` 指终端打印的本次输出目录。`run-summary.json` 记录各阶段状态、输出位置及已采集的整卡 HBM 峰值。精度默认采样，正式性能默认关闭。
 
@@ -134,7 +135,7 @@ python run_megamoe.py --run-config configs/l0/L01.json --only memory
 | 融合 A/B 耗时 | `{gelu,swiglu}/perf-w4a8/rank_0/bs_39280/profiling.json` | kernel 取 `rank_max_mean_us`，同步 E2E 取 `host_e2e.rank_max_mean_us`，目标 E2E A/B ≤ 1。 |
 | D / C / Total 掩盖率 | `native-overlap.json` | 比较两臂相同首窗和相同采样 rank 的本地阶段。目标 `gelu_minus_swiglu_pp.Total >= 0`，单位为百分点。 |
 | A 融合与 Prefill 级联 | `gelu-prefill/perf-w4a8/rank_0/bs_39280/prefill_comparison.json` | 记录两臂耗时及级联 / 融合加速比。 |
-| 整卡 HBM 峰值和占比 | `run-summary.json` 对应 job 的 `device_memory_peak_group`；逐卡明细在各臂的 `resources.json` | `max_peak_used_pct` 和 `max_peak_used_pct_rank` 给出占比最高的卡，`min_headroom_bytes` 给出观察到的最小剩余量。Prefill 对照按两臂共驻登记。HBM 读写带宽另按[转测清单](../../../docs/megamoe-topk32-gelu-a4w4-test-checklist.md#hbm-显存带宽采集)采集。 |
+| 整卡 HBM 峰值和占比 | `run-summary.json` 对应 job 的 `device_memory_peak_group`；逐卡明细在各臂的 `resources.json` | `max_peak_used_pct` 和 `max_peak_used_pct_rank` 给出占比最高的卡，`min_headroom_bytes` 给出观察到的最小剩余量。Prefill 对照按两臂共驻登记。HBM 读写带宽另按[转测清单](../../../docs/megamoe-topk32-gelu-test-checklist.md#hbm-显存带宽采集)采集。 |
 
 ## B05 的 84.50% 和 58.48% 怎么算
 

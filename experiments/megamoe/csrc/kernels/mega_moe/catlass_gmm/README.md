@@ -46,19 +46,13 @@ SwiGLU 根据同一布局取数、写回逻辑 N 列；路由 GMM2 就绪计数�
 A8W4 使用独立 A 窗口、条件 K512 B 窗口及半块四缓冲；实际性能仍需同 shape 上机测量。
 GMM2 写回行主序结果。共享专家的 A8W4 调用也复用此 kernel。
 
-通用 A8W8/A4W4 GMM 使用 `mega_moe_mx_matmul.hpp` 和 `block_mmad_mx.hpp` 的 CATLASS MX 流水。
+A8W8 GMM 使用 `mega_moe_mx_matmul.hpp` 和 `block_mmad_mx.hpp` 的 CATLASS MX 流水。
 适配层保留 tensor-API slice 起始地址和父矩阵行距，支持 ND/NZ 权重、GM 输出及指定 AIV0 的 UB 输出。
 通用路径固定使用 K256 数据窗口及 K512 scale 窗口。
 所有 GMM 后端均使用 CATLASS。
 后处理位于 `../epilogue`。
 
-## 原生 A4W4 的模板与布局
-
-仓库锁定的 CATLASS `2b4bd7c` 在 Ascend 950 上提供 MXFP4 Matmul 和沿 M 切分的 MXFP4 Grouped Matmul。Grouped 样例实例化打包的 E2M1 × E2M1，两侧每 32 个 K 元素使用一个 E8M0 scale，输出 BF16。[锁定版本的 Grouped Matmul 样例](https://gitcode.com/cann/catlass/blob/2b4bd7cbf7e67ebab23d7d5a99d472c83f90d9a1/examples/55_ascend950_mx_grouped_matmul_slice_m/mx_grouped_matmul_slice_m.cpp)
-
-MegaMoE 的 EP16 MTE 和 EP32 MTE+RoCE 已用 `MmadMx`、`PackedMxTileCopyTla` 和本仓的 `MegaMoeBlockMmadMx` 接入两层 FP4×FP4。激活按行主序传入，权重使用 NZ，每个 C0 含 32 个打包字节 (64 个 FP4 值)。SwiGLU 的 GMM1 权重沿 N 保持 `[gate | up]`。CATLASS 的 Grouped 样例使用 GM 行主序或列主序输入布局，MegaMoE 对应的 NZ 搬运由各自的 MX 适配层选择。
-
-MegaMoE 的 MX matmul 当前使用 L1/L0 K256/K128。锁定版 Grouped 样例的 FP4 特化使用 K512/K256，可作为对比的分块参数。测 EP32 A4W4 的 GELU/SwiGLU 端到端和首窗阶段掩盖率，见 [UBX 掩盖率 A/B Quick Start](../../../../scripts/ubx_overlap_quickstart.md)。
+## 设备验收
 
 设备验收需要覆盖完整 K/尾 K、gate/up 列偏移、跨专家复用、共享专家和不同 BS。
 CPU 接口及数值参考测试见 [MegaMoE 使用说明](../../../../README.md#4-测试与验证范围)，

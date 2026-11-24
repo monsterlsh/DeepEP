@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 
 from .timer.__main__ import parse_ranks
-from .numerics import prequant_route_weight
+from .numerics import prequant_route_weight, validate_mma_type
 from .validation import collective_check
 from .performance import (
     alignment_config,
@@ -54,8 +54,7 @@ def load_config(name, bs_values=None):
     if model.get("activation", "swiglu") not in ("swiglu", "gelu"):
         raise ValueError("activation must be 'swiglu' or 'gelu'")
     mma_type = model.get("mma_type", "fp8xfp4")
-    if mma_type not in ("fp8xfp4", "fp8xfp8", "fp4xfp4"):
-        raise ValueError("mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4")
+    validate_mma_type(mma_type)
     if model.get("activation") == "gelu" and "activation_clamp" in model:
         raise ValueError("activation_clamp is only defined for SwiGLU")
     normalize_clamp(model.get("activation_clamp"))
@@ -181,7 +180,7 @@ def copy_quantized_input(x, mma_type, data_out, scale_out):
         rows = slice(begin, min(len(x), begin + 256))
         data, scale = quantize_activation(x[rows], mma_type)
         codes = torch.from_numpy(data).npu()
-        data_out[rows].copy_(codes if mma_type == "fp4xfp4" else codes.view(torch.float8_e4m3fn))
+        data_out[rows].copy_(codes.view(torch.float8_e4m3fn))
         scale_out[rows].copy_(torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
 
 
@@ -267,14 +266,14 @@ def main():
     parser.add_argument("--profile-memory-peak", action=argparse.BooleanOptionalAction, default=None,
                         help="Sample device-wide HBM usage during setup and execution (default: accuracy on, perf off)")
     parser.add_argument("--backend", choices=("mte", "mte_roce"),
-                        help="Select single-host EP4/8/16 MTE, 8-rank-per-host POD A4W4 MTE, or two-host EP32 MTE+RoCE")
+                        help="Select single-host EP4/8/16 MTE or two-host EP32 MTE+RoCE")
     parser.add_argument("--perf-scope", choices=("all", "host", "timer", "memory"), default="all",
                         help="Run all performance measures, host timing, timer tracing, or memory-only forwards")
     parser.add_argument("--paired-weights", action="store_true",
                         help="For performance comparisons, share SwiGLU gate and GMM2 weights with GELU")
     parser.add_argument("--urma-window-tokens", type=int, choices=(64, 128, 256),
                         help="Fix the URMA window for a same-window comparison")
-    parser.add_argument("--input", choices=("bf16", "fp8", "fp4"), default="bf16")
+    parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
     parser.add_argument(
         "--routing",
         choices=("balanced", "random", "skewed", "random-balanced"),
@@ -400,6 +399,10 @@ def _run(args, config, group, monitors):
             requested_backend,
         ),
     )
+    mma_type = model.get("mma_type", "fp8xfp4")
+    validate_mma_type(mma_type)
+    if args.input not in ("bf16", "fp8"):
+        raise ValueError("input must be bf16 or fp8")
     if cascade_kind:
         if compare_decode and compare_prefill:
             raise ValueError("Select a single cascade comparison")
@@ -423,16 +426,12 @@ def _run(args, config, group, monitors):
             except Exception as failure:
                 error = f"{type(failure).__name__}: {failure}"
             collective_check(group, "Decode fused GELU operator", error)
-    mma_type = model.get("mma_type", "fp8xfp4")
     if roce and (paired_weights or urma_window_tokens is not None):
         raise ValueError("MTE+RoCE does not accept --paired-weights or --urma-window-tokens")
     if "shared_dtype" in config and not roce:
         raise ValueError("The benchmark shared_dtype option requires --backend mte_roce")
-    if paired_weights and (mma_type not in ("fp8xfp4", "fp8xfp8") or model["num_shared_experts"]):
+    if paired_weights and model["num_shared_experts"]:
         raise ValueError("--paired-weights requires routed W4A8 or W8A8 with zero shared experts")
-    storage_kind = "fp4" if mma_type == "fp4xfp4" else "fp8"
-    if args.input != "bf16" and args.input != storage_kind:
-        raise ValueError(f"{mma_type} buffered input must be {storage_kind}")
     if urma and args.input != "fp8":
         raise ValueError("URMA requires --input fp8")
     timer_ranks = args.timer_ranks if args.timer_ranks is not None else default_timer_ranks(

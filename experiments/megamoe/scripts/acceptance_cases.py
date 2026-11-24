@@ -11,7 +11,7 @@ from pathlib import Path
 
 CONFIGS = Path(__file__).resolve().with_name("configs")
 MODELS = CONFIGS.parents[1] / "python/deep_ep_experimental/megamoe/configs"
-MMA = {"a8w4": "fp8xfp4", "a8w8": "fp8xfp8", "a4w4": "fp4xfp4"}
+MMA = {"a8w4": "fp8xfp4", "a8w8": "fp8xfp8"}
 MACHINES = ("ubx", "950pod")
 EPS = (4, 8, 16, 32)
 
@@ -50,7 +50,7 @@ class Case:
             return f"{self.experts} / EP{self.ep_size} = {self.experts // self.ep_size} 个本地专家，MTE 上限为 128"
         # EP32 950POD auto-MTE uses the full SwiGLU batch with A8 inputs. These two
         # payloads alone suffice to prove overflow, even before scales and metadata.
-        if (self.machine, self.ep_size) == ("950pod", 32) and self.activation == "swiglu" and self.precision != "a4w4":
+        if (self.machine, self.ep_size) == ("950pod", 32) and self.activation == "swiglu":
             minimum_heap = self.bs * self.hidden * (2 * self.topk + 1)
             if minimum_heap > 1 << 30:
                 return f"950POD 原生 SwiGLU 整批对称区至少 {minimum_heap} 字节，超过 1 GiB；可预生成 CPU Golden"
@@ -94,13 +94,16 @@ def cases():
                 yield Case(f"C{i:02}", machine, ep, 96, 3584, 1280, 384, 8, activation, 0, precision)
         start = 37 if machine == "950pod" else (19 if ep == 32 else 1)
         arms = (("gelu", 0), ("gelu", 1), ("swiglu", 0))
-        for i, (topk, (act, weight), precision) in enumerate(product((25, 32), arms, MMA), start):
-            yield Case(f"K{i:02}", machine, ep, 4096, 7168, 3072, 384, topk, act, weight, precision)
+        # Each original workload reserved three case numbers. Keep the published IDs.
+        for group, (topk, (act, weight)) in enumerate(product((25, 32), arms)):
+            for i, precision in enumerate(MMA, start + 3 * group):
+                yield Case(f"K{i:02}", machine, ep, 4096, 7168, 3072, 384, topk, act, weight, precision)
         for i, precision in enumerate(MMA, 1 if machine == "ubx" else 4):
             yield Case(f"L{i:02}", machine, ep, 39280, 4096, 1536, 800, 25, "gelu", 1, precision)
         if machine == "ubx" or ep < 32:
-            for i, (gs, bs, precision) in enumerate(product((256, 512), (1024, 2048, 4096, 8192), MMA), 1):
-                yield Case(f"D{i:02}", machine, ep, bs, 3584, 1280, 384, 8, "gelu", 1, precision, groupsize=gs)
+            for group, (gs, bs) in enumerate(product((256, 512), (1024, 2048, 4096, 8192))):
+                for i, precision in enumerate(MMA, 1 + 3 * group):
+                    yield Case(f"D{i:02}", machine, ep, bs, 3584, 1280, 384, 8, "gelu", 1, precision, groupsize=gs)
 
 
 def read_json(path):
@@ -185,7 +188,7 @@ def main(argv=None):
     selected = [r for r in cases() if (not args.machine or args.machine == r.machine)
                 and (not args.ep_size or args.ep_size == r.ep_size) and (not args.case or args.case == r.case)]
     if not selected:
-        parser.error("没有匹配的配置。UBX 的 K01–18 对应 EP4/8/16，K19–36 对应 EP32；950POD 使用 K37–54。")
+        parser.error("没有匹配的配置。UBX 的 K01–17 对应 EP4/8/16，K19–35 对应 EP32；950POD 使用 K37–53。K 组均跳过 3 的倍数。")
     if args.command == "list":
         print(json.dumps([dict(asdict(r), backend=r.backend, nodes=r.nodes, phases=r.phases(), limitation=r.limitation)
                           for r in selected], indent=2, ensure_ascii=False))

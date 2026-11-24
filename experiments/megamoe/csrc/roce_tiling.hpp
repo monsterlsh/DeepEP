@@ -36,8 +36,7 @@ inline uint8_t MmaMode(const std::string& mma_type)
     using namespace HierarchicalMegaMoeImpl;
     if (mma_type == "fp8xfp4") return GROUPED_MATMUL_MODE_A8W4;
     if (mma_type == "fp8xfp8") return GROUPED_MATMUL_MODE_GENERAL;
-    if (mma_type == "fp4xfp4") return GROUPED_MATMUL_MODE_A4W4_NZ;
-    throw std::invalid_argument("MTE+RoCE mma_type must be fp8xfp4, fp8xfp8, or fp4xfp4");
+    throw std::invalid_argument("MTE+RoCE mma_type must be fp8xfp4 or fp8xfp8");
 }
 
 inline bool IsGelu(const HierarchicalMegaMoeTilingData& t)
@@ -54,7 +53,7 @@ inline uint32_t QuantizedRecordBytes(const HierarchicalMegaMoeTilingData& t)
 {
     using namespace HierarchicalMegaMoeImpl;
     return static_cast<uint32_t>(CalcQuantTokenScaleBytes(
-        t.h, DispatchElementsPerByte(t.groupedMatmulMode), t.topK, t.topkWeightsPrefetch != 0));
+        t.h, t.topK, t.topkWeightsPrefetch != 0));
 }
 
 inline uint32_t DispatchCopyBytes(const HierarchicalMegaMoeTilingData& t)
@@ -284,9 +283,8 @@ inline HierarchicalMegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t i
                          "MTE+RoCE intermediate_hidden must be divisible by 128 and in [256,4096]");
     CheckTilingCondition(activation == "gelu" || activation == "swiglu", "MTE+RoCE activation must be gelu or swiglu");
     CheckTilingCondition(shared_experts >= 0 && shared_experts <= 8, "MTE+RoCE shared expert count must be in [0,8]");
-    CheckTilingCondition(shared_experts == 0 || mma_mode == GROUPED_MATMUL_MODE_A4W4_NZ ||
-                             (mma_mode == GROUPED_MATMUL_MODE_A8W4 && activation == "swiglu"),
-                         "MTE+RoCE shared experts require SwiGLU W4A8 or A4W4");
+    CheckTilingCondition(shared_experts == 0 || (mma_mode == GROUPED_MATMUL_MODE_A8W4 && activation == "swiglu"),
+                         "MTE+RoCE shared experts require SwiGLU A8W4");
 
     HierarchicalMegaMoeTilingData t{};
     t.moeExpertPerRank = static_cast<uint32_t>(local_experts);

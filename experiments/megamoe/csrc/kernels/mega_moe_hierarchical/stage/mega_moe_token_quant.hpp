@@ -23,12 +23,12 @@ struct QuantProcessConfig {
  * 记录布局 = Align256(token 数据) + Align32(scale) + prefetch 时附加 Align32(topk 权重)，
  * 与 host CalcDispatchBufferConfig 的 copyBufferBytes 契约恒相等。
  */
-template <typename ActivationType, typename QuantScaleOutType, bool TopkWeightsPrefetch, uint32_t AElemsPerByte>
+template <typename ActivationType, typename QuantScaleOutType, bool TopkWeightsPrefetch>
 __aicore__ inline QuantProcessConfig CreateQuantProcessConfig(uint32_t tokenHiddenDim, const Params& params)
 {
     uint32_t quantScaleNumAlignPerToken = Ops::Base::CeilDiv(tokenHiddenDim, static_cast<uint32_t>(ALIGN_32));
     uint32_t quantTokenAlignBytes =
-        Ops::Base::CeilAlign(tokenHiddenDim / AElemsPerByte, static_cast<uint32_t>(ALIGN_256)) * sizeof(ActivationType);
+        Ops::Base::CeilAlign(tokenHiddenDim, static_cast<uint32_t>(ALIGN_256)) * sizeof(ActivationType);
     uint32_t quantScaleAlignBytes = Ops::Base::CeilAlign(
         quantScaleNumAlignPerToken * static_cast<uint32_t>(sizeof(QuantScaleOutType)), static_cast<uint32_t>(ALIGN_32));
     uint32_t quantTokenScaleAlignBytes = quantTokenAlignBytes + quantScaleAlignBytes;
@@ -86,7 +86,7 @@ __aicore__ inline void LoadTopkWeightsToUb(const Params& params, const QuantProc
 
 // 原型：MegaMoe::QuantProcessInRank。量化一个逻辑 AIV 任务负责的本卡 token。
 // Quantized inputs are copied byte-for-byte into the same record as BF16 inputs.
-template <typename QuantOutType, typename TopkWeightsType, bool TopkWeightsPrefetch, typename ActivationType>
+template <typename TopkWeightsType, bool TopkWeightsPrefetch, typename ActivationType>
 __aicore__ inline void PackQuantizedLocalTokens(const WorkRange& range, uint32_t hidden, const Params& params,
                                                 const QuantProcessConfig& config,
                                                 QuantProcessScratch<ActivationType>& scratch)
@@ -95,7 +95,6 @@ __aicore__ inline void PackQuantizedLocalTokens(const WorkRange& range, uint32_t
     input.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(params.aGmAddr));
     scales.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(params.inputScaleGmAddr));
     output.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(params.peermemInfo.quantTokenScalePtr));
-    const uint32_t tokenBytes = hidden / PackedElementTraits<QuantOutType>::ELEMENTS_PER_BYTE;
     const uint32_t scaleBytes = config.quantScaleNumAlignPerToken;
     SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
     SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
@@ -105,7 +104,7 @@ __aicore__ inline void PackQuantizedLocalTokens(const WorkRange& range, uint32_t
         auto typedBuffer = index % DOUBLE_BUFFER == 0 ? scratch.xOutTensor0 : scratch.xOutTensor1;
         auto buffer = typedBuffer.template ReinterpretCast<uint8_t>();
         WaitFlag<HardEvent::MTE3_MTE2>(event);
-        DataCopyPad(buffer, input[row * tokenBytes], {1U, tokenBytes, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+        DataCopyPad(buffer, input[row * hidden], {1U, hidden, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
         DataCopyPad(buffer[config.quantTokenAlignBytes], scales[row * scaleBytes], {1U, scaleBytes, 0U, 0U, 0U},
                     {false, 0U, 0U, 0U});
         LoadTopkWeightsToUb<TopkWeightsType, ActivationType, TopkWeightsPrefetch>(params, config, scratch, typedBuffer,
@@ -152,8 +151,7 @@ __aicore__ inline void PackDispatchRows(const AivJobContext& job, const MoeStage
     SyncFuncStatic<HardEvent::MTE3_S, EVENT_ID0>();
 }
 
-template <int32_t QuantMode, typename QuantOutType, typename ActivationType, typename TopkWeightsType,
-          bool TopkWeightsPrefetch>
+template <typename QuantOutType, typename ActivationType, typename TopkWeightsType, bool TopkWeightsPrefetch>
 __aicore__ inline void QuantizeLocalTokens(const AivJobContext& job, const MoeStageCommonConfig& common,
                                            const Params& params, const QuantProcessConfig& config,
                                            QuantProcessScratch<ActivationType>& scratch)
@@ -167,8 +165,7 @@ __aicore__ inline void QuantizeLocalTokens(const AivJobContext& job, const MoeSt
     }
     uint32_t hiddenDim = common.tokenHiddenDim;
     if (params.inputScaleGmAddr != nullptr) {
-        PackQuantizedLocalTokens<QuantOutType, TopkWeightsType, TopkWeightsPrefetch>(tokenRange, hiddenDim, params,
-                                                                                   config, scratch);
+        PackQuantizedLocalTokens<TopkWeightsType, TopkWeightsPrefetch>(tokenRange, hiddenDim, params, config, scratch);
         return;
     }
     GlobalTensor<bfloat16_t> srcGlobalTensor;
@@ -206,16 +203,8 @@ __aicore__ inline void QuantizeLocalTokens(const AivJobContext& job, const MoeSt
         __ubuf__ int8_t* outDataAddr = (__ubuf__ int8_t*)xOutTensor.GetPhyAddr();
         __ubuf__ uint16_t* mxScaleAddr = (__ubuf__ uint16_t*)xOutTensor[config.quantTokenAlignBytes].GetPhyAddr();
 
-        if constexpr (QuantMode == E2M1_QUANT) {
-            Quant::ComputeMaxExp(srcAddr, maxExpAddr, hiddenDim);
-            Quant::ComputeScale<QuantOutType>(maxExpAddr, mxScaleAddr, halfScaleAddr,
-                                              config.quantScaleNumAlignPerToken);
-            Quant::ComputeFp4Data<bfloat16_t, QuantOutType, AscendC::RoundMode::CAST_TRUNC,
-                                  AscendC::RoundMode::CAST_RINT>(srcAddr, halfScaleAddr, outDataAddr, hiddenDim);
-        } else {
-            Mxfp8::ComputeFp8Token<bfloat16_t, QuantOutType>(srcAddr, maxExpAddr, mxScaleAddr, halfScaleAddr,
-                                                             outDataAddr, hiddenDim, config.quantScaleNumAlignPerToken);
-        }
+        Mxfp8::ComputeFp8Token<bfloat16_t, QuantOutType>(srcAddr, maxExpAddr, mxScaleAddr, halfScaleAddr,
+                                                         outDataAddr, hiddenDim, config.quantScaleNumAlignPerToken);
         SetFlag<AscendC::HardEvent::V_MTE3>(event);
         WaitFlag<AscendC::HardEvent::V_MTE3>(event);
         auto xOutBytesTensor = xOutTensor.template ReinterpretCast<uint8_t>();

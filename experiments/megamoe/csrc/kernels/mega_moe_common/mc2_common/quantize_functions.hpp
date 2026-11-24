@@ -33,12 +33,7 @@ constexpr int16_t SHR_NUM_FOR_BF16 = 7;
 constexpr int16_t SHR_NUM_FOR_FP32 = 23;
 constexpr uint16_t FP8_E4M3_MAX_EXP = 0x0400;  // elem_emax右移7位(BF16E8M7)
 constexpr uint16_t FP8_E5M2_MAX_EXP = 0x0780;
-constexpr uint16_t FP4_E2M1_BF16_MAX_EXP = 0x0100;
-constexpr uint16_t FP4_E1M2_BF16_MAX_EXP = 0x0000;
-constexpr uint16_t SPECIAL_VALUE_E2M1 = 0x00ff;
-constexpr uint16_t SPECIAL_VALUE_E1M2 = 0x007f;
 constexpr int64_t OUT_ELE_NUM_ONE_BLK = 64;
-constexpr int64_t OUT_ELE_NUM_PER_LOOP_FP4 = 128;
 constexpr float FP8_E5M2_MAX_VALUE = 57344.0f;
 constexpr float FP8_E4M3_MAX_VALUE = 448.0f;
 constexpr uint32_t FP8_E5M2_MAX = 0x37924925;  // 1/57344的float32表示 57344是E5M2所能表示的最大值
@@ -49,7 +44,6 @@ constexpr uint32_t FP32_MANTISSA_HALF = 0x00400000;
 constexpr float HIFP8_MAX_VALUE = 32768.0f;
 constexpr float INT8_MAX_VALUE = 127.0f;
 constexpr uint16_t MAX_EXP_FOR_FP16 = 0x7c00;
-constexpr uint16_t NEW_MANTISSA = 0x0008;
 constexpr uint16_t NAN_CUSTOMIZATION_PACK = 0x00007f81;
 constexpr uint32_t MAN_MASK_FLOAT = 0x007fffff;
 constexpr uint32_t FP32_EXP_BIAS_CUBLAS = 0x00007f00;
@@ -180,12 +174,9 @@ __aicore__ inline void ComputeScale(__ubuf__ uint16_t* maxExpAddr, __ubuf__ uint
     uint16_t maxExponent;
     if constexpr (Std::IsSame<T, fp8_e4m3fn_t>::value) {
         maxExponent = FP8_E4M3_MAX_EXP;
-    } else if constexpr (Std::IsSame<T, fp8_e5m2_t>::value) {
-        maxExponent = FP8_E5M2_MAX_EXP;
-    } else if constexpr (Std::IsSame<T, fp4x2_e2m1_t>::value) {
-        maxExponent = FP4_E2M1_BF16_MAX_EXP;
     } else {
-        maxExponent = FP4_E1M2_BF16_MAX_EXP;
+        static_assert(Std::IsSame<T, fp8_e5m2_t>::value, "Expected FP8 output");
+        maxExponent = FP8_E5M2_MAX_EXP;
     }
 
     __VEC_SCOPE__
@@ -430,90 +421,6 @@ __aicore__ inline void ComputeFp8Data(__ubuf__ T* srcAddr, __ubuf__ uint16_t* re
 
             Reg::StoreAlign<int8_t, Reg::PostLiteral::POST_MODE_UPDATE, Reg::StoreDist::DIST_NORM_B8>(
                 outLocalAddr, (Reg::RegTensor<int8_t>&)x0ZeroFP8, vlB16Double, dataMask);
-        }
-    }
-}
-
-template <typename T, typename U>
-__aicore__ inline void FP16Convert(Reg::RegTensor<half>& output, Reg::RegTensor<half>& input, Reg::MaskReg& mask)
-{
-    __VEC_SCOPE__
-    {
-        Reg::RegTensor<uint16_t> specialValueTensor;
-        Reg::RegTensor<uint16_t> newMantissa;
-        Reg::RegTensor<uint16_t> andResult;
-        Reg::RegTensor<uint16_t> newValue;
-        Reg::MaskReg specialMask;
-        Reg::MaskReg nonzeroMask;
-        uint16_t specialValue = SPECIAL_VALUE_E1M2;
-        if constexpr (Std::IsSame<U, fp4x2_e2m1_t>::value) {
-            specialValue = SPECIAL_VALUE_E2M1;
-        }
-        Reg::Duplicate(specialValueTensor, specialValue);
-        Reg::Duplicate(newMantissa, NEW_MANTISSA);
-        Reg::And(andResult, (Reg::RegTensor<uint16_t>&)input, specialValueTensor, mask);
-        Reg::CompareScalar<uint16_t, CMPMODE::GT>(nonzeroMask, andResult, 0, mask);
-        Reg::CompareScalar<uint16_t, CMPMODE::LT>(specialMask, andResult, NEW_MANTISSA, mask);
-        Reg::MaskAnd(specialMask, specialMask, nonzeroMask, mask);
-        Reg::Or(newValue, (Reg::RegTensor<uint16_t>&)input, newMantissa, mask);
-        Reg::Select<uint16_t>((Reg::RegTensor<uint16_t>&)output, newValue, (Reg::RegTensor<uint16_t>&)input,
-                              specialMask);
-    }
-}
-
-template <typename T, typename U, RoundMode toBf16RoundMode, RoundMode roundMode>
-__aicore__ inline void ComputeFp4Data(__ubuf__ T* srcAddr, __ubuf__ uint16_t* halfScaleLocalAddr,
-                                      __ubuf__ int8_t* outLocalAddr, uint32_t totalCountInUB)
-{
-    uint32_t vlForHalfNumber = GetVRegSizeDispatch() / sizeof(T);
-    uint16_t elementAfterReduce = GetVRegSizeDispatch() / GetUbBlockSizeDispatch();
-    uint16_t loopNum = CeilDiv(totalCountInUB, 2 * vlForHalfNumber);
-    __VEC_SCOPE__
-    {
-        Reg::MaskReg dataMask1 = Reg::CreateMask<uint8_t, Reg::MaskPattern::ALL>();
-        Reg::RegTensor<uint16_t> halfScaleForMul;
-        Reg::RegTensor<T> vdExp0;
-        Reg::RegTensor<T> vdExp1;
-
-        Reg::RegTensor<bfloat16_t> vdExp0BF16;
-        Reg::RegTensor<bfloat16_t> vdExp1BF16;
-
-        Reg::RegTensor<U> vdExp0FP4;
-        Reg::RegTensor<U> vdExp1FP4;
-
-        static constexpr Reg::CastTrait castTraitZero = {Reg::RegLayout::ZERO, Reg::SatMode::UNKNOWN,
-                                                         Reg::MaskMergeMode::ZEROING, roundMode};
-        static constexpr Reg::CastTrait castTraitOne = {Reg::RegLayout::ONE, Reg::SatMode::UNKNOWN,
-                                                        Reg::MaskMergeMode::ZEROING, roundMode};
-        static constexpr Reg::CastTrait castTraitHalf2Bf16 = {Reg::RegLayout::UNKNOWN, Reg::SatMode::UNKNOWN,
-                                                              Reg::MaskMergeMode::ZEROING, toBf16RoundMode};
-        for (uint16_t i = 0; i < loopNum; i++) {
-            Reg::DataCopy<uint32_t, Reg::PostLiteral::POST_MODE_UPDATE, Reg::LoadDist::DIST_DINTLV_B32>(
-                (Reg::RegTensor<uint32_t>&)vdExp0, (Reg::RegTensor<uint32_t>&)vdExp1, (__ubuf__ uint32_t*&)srcAddr,
-                vlForHalfNumber);
-            Reg::DataCopy<uint16_t, Reg::PostLiteral::POST_MODE_UPDATE, Reg::LoadDist::DIST_E2B_B16>(
-                halfScaleForMul, halfScaleLocalAddr, elementAfterReduce);
-            if constexpr (Std::IsSame<T, half>::value) {
-                if constexpr (roundMode == RoundMode::CAST_RINT) {
-                    FP16Convert<T, U>(vdExp0, vdExp0, dataMask1);
-                    FP16Convert<T, U>(vdExp1, vdExp1, dataMask1);
-                }
-                Reg::Cast<bfloat16_t, T, castTraitHalf2Bf16>(vdExp0BF16, vdExp0, dataMask1);
-                Reg::Cast<bfloat16_t, T, castTraitHalf2Bf16>(vdExp1BF16, vdExp1, dataMask1);
-                Reg::Mul(vdExp0BF16, vdExp0BF16, (Reg::RegTensor<bfloat16_t>&)halfScaleForMul, dataMask1);
-                Reg::Mul(vdExp1BF16, vdExp1BF16, (Reg::RegTensor<bfloat16_t>&)halfScaleForMul, dataMask1);
-                Reg::Cast<U, bfloat16_t, castTraitZero>(vdExp0FP4, vdExp0BF16, dataMask1);
-                Reg::Cast<U, bfloat16_t, castTraitOne>(vdExp1FP4, vdExp1BF16, dataMask1);
-            } else {
-                Reg::Mul(vdExp0, vdExp0, (Reg::RegTensor<T>&)halfScaleForMul, dataMask1);
-                Reg::Mul(vdExp1, vdExp1, (Reg::RegTensor<T>&)halfScaleForMul, dataMask1);
-                Reg::Cast<U, T, castTraitZero>(vdExp0FP4, vdExp0, dataMask1);
-                Reg::Cast<U, T, castTraitOne>(vdExp1FP4, vdExp1, dataMask1);
-            }
-            Reg::Add((Reg::RegTensor<uint8_t>&)vdExp0FP4, (Reg::RegTensor<uint8_t>&)vdExp0FP4,
-                     (Reg::RegTensor<uint8_t>&)vdExp1FP4, dataMask1);
-            Reg::DataCopy<int8_t, Reg::PostLiteral::POST_MODE_UPDATE, Reg::StoreDist::DIST_PACK_B32>(
-                outLocalAddr, (Reg::RegTensor<int8_t>&)vdExp0FP4, OUT_ELE_NUM_PER_LOOP_FP4, dataMask1);
         }
     }
 }

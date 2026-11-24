@@ -19,7 +19,7 @@ class PrefillCascade(CascadeReference):
             return tensor
         send = tensor.contiguous()
         if tensor.element_size() == 1:
-            # Preserve FP8, packed FP4 and E8M0 codes through HCCL.
+            # Preserve FP8 and E8M0 codes through HCCL.
             send = send.view(self.torch.int8)
         if recv_sizes is None:
             received = self.torch.empty_like(send)
@@ -94,8 +94,7 @@ class PrefillCascade(CascadeReference):
         elif self.world == 1:
             owner_output = self._run_expert_tiles(owner_data, owner_scales, counts, owner_weights)
         else:
-            # ReRouting only permutes rows. A BF16 view carries both FP8 and
-            # packed FP4 bytes through the same operator without dequantizing.
+            # ReRouting only permutes rows. A BF16 view preserves the FP8 codes.
             ordered, _, owner_order, local_counts = npu.npu_moe_re_routing(
                 owner_data.view(torch.bfloat16), owner_counts,
             )
@@ -129,9 +128,11 @@ class PrefillCascade(CascadeReference):
         """Return one rank's BF16 outputs for a large prefill forward."""
         if input_kind == "bf16":
             data, scale = self._quantize(x)
-        else:
-            data, scale = quantized
+        elif input_kind == "fp8":
+            data, scale = self._fp8_input(quantized)
             scale = self._normalize_scale(scale, data.shape[0], self.hidden)
+        else:
+            raise ValueError("Prefill input_kind must be bf16 or fp8")
         bs = data.shape[0]
         if bs <= PREFILL_TOKEN_WINDOW:
             return self._forward_window(data, scale, ids, weights)

@@ -19,7 +19,7 @@ struct SharedExpertPrepareScratch {
 
 // 拆分一个逻辑 AIV 任务上的共享专家 token data 和 scale。
 // 通信记录布局直接复用 token quant 的 QuantProcessConfig，不再维护单独的拷贝。
-template <typename ActivationType, typename QuantScaleType, uint32_t ActivationElementsPerByte>
+template <typename ActivationType, typename QuantScaleType>
 __aicore__ inline void PrepareSharedExpertInput(const AivJobContext& job, const MoeStageCommonConfig& common,
                                                 const Params& params, const QuantProcessConfig& config,
                                                 SharedExpertPrepareScratch<ActivationType>& scratch)
@@ -33,7 +33,7 @@ __aicore__ inline void PrepareSharedExpertInput(const AivJobContext& job, const 
 
     WorkRange tokenRange = TilingByJobContext(common.tokenNum, job.jobIndex, job.totalJobs, 1U);
 
-    int64_t tokenDataElementCount = common.tokenHiddenDim / ActivationElementsPerByte;
+    int64_t tokenDataElementCount = common.tokenHiddenDim;
     int64_t tokenScaleElementCount =
         Ops::Base::CeilDiv(static_cast<int64_t>(common.tokenHiddenDim), static_cast<int64_t>(MXFP_DIVISOR_SIZE)) *
         MXFP_MULTI_BASE_SIZE;

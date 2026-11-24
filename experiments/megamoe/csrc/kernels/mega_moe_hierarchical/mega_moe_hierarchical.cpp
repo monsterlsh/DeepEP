@@ -36,8 +36,7 @@ __schedmode__(1) __global__
         trap();
     }
     util_set_ffts_config(ffts_addr);
-    constexpr bool nativeFp4 = GroupedMode == HierarchicalMegaMoeImpl::GROUPED_MATMUL_MODE_A4W4_NZ;
-    constexpr int32_t quantMode = nativeFp4 ? HierarchicalMegaMoeImpl::E2M1_QUANT : 4;  // MXFP8 E4M3
+    constexpr int32_t quantMode = 4;  // MXFP8 E4M3
     using Weight = std::conditional_t<GroupedMode == HierarchicalMegaMoeImpl::GROUPED_MATMUL_MODE_GENERAL,
                                       fp8_e4m3fn_t, fp4x2_e2m1_t>;
     HierarchicalMegaMoeTilingData invocation = tiling;
@@ -101,8 +100,6 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_hierarchical_ker
         } else {
             SelectWeighting<GROUPED_MATMUL_MODE_A8W4>(block_dim, ub_bytes, stream, args, tiling, ffts_addr);
         }
-    } else if (tiling.groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ) {
-        SelectWeighting<GROUPED_MATMUL_MODE_A4W4_NZ>(block_dim, ub_bytes, stream, args, tiling, ffts_addr);
     } else {
         SelectWeighting<GROUPED_MATMUL_MODE_GENERAL>(block_dim, ub_bytes, stream, args, tiling, ffts_addr);
     }

@@ -39,7 +39,6 @@ private:
     using QuantScaleOutType = typename MegaMoeBase::QuantScaleOutType;
     using ActivationQuantOutType = typename MegaMoeBase::ActivationQuantOutType;
 
-    static constexpr uint32_t A_ELEMS_PER_BYTE = MegaMoeBase::A_ELEMS_PER_BYTE;
     static constexpr uint32_t GMM1_TILE_M = MegaMoeBase::GMM1_TILE_M;
     static constexpr uint32_t EPILOGUE_TILE_M = MegaMoeBase::EPILOGUE_TILE_M;
     // 一个逻辑任务对应一对 gate/up；生产、SwiGLU 和 GMM2 ready 必须使用同一粒度。
@@ -48,7 +47,7 @@ private:
     static constexpr bool USE_WEIGHT_PROLOGUE = GmmKernel::UsesA8W4Prologue<QuantOutType, Weight1Type>;
     using Gmm1Config =
         GmmKernel::Config<USE_WEIGHT_PROLOGUE, 0, QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType,
-                          QuantScaleOutType, GmmKernel::UsesNativeFp4Weights<QuantOutType>, TopkWeightsPrefetch, false,
+                          QuantScaleOutType, false, TopkWeightsPrefetch, false,
                           false, false, true, FuseGateUp>;
     struct EmptyGmm1Context {};
     std::conditional_t<USE_WEIGHT_PROLOGUE, GmmKernel::CatlassGmm1<typename Gmm1Config::ProblemConfig>,
@@ -123,7 +122,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm1
         return;
     }
     UpdateMoeExpertGmm1GlobalBuffer<ActivationType, Weight1Type, ActivationQuantOutType, QuantScaleOutType,
-                                    A_ELEMS_PER_BYTE, true, TopkWeightsPrefetch>(
+                                    true, TopkWeightsPrefetch>(
         gmmExecutionConfig_, syncWorkspaceLayout_, params_.workspaceInfo, moeWeightTensorListAddrs_, epilogueOp_,
         gmmAddrInfo, state, tokenStartIndexInExpert, gmm1TilesPerMGroup);
     gmmAddrInfo.timer = timer_.Enabled() ? &timer_ : nullptr;
@@ -286,7 +285,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunRead
     uint32_t tilesPerM =
         Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / commonConfig_.activationFactor, static_cast<uint32_t>(GMM1_TASK_N));
     UpdateMoeExpertGmm1GlobalBuffer<ActivationType, Weight1Type, ActivationQuantOutType, QuantScaleOutType,
-                                    A_ELEMS_PER_BYTE, true, TopkWeightsPrefetch>(
+                                    true, TopkWeightsPrefetch>(
         gmmExecutionConfig_, syncWorkspaceLayout_, params_.workspaceInfo, moeWeightTensorListAddrs_, epilogueOp_, addr,
         state, begin.tokenIndexInExpert, tilesPerM);
     addr.timer = timer_.Enabled() ? &timer_ : nullptr;

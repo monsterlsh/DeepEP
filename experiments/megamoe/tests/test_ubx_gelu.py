@@ -5,13 +5,11 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
-from types import SimpleNamespace
 
 import pytest
 
 from deep_ep_experimental.megamoe.benchmark import default_timer_ranks
 from experiments.megamoe.scripts import run_megamoe as launcher
-from experiments.megamoe.scripts import ubx_device_check
 
 
 @pytest.fixture(autouse=True)
@@ -181,7 +179,6 @@ def test_ep32_auto_waits_for_both_golden_preparations(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(("argv", "message"), [
     (["perf", "--ep-size", "16"], "需要 --ep-size 32"),
-    (["perf", "w4a4", "--input", "fp8"], "W4A4 需要 fp4"),
     (["perf", "--bs", "65537"], "--bs 必须在 1..65536"),
     (["compare", "--plan"], "A/B 参数适用于 URMA"),
 ])
@@ -193,8 +190,8 @@ def test_mte_roce_rejects_unsuitable_cases(argv, message, capsys):
 
 
 @pytest.mark.parametrize("timer", [False, True])
-@pytest.mark.parametrize(("precision", "input_kind"), [("w4a8", "fp8"), ("w4a4", "fp4")])
-def test_mte_roce_forwards_explicit_backend_and_reads_mte_reports(tmp_path, monkeypatch, capsys, timer, precision, input_kind):
+@pytest.mark.parametrize("precision", ["w4a8", "w8a8"])
+def test_mte_roce_forwards_explicit_backend_and_reads_mte_reports(tmp_path, monkeypatch, capsys, timer, precision):
     stages, checks, launches = [], [], []
 
     def run_stage(label, scripts, logs, **ssh):
@@ -213,7 +210,7 @@ def test_mte_roce_forwards_explicit_backend_and_reads_mte_reports(tmp_path, monk
         def option(name):
             return command[command.index(name) + 1]
 
-        assert option("--bs-values") == "32" and option("--input") == input_kind
+        assert option("--bs-values") == "32" and option("--input") == "fp8"
         spec = json.loads(Path(option("--config")).read_text(encoding="utf-8"))
         model = spec["model"]
         assert (model["activation"], model["mma_type"], model["topk_weights_type"]) == (
@@ -250,7 +247,7 @@ def test_mte_roce_forwards_explicit_backend_and_reads_mte_reports(tmp_path, monk
         args.append("--timer")
     assert launcher.cli(args) == 0
     assert stages == [f"prepare-accuracy-{precision}", f"run-accuracy-{precision}", f"run-perf-{precision}"]
-    base = ["16", "0", "mte_roce", precision]
+    base = ["16", "0", "mte_roce"]
     assert checks == [base] * 2 + [base + (["1"] if timer else [])] * 4
     assert launches == [
         ("prepare", "0-15"), ("prepare", "16-31"), ("accuracy", 0), ("accuracy", 16), ("perf", 0), ("perf", 16),
@@ -283,11 +280,11 @@ def test_mte_roce_accepts_bs96_shared_fp8_config(tmp_path):
 
 @pytest.mark.parametrize(("ep_size", "backend"), [(16, "mte"), (32, "mte_roce")])
 @pytest.mark.parametrize(("suffix", "activation", "weight_mode"), [("", "gelu", 1), ("_swiglu", "swiglu", 0)])
-def test_target_run_json_covers_three_precisions(tmp_path, ep_size, backend, suffix, activation, weight_mode):
+def test_target_run_json_covers_both_precisions(tmp_path, ep_size, backend, suffix, activation, weight_mode):
     path = launcher.SCRIPT.parent / "configs" / f"ubx_ep{ep_size}_target{suffix}.json"
     args = launcher.parse_args(["--run-config", str(path), "--output-dir", str(tmp_path)])
     assert (args.ep_size, args.backend, args.bs) == (ep_size, backend, 39280)
-    assert args.accuracy_precisions == args.perf_precisions == ("w4a8", "w8a8", "w4a4")
+    assert args.accuracy_precisions == args.perf_precisions == ("w4a8", "w8a8")
     for precision in args.accuracy_precisions:
         config_path = launcher.config_for(args, precision)
         config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -295,27 +292,27 @@ def test_target_run_json_covers_three_precisions(tmp_path, ep_size, backend, suf
         assert (model["num_experts"], model["num_topk"], model["hidden"], model["intermediate_hidden"]) == (800, 25, 4096, 1536)
         assert model["mma_type"] == launcher.MMA_TYPES[precision]
         assert (model["activation"], model["topk_weights_type"]) == (activation, weight_mode)
-        forwarded = launcher.case_args(args, precision, config_path)
-        assert forwarded[forwarded.index("--input") + 1] == ("fp4" if precision == "w4a4" else "fp8")
+        forwarded = launcher.case_args(args, config_path)
+        assert forwarded[forwarded.index("--input") + 1] == "fp8"
 
 
 @pytest.mark.parametrize("suffix", ["", "_swiglu"])
-def test_ubx_ep16_a4w4_launches_fp4_timer(tmp_path, monkeypatch, suffix):
+def test_ubx_ep16_a8w4_launches_fp8_timer(tmp_path, monkeypatch, suffix):
     preset = launcher.SCRIPT.parent / "configs" / f"ubx_ep16_target{suffix}.json"
     data = launcher.read_run_config(preset)
-    data.update(mode="perf", precision="a4w4", timer=True, output_dir="run")
-    source = tmp_path / "a4w4.json"
+    data.update(mode="perf", precision="a8w4", timer=True, output_dir="run")
+    source = tmp_path / "a8w4.json"
     source.write_text(json.dumps(data), encoding="utf-8")
     checks, launches = [], []
 
     def run_logged(command, env, log):
-        assert command[command.index("--input") + 1] == "fp4"
+        assert command[command.index("--input") + 1] == "fp8"
         assert command[command.index("--backend") + 1] == "mte"
         assert "--timer" in command
         assert command[command.index("--timer-ranks") + 1] == "0,4,8,12"
         config = Path(command[command.index("--config") + 1])
         assert json.loads(config.read_text(encoding="utf-8"))["model"] == dict(
-            data["config"]["model"], mma_type="fp4xfp4"
+            data["config"]["model"], mma_type="fp8xfp4"
         )
         launches.append(True)
 
@@ -323,24 +320,8 @@ def test_ubx_ep16_a4w4_launches_fp4_timer(tmp_path, monkeypatch, suffix):
     monkeypatch.setattr(launcher, "run_logged", run_logged)
     monkeypatch.setattr(launcher, "report_lines", lambda *args: ())
     assert launcher.entrypoint(["--run-config", str(source)]) == 0
-    assert checks == [["16", "0", "mte", "w4a4", "1"]]
+    assert checks == [["16", "0", "mte"]]
     assert launches == [True]
-
-
-def test_ubx_ep16_a4w4_timer_requires_instrumented_wheel(monkeypatch):
-    monkeypatch.setattr(ubx_device_check, "check_wheel_packages", lambda: None)
-    npu = SimpleNamespace(device_count=lambda: 16, set_device=lambda rank: None)
-    ext = SimpleNamespace(mte_a4w4_enabled=True, timer_enabled=True, __file__="mock-extension")
-    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(npu=npu))
-    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
-    monkeypatch.setitem(sys.modules, "deep_ep._machine",
-                        SimpleNamespace(physical_device=lambda: 0, board_id=lambda rank: 0x44))
-    monkeypatch.setitem(sys.modules, "deep_ep_experimental.megamoe.api", SimpleNamespace(_extension=lambda: ext))
-    monkeypatch.setattr(sys, "argv", ["-c", "16", "0", "mte", "w4a4", "1"])
-    with pytest.raises(SystemExit, match="单机 MTE W4A4 设备 timer"):
-        ubx_device_check.main()
-    ext.mte_a4w4_timer_enabled = True
-    ubx_device_check.main()
 
 
 def test_run_json_forwards_resolved_settings_and_accepts_cli_overrides(tmp_path, monkeypatch):
@@ -372,8 +353,8 @@ def test_run_json_forwards_resolved_settings_and_accepts_cli_overrides(tmp_path,
             assert str(tmp_path / "golden storage") in script
 
     monkeypatch.setattr(launcher, "run_stage", run_stage)
-    assert launcher.cli(["perf", "a4w4", "--run-config", str(source), "--bs", "17"]) == 0
-    assert stages == ["run-perf-w4a4"]
+    assert launcher.cli(["perf", "a8w4", "--run-config", str(source), "--bs", "17"]) == 0
+    assert stages == ["run-perf-w4a8"]
 
 
 def test_inline_model_reaches_both_ubx_nodes_and_950pod(tmp_path, monkeypatch):
@@ -446,11 +427,10 @@ def test_inline_model_reaches_both_ubx_nodes_and_950pod(tmp_path, monkeypatch):
 @pytest.mark.parametrize(("stage", "model_config", "activation", "precision"), [
     ("decode", "ep32_roce_decode", "swiglu", "w8a8"),
     ("decode", "ep32_roce_decode", "gelu", "w8a8"),
-    ("decode", "ep32_roce_decode", "swiglu", "w4a4"),
-    ("decode", "ep32_roce_decode", "gelu", "w4a4"),
+    ("decode", "ep32_roce_decode", "swiglu", "w4a8"),
     ("prefill", "target_gelu_k25", "gelu", "w8a8"),
-    ("prefill", "target_gelu_k25", "gelu", "w4a4"),
-    ("prefill", "ep32_roce_decode", "swiglu", "w4a4"),
+    ("prefill", "target_gelu_k25", "gelu", "w4a8"),
+    ("prefill", "ep32_roce_decode", "swiglu", "w4a8"),
 ])
 def test_cascade_comparison_reaches_workers_and_reads_reports(
     tmp_path, monkeypatch, capsys, machine, ep_size, cli_flag, stage, model_config, activation, precision,
@@ -462,7 +442,6 @@ def test_cascade_comparison_reaches_workers_and_reads_reports(
     data = dict(schema_version=1, machine=machine, ep_size=ep_size, backend=backend, mode="perf",
                 precision=precision,
                 config=spec, output_dir="run", master_addr="192.0.2.1")
-    input_kind = "fp4" if precision == "w4a4" else "fp8"
     stage_field = f"compare_{stage}_cascade"
     stage_option = f"--compare-{stage}-cascade"
     if not cli_flag:
@@ -479,7 +458,7 @@ def test_cascade_comparison_reaches_workers_and_reads_reports(
     def run_logged(command, env, log):
         assert stage_option in command and "--timer" not in command
         assert "--dual-reference" not in command and "--golden-dir" not in command
-        assert command[command.index("--input") + 1] == input_kind
+        assert command[command.index("--input") + 1] == "fp8"
         output = Path(command[command.index("--output-dir") + 1])
         config = json.loads(Path(command[command.index("--config") + 1]).read_text(encoding="utf-8"))
         assert config["model"]["activation"] == activation
@@ -493,7 +472,7 @@ def test_cascade_comparison_reaches_workers_and_reads_reports(
             case = rank_dir / f"bs_{bs}"
             case.mkdir(parents=True)
             manifest = dict(backend=backend, mode="perf", ep_size=ep_size, rank=rank, ranks_per_node=ranks_per_node,
-                            routing="balanced", input=input_kind, config=config)
+                            routing="balanced", input="fp8", config=config)
             manifest[stage_field] = True
             (rank_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             report = {
@@ -535,7 +514,7 @@ def test_decode_comparison_rejects_incomparable_cases(args, message, capsys):
 
 
 @pytest.mark.parametrize(("extra_args", "message"), [
-    (["--precision", "a8w4", "--weighting", "late"], "支持 A8W8 和 A4W4"),
+    (["--precision", "a8w4", "--weighting", "late"], "支持 A8W8"),
     (["--precision", "a8w8"], "Finalize"),
 ])
 def test_decode_gelu_requires_matching_operands_and_finalize_weights(extra_args, message, capsys):
@@ -555,20 +534,11 @@ def test_prefill_comparison_accepts_swiglu_and_rejects_decode_flag(capsys):
     assert "not allowed with argument" in capsys.readouterr().err
 
 
-def test_prefill_comparison_fp4_respects_native_backend_limits(tmp_path, capsys):
-    flags = ["--mode", "perf", "--config", "target_gelu_k25", "--compare-prefill-cascade"]
-    with pytest.raises(SystemExit, match="2"):
-        launcher.parse_args([*flags, "--backend", "urma", "--precision", "a4w4"])
-    assert "URMA 暂不支持 W4A4" in capsys.readouterr().err
-    assert launcher.parse_args([*flags, "--backend", "urma", "--precision", "all"]).perf_precisions == ("w4a8", "w8a8")
-    assert launcher.parse_args([*flags, "--backend", "mte", "--precision", "all"]).perf_precisions == (
-        "w4a8", "w8a8", "w4a4",
-    )
-
-    preset = launcher.SCRIPT.parent / "configs/950pod_target.json"
-    data = launcher.read_run_config(preset)
-    data.update(mode="perf", precision="a4w4", compare_prefill_cascade=True)
-    assert launcher.pod_settings(tmp_path / "run.json", data).precisions == ("w4a4",)
+@pytest.mark.parametrize("backend", ["urma", "mte"])
+def test_prefill_comparison_covers_both_native_precisions(backend):
+    args = launcher.parse_args(["--mode", "perf", "--config", "target_gelu_k25", "--compare-prefill-cascade",
+                                "--backend", backend, "--precision", "all"])
+    assert args.perf_precisions == ("w4a8", "w8a8")
 
 
 @pytest.mark.parametrize("fault", [None, "manifest", "kernel", "host", "throughput", "missing"])
@@ -636,10 +606,10 @@ def test_950pod_ep32_perf_only(tmp_path, monkeypatch, capsys, fault):
 @pytest.mark.parametrize("mode", ["accuracy", "perf"])
 @pytest.mark.parametrize(("activation", "weight_mode"), [("gelu", 1), ("swiglu", 0)])
 @pytest.mark.parametrize("ep_size", [8, 16, 32])
-def test_950pod_a4w4_runs_fp4(tmp_path, monkeypatch, mode, activation, weight_mode, ep_size):
+def test_950pod_a8w8_accuracy_and_perf(tmp_path, monkeypatch, mode, activation, weight_mode, ep_size):
     preset = launcher.SCRIPT.parent / "configs/950pod_target.json"
     data = launcher.read_run_config(preset)
-    data.update(mode=mode, precision="a4w4", ep_size=ep_size, output_dir="out", check_tokens=8)
+    data.update(mode=mode, precision="a8w8", ep_size=ep_size, output_dir="out", check_tokens=8)
     data["config"]["model"].update(activation=activation, topk_weights_type=weight_mode)
     source = tmp_path / "run.json"
     source.write_text(json.dumps(data), encoding="utf-8")
@@ -648,16 +618,16 @@ def test_950pod_a4w4_runs_fp4(tmp_path, monkeypatch, mode, activation, weight_mo
     launched = []
 
     def run_logged(command, env, log):
-        assert command[command.index("--input") + 1] == "fp4"
+        assert command[command.index("--input") + 1] == "fp8"
         spec = json.loads(Path(command[command.index("--config") + 1]).read_text(encoding="utf-8"))
-        assert spec["model"] == dict(data["config"]["model"], mma_type="fp4xfp4")
+        assert spec["model"] == dict(data["config"]["model"], mma_type="fp8xfp8")
         if "--module" not in command:
             assert "--backend" not in command
             assert command[command.index("--ranks") + 1] == "0-7"
             launched.append("golden")
             return
         assert {f"--nnodes={ep_size // 8}", "--nproc-per-node=8", "--node-rank=0"} <= set(command)
-        assert command[command.index("--backend") + 1] == "mte"
+        assert "--backend" not in command
         assert command[command.index("--mode") + 1] == mode
         launched.append(mode)
         if mode == "accuracy":
@@ -674,16 +644,16 @@ def test_950pod_a4w4_runs_fp4(tmp_path, monkeypatch, mode, activation, weight_mo
 
 @pytest.mark.parametrize("activation", ["gelu", "swiglu"])
 @pytest.mark.parametrize("ep_size", [8, 16, 32])
-def test_950pod_all_includes_a4w4_for_routed_experts(tmp_path, activation, ep_size):
+def test_950pod_all_selects_supported_routed_and_shared_precisions(tmp_path, activation, ep_size):
     data = launcher.read_run_config(launcher.SCRIPT.parent / "configs/950pod_target.json")
     data.update(mode="perf", precision="all", ep_size=ep_size, output_dir="out")
     model = data["config"]["model"]
     model.update(activation=activation, topk_weights_type=int(activation == "gelu"), num_topk=32)
     path = tmp_path / "run.json"
-    assert launcher.pod_settings(path, data).precisions == ("w4a8", "w8a8", "w4a4")
+    assert launcher.pod_settings(path, data).precisions == ("w4a8", "w8a8")
     model["num_shared_experts"] = 1
-    assert launcher.pod_settings(path, data).precisions == ("w4a8", "w4a4")
-    with pytest.raises(ValueError, match="共享专家要求 W4A8 或 W4A4"):
+    assert launcher.pod_settings(path, data).precisions == ("w4a8",)
+    with pytest.raises(ValueError, match="共享专家要求 W4A8"):
         launcher.pod_settings(path, dict(data, precision="a8w8"))
 
 
@@ -720,11 +690,22 @@ def test_public_entry_requires_inline_json(tmp_path, capsys):
     assert "内嵌模型" in capsys.readouterr().err
 
 
-def test_urma_a4w4_fails_before_any_launch(capsys):
-    with pytest.raises(SystemExit) as error:
-        launcher.parse_args(["accuracy", "a4w4"])
-    assert error.value.code == 2
-    assert "URMA 暂不支持 W4A4" in capsys.readouterr().err
+@pytest.mark.parametrize("preset", ["ubx_ep16_target", "ubx_ep32_target", "950pod_target"])
+@pytest.mark.parametrize("field,value", [
+    ("precision", "a4w4"), ("precision", "w4a4"), ("input", "fp4"), ("mma_type", "fp4xfp4"),
+])
+def test_unsupported_precision_fails_in_public_plan(tmp_path, capsys, preset, field, value):
+    data = launcher.read_run_config(launcher.SCRIPT.parent / "configs" / f"{preset}.json")
+    data["precision"] = "all"
+    if field == "mma_type":
+        data["config"]["model"][field] = value
+    else:
+        data[field] = value
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(SystemExit, match="2"):
+        launcher.entrypoint(["--run-config", str(path), "--plan"])
+    assert field in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(("machine", "ep_size", "stage", "override"), [

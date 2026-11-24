@@ -19,7 +19,7 @@ else:
 def case_jobs(data, selection):
     pod = data["machine"] == "950pod"
     precision = data["precision"]
-    native_b_limited = pod and data["ep_size"] == 32 and precision in ("a8w4", "a8w8")
+    native_b_limited = pod and data["ep_size"] == 32
     jobs = []
     memory_only = selection == "memory"
     configured_peak = runner.configured_memory_peak(data)
@@ -58,7 +58,7 @@ def case_jobs(data, selection):
             add("paired", "paired", "gelu")
     if selection in ("both", "perf"):
         if pod:
-            if precision == "a4w4" or (precision == "a8w4" and not native_b_limited):
+            if precision == "a8w4" and not native_b_limited:
                 add("native-overlap", "overlap")
             reason = ("950POD MTE A8W8 没有设备 timer，无法计算掩盖率。" if precision == "a8w8" else
                       "950POD 全窗验收需两臂逐窗打点；原生 timer 只保留首窗。")
@@ -148,15 +148,16 @@ def collect_overlap(base, root):
 def run_l0(path, data, *, only=None, plan=False, accuracy_arm=None):
     case = data.get("case")
     precision = data.get("precision")
-    matrix = [(machine, p) for machine in ("ubx", "950pod") for p in ("a8w4", "a8w8", "a4w4")]
-    cases = {f"L{i:02}": pair for i, pair in enumerate(matrix, 1)}
+    cases = {"L01": ("ubx", "a8w4"), "L02": ("ubx", "a8w8"),
+             "L04": ("950pod", "a8w4"), "L05": ("950pod", "a8w8")}
     ep = data.get("ep_size")
     if (data.get("suite") != "l0" or not isinstance(case, str)
             or cases.get(case) != (data.get("machine"), precision) or type(ep) is not int or ep not in (4, 8, 16, 32)):
-        raise ValueError("L01–L06 分别使用 UBX 或 950POD 的 A8W4 / A8W8 / A4W4 和 EP4/8/16/32")
+        raise ValueError("L01/L02 和 L04/L05 分别使用 UBX 或 950POD 的 A8W4 / A8W8 和 EP4/8/16/32")
     spec = data.get("config")
     if not isinstance(spec, dict) or spec.get("schema_version") != 1 or not isinstance(spec.get("model"), dict):
         raise ValueError("L0 需包含 schema_version=1 的内嵌模型 config")
+    runner.validate_model_precision(spec["model"])
     if spec.get("bs_values") != [39280] or "bs" in data:
         raise ValueError("L0 按每卡 39280 token 验收，请使用 config.bs_values=[39280]")
     shape = dict(hidden=4096, intermediate_hidden=1536, num_experts=800, num_topk=25, num_shared_experts=0)

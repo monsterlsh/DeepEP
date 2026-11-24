@@ -423,11 +423,11 @@ HOST_DEVICE uint32_t CalcSendMaskExpertCapacity(const HierarchicalMegaMoeTilingD
 }
 
 // 单 token 的量化记录字节数 = 量化数据 + mx scale（prefetch 场景再拼 topk 权重），按 32B 对齐。
-HOST_DEVICE int64_t CalcQuantTokenScaleBytes(int64_t h, uint32_t elemsPerByte, int64_t topK, bool topkWeightsPrefetch)
+HOST_DEVICE int64_t CalcQuantTokenScaleBytes(int64_t h, int64_t topK, bool topkWeightsPrefetch)
 {
     uint32_t mxScaleNum = Ops::Base::CeilDiv(static_cast<uint32_t>(h), static_cast<uint32_t>(ALIGN_32));
     uint32_t dataBytes =
-        Ops::Base::CeilAlign(static_cast<uint32_t>(h) / elemsPerByte, static_cast<uint32_t>(ALIGN_256)) *
+        Ops::Base::CeilAlign(static_cast<uint32_t>(h), static_cast<uint32_t>(ALIGN_256)) *
         static_cast<uint32_t>(sizeof(int8_t));
     uint32_t scaleBytes = mxScaleNum * static_cast<uint32_t>(sizeof(int8_t));
     uint32_t tokenScaleBytes = Ops::Base::CeilAlign(dataBytes + scaleBytes, static_cast<uint32_t>(ALIGN_32));
@@ -439,15 +439,9 @@ HOST_DEVICE int64_t CalcQuantTokenScaleBytes(int64_t h, uint32_t elemsPerByte, i
     return static_cast<int64_t>(tokenScaleBytes);
 }
 
-HOST_DEVICE uint32_t DispatchElementsPerByte(uint8_t groupedMatmulMode)
-{
-    return groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ ? 2U : 1U;
-}
-
 HOST_DEVICE uint32_t HierarchicalDispatchPacketCount(const HierarchicalMegaMoeTilingData* tiling)
 {
-    return DispatchPacketCount(CalcQuantTokenScaleBytes(tiling->h, DispatchElementsPerByte(tiling->groupedMatmulMode),
-                                                       tiling->topK, tiling->topkWeightsPrefetch != 0));
+    return DispatchPacketCount(CalcQuantTokenScaleBytes(tiling->h, tiling->topK, tiling->topkWeightsPrefetch != 0));
 }
 
 // combine 接收区单 token 记录字节数：须与 kernel InitCombineBuffers 的 combine record 布局一致。
@@ -470,7 +464,6 @@ struct PeermemSizeParams {
     int64_t moeExpertPerRank;
     int64_t epWorldSize;
     int64_t yDtypeSize;
-    uint32_t elemsPerByte;
     bool topkWeightsPrefetch;
     bool isQuantCombine;
     int64_t topoType;
@@ -505,7 +498,7 @@ HOST_DEVICE int64_t CalcPeermemLeastSize(const PeermemSizeParams& params)
                              : 0;
 
     int64_t tokenScaleBytes =
-        CalcQuantTokenScaleBytes(params.h, params.elemsPerByte, params.topK, params.topkWeightsPrefetch);
+        CalcQuantTokenScaleBytes(params.h, params.topK, params.topkWeightsPrefetch);
     int64_t quantTokenScaleSize = Ops::Base::CeilAlign(params.numMaxTokensPerRank * tokenScaleBytes, ALIGN_512);
     int64_t combineTokenBytes = CalcCombineTokenBytes(params.h, params.yDtypeSize, params.isQuantCombine);
     int64_t combineSendSize =
@@ -547,7 +540,7 @@ struct PeermemInfo {
     GM_ADDR closurePtr{nullptr};
 
     HOST_DEVICE PeermemInfo() = default;
-    HOST_DEVICE PeermemInfo(GM_ADDR base, const HierarchicalMegaMoeTilingData* tilingData, uint32_t elemsPerByte = 1,
+    HOST_DEVICE PeermemInfo(GM_ADDR base, const HierarchicalMegaMoeTilingData* tilingData,
                             uint32_t serverNum = 1)
     {
         rankSyncInWorldPtr = base;
@@ -592,7 +585,7 @@ struct PeermemInfo {
         }
 
         int64_t tokenScaleBytes =
-            CalcQuantTokenScaleBytes(static_cast<int64_t>(tilingData->h), elemsPerByte,
+            CalcQuantTokenScaleBytes(static_cast<int64_t>(tilingData->h),
                                      static_cast<int64_t>(tilingData->topK), tilingData->topkWeightsPrefetch == 1);
         if (UsesMteLayout(tilingData->topoType)) {
             quantTokenScalePtr = base + offset;

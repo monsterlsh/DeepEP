@@ -27,16 +27,14 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     using namespace HierarchicalMegaMoeImpl;
     CheckTensor(example, 2, "plan input");
     const auto mma_mode = MmaMode(mma_type);
-    const auto elements_per_byte = DispatchElementsPerByte(mma_mode);
-    const auto packed_dtype = elements_per_byte == 2U ? torch::kUInt8 : c10::ScalarType::Float8_e4m3fn;
-    TORCH_CHECK(example.scalar_type() == torch::kBFloat16 || example.scalar_type() == packed_dtype,
+    TORCH_CHECK(example.scalar_type() == torch::kBFloat16 || example.scalar_type() == c10::ScalarType::Float8_e4m3fn,
                 "MTE+RoCE plan input must be BF16 or match the quantized activation type");
-    const int64_t h = example.size(1) * (example.scalar_type() == torch::kUInt8 ? elements_per_byte : 1U);
+    const int64_t h = example.size(1);
     platform_ = GetPlatformInfo();
     tiling_ = MakeTiling(example.size(0), h, intermediate, topk, experts, world, max_tokens, shared_experts,
                          platform_, activation, mma_mode, topk_weights_type);
     const auto required = LayoutArena(world, experts, max_tokens, topk, h, HIERARCHICAL_RANKS_PER_HOST, 0, 1,
-                                      elements_per_byte, topk_weights_type == 1, tiling_.arena);
+                                      topk_weights_type == 1, tiling_.arena);
     TORCH_CHECK(symmetric_address != 0 && symmetric_address % HIERARCHICAL_FLAG_BYTES == 0 && symmetric_bytes >= required,
                 "MTE+RoCE requires a 512-byte aligned symmetric address and ", required, " bytes, got ", symmetric_bytes);
     int32_t device = -1;
@@ -87,16 +85,12 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     CheckTensor(weight_scales2, 4, "weight_scales2");
     const bool prequantized = x_scales.has_value();
     const auto mma_mode = tiling_.groupedMatmulMode;
-    const auto input_elements_per_byte = DispatchElementsPerByte(mma_mode);
-    const bool fp4_input = input_elements_per_byte == 2U;
-    const auto quant_input_dtype = fp4_input ? torch::kUInt8 : c10::ScalarType::Float8_e4m3fn;
-    TORCH_CHECK(x.scalar_type() == (prequantized ? quant_input_dtype : torch::kBFloat16),
+    TORCH_CHECK(x.scalar_type() == (prequantized ? c10::ScalarType::Float8_e4m3fn : torch::kBFloat16),
                 "x must be BF16 or the plan's quantized activation dtype with E8M0 scales");
     const int64_t bs = tiling_.bs, h = tiling_.h, topk = tiling_.topK;
     const int64_t experts = tiling_.moeExpertPerRank, hidden = tiling_.hiddenDim;
     const int64_t intermediate = IntermediateWidth(tiling_);
-    TORCH_CHECK(x.device() == workspace_.device() &&
-                    x.sizes() == torch::IntArrayRef({bs, prequantized ? h / input_elements_per_byte : h}),
+    TORCH_CHECK(x.device() == workspace_.device() && x.sizes() == torch::IntArrayRef({bs, h}),
                 "Input shape and device must match the MTE+RoCE plan");
     if (prequantized) {
         CheckTensor(*x_scales, 2, "x_scales");
@@ -153,7 +147,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
             TORCH_CHECK(!out || !out->is_alias_of(*tensor), "out must not alias shared inputs");
         }
         const bool fp8 = shared_weight1->scalar_type() == c10::ScalarType::Float8_e4m3fn;
-        TORCH_CHECK(((fp8 && !fp4_input) || shared_weight1->scalar_type() == torch::kUInt8) &&
+        TORCH_CHECK((fp8 || shared_weight1->scalar_type() == torch::kUInt8) &&
                         shared_weight1->scalar_type() == shared_weight2->scalar_type(),
                     "invalid shared projection types");
         const int64_t packing = fp8 ? 1 : 2;
@@ -233,9 +227,9 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
 {
     using namespace HierarchicalMegaMoeImpl;
     CheckArenaGeometry(world, experts, tokens, topk, hidden, topk_weights_type);
-    const auto elements_per_byte = DispatchElementsPerByte(MmaMode(mma_type));
+    MmaMode(mma_type);
     HierarchicalMegaMoeArenaOffsets layout{};
-    return LayoutArena(world, experts, tokens, topk, hidden, HIERARCHICAL_RANKS_PER_HOST, 0, 1, elements_per_byte,
+    return LayoutArena(world, experts, tokens, topk, hidden, HIERARCHICAL_RANKS_PER_HOST, 0, 1,
                        topk_weights_type == 1, layout);
 }
 

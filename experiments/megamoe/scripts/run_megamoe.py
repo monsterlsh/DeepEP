@@ -34,8 +34,8 @@ POD_RANKS = 8
 POD_PYTHON = "/opt/miniconda3/envs/lsx/bin/python"
 POD_CANN_ENV = "/home/cann/b112/cann-9.2.0/set_env.sh"
 TIMER_RANKS_PER_NODE = 4
-MMA_TYPES = {"w4a8": "fp8xfp4", "w8a8": "fp8xfp8", "w4a4": "fp4xfp4"}
-PRECISION_ALIASES = {"a8w4": "w4a8", "a8w8": "w8a8", "a4w4": "w4a4"}
+MMA_TYPES = {"w4a8": "fp8xfp4", "w8a8": "fp8xfp8"}
+PRECISION_ALIASES = {"a8w4": "w4a8", "a8w8": "w8a8"}
 MODES = ("accuracy", "perf", "both", "compare")
 ROUTINGS = ("balanced", "skewed", "random", "random-balanced")
 FORWARDED_ENV = (
@@ -46,7 +46,6 @@ COMPARISON_PLAN = "comparison-plan.json"
 COMPARISON_REPORT = "comparison.json"
 CASCADE_STAGES = ("decode", "prefill")
 ACCURACY_STAGES = ("golden", "megamoe", "cascade")
-A8_PRECISIONS = ("w4a8", "w8a8")
 WEIGHT_MODE = {"gelu": 1, "swiglu": 0}
 DEVICE_CHECK = str(SCRIPT.with_name("ubx_device_check.py"))
 
@@ -134,7 +133,13 @@ def comparison_settings(config):
     return arms, tuple(precisions)
 
 
+def validate_model_precision(model):
+    if "mma_type" in model and model["mma_type"] not in MMA_TYPES.values():
+        raise ValueError(f"不支持 model.mma_type={model['mma_type']!r}，请选择 fp8xfp4 或 fp8xfp8")
+
+
 def validate_geometry(model, ep_size):
+    validate_model_precision(model)
     for dimension in ("hidden", "intermediate_hidden"):
         if type(model[dimension]) is not int or model[dimension] <= 0:
             raise ValueError(f"{dimension} 必须为正整数")
@@ -186,7 +191,7 @@ def cascade_stage(args):
 
 
 def decode_cascade_precisions(model):
-    return ("w8a8", "w4a4") if model.get("activation") == "gelu" else tuple(MMA_TYPES)
+    return ("w8a8",) if model.get("activation") == "gelu" else tuple(MMA_TYPES)
 
 
 def validate_cascade_comparison(stage, model, bs, mode, precisions, dual_reference):
@@ -197,8 +202,8 @@ def validate_cascade_comparison(stage, model, bs, mode, precisions, dual_referen
     if stage == "decode":
         if set(precisions) - set(decode_cascade_precisions(model)):
             if activation == "gelu":
-                raise ValueError("Decode GELU 融合小算子支持 A8W8 和 A4W4")
-            raise ValueError("Decode SwiGLU 小算子级联对照支持 A8W4、A8W8 和 A4W4")
+                raise ValueError("Decode GELU 融合小算子支持 A8W8")
+            raise ValueError("Decode SwiGLU 小算子级联对照支持 A8W4 和 A8W8")
         if (activation not in WEIGHT_MODE or type(weight_mode) is not int or weight_mode != 0
                 or model["num_shared_experts"] != 0 or model.get("activation_clamp") is not None):
             raise ValueError("Decode 级联对照要求无截断的 SwiGLU 或 GELU、Finalize 加权、零共享专家")
@@ -308,12 +313,12 @@ def parse_args(argv, run_config=None):
     parser.add_argument("precision", nargs="?", type=parse_precision, choices=("all", *MMA_TYPES),
                         help="显式指定时适用于所选模式。省略时精度测两种，性能测 W4A8")
     parser.add_argument("--precision", dest="precision_option", type=parse_precision, choices=("all", *MMA_TYPES),
-                        help="显式选择 w8a8、w4a8（a8w4）、w4a4（a4w4）或 all")
+                        help="显式选择 w8a8（a8w8）、w4a8（a8w4）或 all")
     parser.add_argument("--ep-size", type=int, choices=(4, 8, 16, 32), default=16)
     parser.add_argument("--backend", choices=("urma", "mte", "mte_roce"), default="urma",
                         help="默认 URMA；mte 为单机 EP4/8/16，mte_roce 为双机 EP32")
     parser.add_argument("--activation", choices=("gelu", "swiglu"), help="覆盖模型激活函数")
-    parser.add_argument("--input", choices=("fp8", "fp4"), help="默认按激活精度选 FP8 或 packed FP4")
+    parser.add_argument("--input", choices=("fp8",), help="使用 FP8 激活输入")
     node = parser.add_mutually_exclusive_group()
     node.add_argument("--node-ip", nargs=2, metavar=("NODE0", "NODE1"),
                       help="EP32 自动拉起的两台节点")
@@ -390,8 +395,6 @@ def parse_args(argv, run_config=None):
             parser.error("MTE 和 MTE+RoCE 使用独立精度/性能轮，A/B 参数适用于 URMA")
         if args.perf_scope not in ("all", "memory"):
             parser.error("MTE 和 MTE+RoCE 支持 perf_scope=all 或 memory")
-    elif args.precision == "w4a4":
-        parser.error("URMA 暂不支持 W4A4。单机使用 --backend mte，EP32 使用 --backend mte_roce")
     if args.peer_python is not None:
         if args.ep_size != 32 or args.node_ip is None or args.node_rank is not None:
             parser.error("peer_python 只适用于 UBX EP32 自动启动")
@@ -507,12 +510,13 @@ def parse_args(argv, run_config=None):
     except (OSError, ValueError, AttributeError, KeyError, TypeError) as error:
         parser.error(f"无法读取 {config_source}：{error}")
 
-    supported = A8_PRECISIONS if args.backend == "urma" else tuple(MMA_TYPES)
+    supported = tuple(MMA_TYPES)
     if args.cascade_stage == "decode":
         supported = tuple(p for p in decode_cascade_precisions(model) if p in supported)
-    shared_precisions = {"w4a8", "w4a4"} if not roce or activation == "swiglu" else {"w4a4"}
     if model["num_shared_experts"]:
-        supported = tuple(p for p in supported if p in shared_precisions)
+        if roce and activation != "swiglu":
+            parser.error("MTE+RoCE 共享专家要求 SwiGLU")
+        supported = tuple(p for p in supported if p == "w4a8")
     wanted = supported if args.precision in (None, "all") else (args.precision,)
     if args.mode == "compare" and args.precision is None:
         wanted = comparison_precisions
@@ -536,12 +540,10 @@ def parse_args(argv, run_config=None):
             validate_cascade_comparison(args.cascade_stage, model, args.bs, args.mode, selected, args.dual_reference)
         except ValueError as error:
             parser.error(str(error))
-    if args.input is not None and any(input_kind(precision) != args.input for precision in selected):
-        parser.error("W4A4 需要 fp4 输入，W4A8/W8A8 需要 fp8 输入，混合精度可省略 --input")
-    if args.timer and args.backend == "mte" and selected - {"w4a8", "w4a4"}:
-        parser.error("本机 MTE 设备 timer 请指定 w4a8 或 w4a4")
-    if model["num_shared_experts"] and selected - shared_precisions:
-        parser.error("共享专家要求 W4A8 或 W4A4，MTE+RoCE 的 W4A8 需要 SwiGLU")
+    if args.timer and args.backend == "mte" and selected - {"w4a8"}:
+        parser.error("本机 MTE 设备 timer 请指定 w4a8")
+    if model["num_shared_experts"] and selected - {"w4a8"}:
+        parser.error("共享专家要求 W4A8")
     return args
 
 
@@ -635,19 +637,15 @@ def config_for(args, precision):
     return path
 
 
-def input_kind(precision):
-    return "fp4" if precision == "w4a4" else "fp8"
-
-
-def case_args(args, precision, config):
-    return ["--config", str(config), "--bs-values", str(args.bs), "--input", input_kind(precision), "--routing", args.routing]
+def case_args(args, config):
+    return ["--config", str(config), "--bs-values", str(args.bs), "--input", "fp8", "--routing", args.routing]
 
 
 def prepare_golden(python, env, args, precision, config, *, reuse_only=False):
     first = args.node_rank * args.ranks_per_node
     summary = args.output_dir / f"golden-{precision}-node{args.node_rank}.json"
     command = [
-        python, "-P", str(SCRIPT.with_name("ubx_prepare_golden.py")), *case_args(args, precision, config),
+        python, "-P", str(SCRIPT.with_name("ubx_prepare_golden.py")), *case_args(args, config),
         "--golden-dir", env["GOLDEN_DIR"], "--check-tokens", args.check_tokens, "--ep-size", str(args.ep_size),
         "--ranks", f"{first}-{first + args.ranks_per_node - 1}", "--workers", args.golden_workers,
         "--chunk-tokens", "128", "--summary", str(summary),
@@ -782,7 +780,7 @@ def run_case(python, env, args, mode, precision, config):
     command = [
         python, "-c", "from torch.distributed.run import main; main()", *rendezvous,
         f"--nproc-per-node={args.ranks_per_node}", "--max-restarts=0", "--module", f"{MODULE}.benchmark",
-        *case_args(args, precision, config), "--mode", mode, "--output-dir", str(output), *extra,
+        *case_args(args, config), "--mode", mode, "--output-dir", str(output), *extra,
     ]
     print(f"[UBX] node{args.node_rank} {mode} {MMA_TYPES[precision]}", flush=True)
     with (args.output_dir / f"{name}-node{args.node_rank}.log").open("w", encoding="utf-8") as log:
@@ -795,7 +793,7 @@ def run_case(python, env, args, mode, precision, config):
 
 def run_single_accuracy(python, env, args, precision, config, check_device):
     spec = json.loads(config.read_text(encoding="utf-8"))
-    inputs = dict(ep_size=args.ep_size, bs=args.bs, input=input_kind(precision), routing=args.routing,
+    inputs = dict(ep_size=args.ep_size, bs=args.bs, input="fp8", routing=args.routing,
                   check_tokens=int(args.check_tokens))
     lock_id = cache_key(dict(inputs, model=spec["model"], seed=spec["seed"]))
     lock_path = Path(env["GOLDEN_DIR"]) / ".ubx-launch-locks" / f"{lock_id}.lock"
@@ -1008,9 +1006,8 @@ def main(argv=None, run_config=None):
     print(f"[UBX] {args.backend} EP{args.ep_size} B{args.bs} {args.routing} {config_name}\n[UBX] 输出目录 {args.output_dir}", flush=True)
     @cache
     def check_device(precision):
-        extra = [args.backend, precision] if args.backend != "urma" else []
-        check_native_timer = args.backend == "mte_roce" or (args.backend == "mte" and precision == "w4a4")
-        if check_native_timer and args.timer and args.stage != "prepare":
+        extra = [args.backend] if args.backend != "urma" else []
+        if args.backend == "mte_roce" and args.timer and args.stage != "prepare":
             extra.append("1")
         subprocess.run(
             [python, "-P", DEVICE_CHECK, str(args.ranks_per_node), str(int(precision == "w8a8" and args.backend == "urma")), *extra],
@@ -1096,7 +1093,7 @@ def pod_settings(path, data):
         raise ValueError("950POD 支持 perf_scope=all 或 memory")
     validate_memory_scope(args)
     if args.backend != "mte" or args.mode not in {"accuracy", "perf"} or args.precision not in {*MMA_TYPES, "all"}:
-        raise ValueError("950POD 使用 MTE，mode 支持 accuracy 或 perf，precision 支持 a8w4、a8w8、a4w4 或 all")
+        raise ValueError("950POD 使用 MTE，mode 支持 accuracy 或 perf，precision 支持 a8w4、a8w8 或 all")
     if args.ep_size not in (4, 8, 16, 32):
         raise ValueError("950POD 支持 EP4/8/16/32")
     args.ranks_per_node = min(args.ep_size, POD_RANKS)
@@ -1134,27 +1131,27 @@ def pod_settings(path, data):
     if args.cascade_stage == "decode":
         precisions = decode_cascade_precisions(model)
     elif model["num_shared_experts"]:
-        precisions = ("w4a8", "w4a4")
+        precisions = ("w4a8",)
     else:
         precisions = tuple(MMA_TYPES)
     args.precisions = precisions if args.precision == "all" else (args.precision,)
     if args.timer and (args.mode != "perf" or args.cascade_stage or "w8a8" in args.precisions):
-        raise ValueError("950POD 设备 timer 需要 A8W4 或 A4W4 原生融合 perf")
+        raise ValueError("950POD 设备 timer 需要 A8W4 原生融合 perf")
     if args.cascade_stage:
         validate_cascade_comparison(args.cascade_stage, model, args.bs, args.mode, args.precisions, args.dual_reference)
     if model["num_shared_experts"] and "w8a8" in args.precisions:
-        raise ValueError("950POD 共享专家要求 W4A8 或 W4A4")
+        raise ValueError("950POD 共享专家要求 W4A8")
     args.python = args.python or args.base_python
     return args
 
 
-def pod_perf_report(args, output, first, spec, precision):
+def pod_perf_report(args, output, first, spec):
     for rank in range(first, first + args.ranks_per_node):
         rank_dir = output / f"rank_{rank}"
         manifest_path = rank_dir / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         expected = dict(backend="mte", mode="perf", ep_size=args.ep_size, rank=rank,
-                        ranks_per_node=args.ranks_per_node, routing=args.routing, input=input_kind(precision))
+                        ranks_per_node=args.ranks_per_node, routing=args.routing, input="fp8")
         if args.cascade_stage:
             expected[f"compare_{args.cascade_stage}_cascade"] = True
         if args.perf_scope == "memory":
@@ -1192,7 +1189,7 @@ def run_pod_case(args, precision, python, env, first):
     spec = dict(args.spec, model=dict(args.spec["model"], mma_type=MMA_TYPES[precision]), bs_values=[args.bs])
     config = args.output_dir / f"config-{label}.json"
     config.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
-    options = case_args(args, precision, config)
+    options = case_args(args, config)
     if args.mode == "accuracy":
         options.extend(("--check-tokens", str(args.check_tokens), "--golden-dir", str(Path(args.golden_dir).resolve())))
     if args.mode == "accuracy" and not args.skip_golden:
@@ -1207,8 +1204,6 @@ def run_pod_case(args, precision, python, env, first):
     if args.golden_only:
         return
 
-    if precision == "w4a4":
-        options.extend(("--backend", "mte"))
     run = f"{args.mode}-{precision}" if args.precision == "all" else args.mode
     if args.accuracy_stage:
         run += f"-{args.accuracy_stage}"
@@ -1236,7 +1231,7 @@ def run_pod_case(args, precision, python, env, first):
     with (args.output_dir / f"{args.mode}-{label}.log").open("w", encoding="utf-8") as log:
         run_logged(command, env, log)
         if args.mode == "perf":
-            summary = pod_perf_report(args, output, first, spec, precision)
+            summary = pod_perf_report(args, output, first, spec)
             print(summary, file=log)
             print(summary, flush=True)
             return

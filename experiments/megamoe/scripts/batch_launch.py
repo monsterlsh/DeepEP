@@ -23,6 +23,8 @@ from run_directory import create_run_directory  # noqa: E402
 
 sys.path.pop(0)
 
+PRECISIONS = {"fp8xfp4": "a8w4", "fp8xfp8": "a8w8"}
+
 
 def select_hosts(config, ep, master=None, ranks_per_node=8):
     hosts = config["hosts"]
@@ -86,6 +88,9 @@ def make_plan(args):
     if not config_path.is_file():
         config_path = root / "experiments/megamoe/python/deep_ep_experimental/megamoe/configs" / (args.config + ".json")
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    mma_type = config["model"].get("mma_type", "fp8xfp4")
+    if mma_type not in PRECISIONS:
+        raise ValueError(f"Unsupported model.mma_type {mma_type!r}; choose fp8xfp4 or fp8xfp8")
     if args.bs_values is not None:
         config["bs_values"] = [int(value) for value in args.bs_values.split(",")]
     batches = config["bs_values"]
@@ -148,7 +153,7 @@ def make_plan(args):
 
 def batch_run_label(plan):
     model = plan["config"]["model"]
-    precision = {"fp8xfp4": "a8w4", "fp8xfp8": "a8w8", "fp4xfp4": "a4w4"}[model.get("mma_type", "fp8xfp4")]
+    precision = PRECISIONS[model.get("mma_type", "fp8xfp4")]
     mode = "prepare" if plan["prepare_only"] else plan["mode"]
     activation = model.get("activation", "swiglu")
     batches = plan["config"]["bs_values"]

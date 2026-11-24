@@ -92,19 +92,6 @@ def test_fp8_cascade_passes_e8m0_as_full_quantization_scales():
     assert "antiquant_scale" not in call and "weight_dtype" not in call
 
 
-def test_fp4_cascade_uses_two_packed_operands_and_mx_scales():
-    cascade = SimpleNamespace(
-        mma_type="fp4xfp4", fp4="e2m1x2", e8m0_operator="e8m0",
-        npu=SimpleNamespace(npu_grouped_matmul=lambda **kwargs: [kwargs]),
-        torch=SimpleNamespace(uint8=np.uint8, bfloat16="bf16"),
-    )
-    scale = np.array([125, 131], dtype=np.uint8)
-    call = CascadeReference._gmm(cascade, "packed x", scale, "counts", ("packed w", scale))
-    assert call["x_dtype"] == call["weight_dtype"] == "e2m1x2"
-    assert call["scale_dtype"] == call["per_token_scale_dtype"] == "e8m0"
-    assert call["scale"][0] is scale and "antiquant_scale" not in call
-
-
 def test_local_moe_decomposition_and_empty_expert():
     rng = np.random.default_rng(7)
     x = rng.normal(size=(3, 32)).astype(np.float32) * 0.1
@@ -250,16 +237,12 @@ def test_gelu_uses_scalar_erf_contract_not_tanh_approximation():
     assert np.max(np.abs(gelu(x) - tanh_approximation)) > 1e-4
 
 
-def test_fp4_mx32_packing_scale_and_exact_decode():
-    x = np.full((1, 64), 0.5, dtype=np.float32)
-    x[:, 32:] = 2.0
-    codes, scales = quantize_activation(x, "fp4xfp4")
-    assert codes.shape == (1, 32) and codes.dtype == np.uint8
-    np.testing.assert_array_equal(scales, [[124, 126]])
-    np.testing.assert_array_equal(dequantize_activation(codes, scales, "fp4xfp4"), x)
+def test_reference_rejects_unsupported_activation_precision():
+    with pytest.raises(ValueError, match="mma_type must be fp8xfp4 or fp8xfp8"):
+        quantize_activation(np.zeros((1, 64)), "fp4xfp4")
 
 
-@pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8", "fp4xfp4"])
+@pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8"])
 def test_single_projection_gelu_weights_happen_before_mx_quant(mma_type):
     rng = np.random.default_rng(101)
     x = rng.normal(size=(4, 64)).astype(np.float32) * 0.2

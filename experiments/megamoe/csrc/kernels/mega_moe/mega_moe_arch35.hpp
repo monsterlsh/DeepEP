@@ -59,13 +59,8 @@ public:
     struct QuantTraits<E5M2_QUANT> {
         using OutType = fp8_e5m2_t;
     };
-    template <>
-    struct QuantTraits<E2M1_QUANT> {
-        using OutType = fp4x2_e2m1_t;
-    };
     using QuantOutType = typename QuantTraits<QuantMode>::OutType;
-    using ActivationType =
-        typename std::conditional<Std::IsSame<QuantOutType, fp4x2_e2m1_t>::value, uint8_t, QuantOutType>::type;
+    using ActivationType = QuantOutType;
     using QuantScaleOutType = typename std::conditional<(QuantMode >= E5M2_QUANT), fp8_e8m0_t, float>::type;
     __aicore__ inline MegaMoe(){};
     __aicore__ inline void Init(GM_ADDR context, GM_ADDR x, GM_ADDR topkIds, GM_ADDR topkWeights, GM_ADDR weight1,
@@ -149,15 +144,9 @@ protected:
     uint32_t moeExpertPerRank_ = 0;
     uint32_t mGroupsPerWave_ = 1U;
 
-    static constexpr uint32_t A_ELEMS_PER_BYTE = PackedElementTraits<QuantOutType>::ELEMENTS_PER_BYTE;
-    static constexpr uint32_t B_ELEMS_PER_BYTE = PackedElementTraits<Weight1Type>::ELEMENTS_PER_BYTE;
-    // ENABLE_A8W4: A8W8 路径（fp8 act + fp4 w1），GMM1 使用 A8W4 prologue（W4→W8 + MMAD）。
+    // ENABLE_A8W4: A8W4 路径（fp8 act + fp4 w1），GMM1 使用 A8W4 prologue（W4→W8 + MMAD）。
     static constexpr bool ENABLE_A8W4 =
         Std::IsSame<Weight1Type, fp4x2_e2m1_t>::value && Std::IsSame<QuantOutType, fp8_e4m3fn_t>::value;
-    // ENABLE_A4W4: A4W4 路径（fp4 act + fp4 weight），GMM2 复用 A8W4 prologue。
-    //             a4w4 场景下 GMM1 走 generic a4w4、GMM2 走 a8w4，避免两段都用 a4w4 导致精度损失过大。
-    static constexpr bool ENABLE_A4W4 =
-        Std::IsSame<Weight1Type, fp4x2_e2m1_t>::value && Std::IsSame<QuantOutType, fp4x2_e2m1_t>::value;
     static constexpr uint32_t GMM1_TILE_M = L1_TILE_M_256;
     static constexpr uint32_t EPILOGUE_TILE_M = TopkWeightsPrefetch ? L1_TILE_M_128 : L1_TILE_M_256;
     QuantProcessScratch<ActivationType> quantScratch_;
@@ -165,14 +154,7 @@ protected:
     SendMaskScratch sendMaskScratch_;
     LocalTensor<int32_t> resetTensor_;
 
-    // GMM2 走 A8W4 且 QuantMode 为 a4w4（E2M1）时，ActivationQuant 输出需提升为 fp8_e4m3fn_t。
-    // 同时当 Weight2 非 fp4 但 QuantMode==E2M1 时（generic GMM2 路径），也需 promotion，
-    // 否则会出现 A=QuantOutType(fp4) vs B=Weight1Type(fp8) 的类型不匹配。
-    using ActivationQuantOutType =
-        typename std::conditional<(QuantMode == E2M1_QUANT), fp8_e4m3fn_t, QuantOutType>::type;
-
-    // ActivationQuant 输出的元素字节密度：fp4 时为 2elem/B，fp8 时为 1elem/B。
-    static constexpr uint32_t C_ELEMS_PER_BYTE = PackedElementTraits<ActivationQuantOutType>::ELEMENTS_PER_BYTE;
+    using ActivationQuantOutType = QuantOutType;
 
     using BlockEpilogue = BlockEpilogueActivationMxQuant<ActivationQuantOutType, bfloat16_t, EPILOGUE_TILE_M, L1_TILE_N,
                                                          TopkWeightsPrefetch>;
@@ -193,7 +175,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::InitInputPrepareConfigs
 {
     aivJob_ = {.jobIndex = aivCoreIdx_, .totalJobs = blockAivNum_};
     quantProcessConfig_ =
-        CreateQuantProcessConfig<ActivationType, QuantScaleOutType, TopkWeightsPrefetch, A_ELEMS_PER_BYTE>(k_, params_);
+        CreateQuantProcessConfig<ActivationType, QuantScaleOutType, TopkWeightsPrefetch>(k_, params_);
     sendMaskConfig_ = CreateSendMaskConfig(params_, sharedPolicy_.routeAiv1Only ? blockIdx_ : aivCoreIdx_);
 }
 
@@ -267,7 +249,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Init(
     params_.expertTokenNumsOutGmAddr = expertTokenNumsOut;
     params_.probsGmAddr = topkWeights;
     params_.workspaceInfo = WorkspaceInfo(workspaceGM, tilingData);
-    params_.peermemInfo = PeermemInfo(g_winRankAddr_[rankId_], tilingData, A_ELEMS_PER_BYTE);
+    params_.peermemInfo = PeermemInfo(g_winRankAddr_[rankId_], tilingData);
     params_.tilingData = tilingData;
     epilogueOp_.Init({.yGmAddr = params_.workspaceInfo.activationQuantDataPtr,
                       .yScaleGmAddr = params_.workspaceInfo.activationQuantScalePtr,
@@ -324,14 +306,14 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::DispatchBuffInit()
     }
 
     const MegaMoeDispatchBufferConfig& bufferConfig = context.bufferConfig;
-    scratch.revTokenElemCnt = commonConfig_.tokenHiddenDim / A_ELEMS_PER_BYTE;
+    scratch.revTokenElemCnt = commonConfig_.tokenHiddenDim;
     scratch.revScaleElemCnt = Ops::Base::CeilDiv(static_cast<int64_t>(commonConfig_.tokenHiddenDim),
                                                  static_cast<int64_t>(MXFP_DIVISOR_SIZE)) *
                               MXFP_MULTI_BASE_SIZE;
     uint32_t cumsumInfoTensorSize = Ops::Base::CeilAlign(
         static_cast<int64_t>(commonConfig_.worldSize * commonConfig_.moeExpertPerRank * sizeof(int32_t)),
         static_cast<int64_t>(ALIGN_32));
-    if constexpr (ENABLE_A8W4 || ENABLE_A4W4) {
+    if constexpr (ENABLE_A8W4) {
         scratch.cumsumInfoGlobalTensor.SetGlobalBuffer(
             reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.cumsumInfoPtr +
                                               static_cast<uint64_t>(cumsumInfoTensorSize) * countWorkspace_.blockIdx));
@@ -710,7 +692,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm2
             gmmAddrInfo.timer = timer_.Enabled() ? &timer_ : nullptr;
         }
         RunGmm2ByMode<COMBINE_NO_QUANT, QuantOutType, ActivationQuantOutType, Weight1Type, QuantScaleOutType,
-                      ENABLE_A8W4, ENABLE_A4W4, GMM1_TILE_M, false, true, false, false>(
+                      ENABLE_A8W4, GMM1_TILE_M, false, true, false, false>(
             gmmExecutionConfig_, gmmAddrInfo, problemShape, runtimeState);
         if constexpr (ENABLE_A8W4) {
             timer_.ClearSlice();
@@ -718,7 +700,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm2
     }
 }
 
-// W4 基类统一执行原 A8W4/A4W4 的专家 GMM2/Combine；派生模板只提供当前专家 slice。
+// W4 基类统一执行原 A8W4 的专家 GMM2/Combine；派生模板只提供当前专家 slice。
 // A8W4 非量化路径在当前 slice 的完整行就绪后发送 token；其他模式保持原分工。
 template <TemplateMegaMoeTypeClass>
 template <bool SourceGmm1Fused>
@@ -866,7 +848,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
         timer_.End(AscendTimer::AIV_INPUT_BUFFER_INIT);
         timer_.Start(AscendTimer::AIV_QUANT);
     }
-    QuantizeLocalTokens<QuantMode, QuantOutType, ActivationType, TopkWeightsType, TopkWeightsPrefetch>(
+    QuantizeLocalTokens<QuantOutType, ActivationType, TopkWeightsType, TopkWeightsPrefetch>(
         aivJob_, commonConfig_, params_, quantProcessConfig_, quantScratch_);
     if constexpr (g_coreType == AIV) {
         if (decodeInputReady_) {
@@ -897,7 +879,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
         timer_.End(AscendTimer::AIV_RESET);
     }
     if (sharedExpertNum_ > 0) {
-        PrepareSharedExpertInput<ActivationType, QuantScaleOutType, A_ELEMS_PER_BYTE>(
+        PrepareSharedExpertInput<ActivationType, QuantScaleOutType>(
             aivJob_, commonConfig_, params_, quantProcessConfig_, sharedExpertPrepareScratch_);
     }
     if (decodeInputReady_) {

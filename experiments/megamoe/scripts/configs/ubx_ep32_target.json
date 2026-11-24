@@ -8,13 +8,13 @@
       "backend": ["mte_roce", "urma"],
       "activation": ["gelu", "swiglu"],
       "weighting": ["auto", "early", "late"],
-      "input": ["fp8", "fp4"],
+      "input": ["fp8"],
       "routing": ["balanced", "skewed", "random", "random-balanced"],
       "config.model.topk_weights_type": [0, 1],
       "按 backend 选择": {
         "mte_roce": {
           "mode": ["accuracy", "perf", "both"],
-          "precision": ["a8w4", "a8w8", "a4w4", "all"],
+          "precision": ["a8w4", "a8w8", "all"],
           "timer": [false, true]
         },
         "urma": {
@@ -31,13 +31,13 @@
         "stage": ["prepare", "run"]
       }
     },
-    "组合约束": "URMA 的 SwiGLU 用 Finalize 加权。compare 由脚本选择两组激活与加权，设置 weighting: auto，并省略外层 activation。input 会由 precision 自动推导，手动指定时 a8w4/a8w8 对应 fp8、a4w4 对应 fp4。",
+    "组合约束": "URMA 的 SwiGLU 用 Finalize 加权。compare 由脚本选择两组激活与加权，设置 weighting: auto，并省略外层 activation。input 使用 fp8。",
     "schema_version / config.schema_version": "运行配置和内嵌模型配置的格式版本，均为 1。",
     "machine / ep_size": "UBX 双机共 32 卡，每台 16 卡。",
     "backend": "mte_roce 用于机内 MTE 和跨机 RoCE。urma 用于 URMA 通信，也支持 compare。",
     "weighting": "auto 按模型或激活预设决定，early 在量化前加权，late 在 Finalize 加权。",
     "mode": "accuracy 只测精度，perf 只测性能，both 先测精度再测性能。设备 timer A/B 对照使用 URMA 的 compare 模式。",
-    "precision / config.model.mma_type": "a8w4、a8w8、a4w4 分别表示 FP8×FP4、FP8×FP8、FP4×FP4，激活精度在前。all 跑所选后端支持的精度。脚本根据外层 precision 设置每轮的 mma_type。",
+    "precision / config.model.mma_type": "a8w4、a8w8 分别表示 FP8×FP4、FP8×FP8，激活精度在前。all 跑所选后端支持的精度。脚本根据外层 precision 设置每轮的 mma_type。",
     "node_ip / master_port / shmem_port": "node_ip 依次填节点 0、节点 1 的 IPv4。节点 0 通过 SSH 拉起节点 1，默认取第一项为 torchrun 和 SHMEM 主地址。两个端口应不同。",
     "comparison.arms": "A 组 gelu 在量化前加权，B 组 swiglu 在 Finalize 加权。外层 activation 选其中一组，外层 mode 控制测精度、性能还是 A/B。",
     "timer": "设为 true 时，MTE+RoCE 在正式测量后另跑一轮，采集首窗 trace。两台节点都需要安装开启 DEEPEP_MEGAMOE_TIMER 的新版 wheel。",

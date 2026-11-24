@@ -30,8 +30,8 @@ else:
 
 TRANSPORT = {"mte": "shmem_mte", "mte_roce": "shmem_mte_roce"}
 TIMER_MODES = {
-    "mte": {"fp8xfp4": ("w4a8", "fp8"), "fp4xfp4": ("w4a4", "fp4")},
-    "mte_roce": {"fp8xfp4": ("w4a8", "fp8"), "fp8xfp8": ("w8a8", "fp8"), "fp4xfp4": ("w4a4", "fp4")},
+    "mte": {"fp8xfp4": "w4a8"},
+    "mte_roce": {"fp8xfp4": "w4a8", "fp8xfp8": "w8a8"},
 }
 GMM = ("AIC_GMM1", "AIC_GMM2")
 MTE_FAMILIES = (*GMM, "AIV_DISPATCH", "AIV_COMBINE")
@@ -75,7 +75,7 @@ def read_job(root, arm, *, platform="ubx"):
     mma_type = model["mma_type"]
     require(mma_type in TIMER_MODES[backend],
             f"{root}: {backend} native overlap supports {', '.join(TIMER_MODES[backend])}")
-    precision, input_kind = TIMER_MODES[backend][mma_type]
+    precision = TIMER_MODES[backend][mma_type]
     require(model["activation"] == arm and type(model["topk_weights_type"]) is int
             and model["topk_weights_type"] == int(arm == "gelu")
             and model["num_shared_experts"] == 0,
@@ -102,7 +102,7 @@ def read_job(root, arm, *, platform="ubx"):
     require(first["routing"] in ("balanced", "random", "random-balanced", "skewed"), f"{root}: invalid routing")
     manifests = read_manifests([root], world)
     agreed = dict(
-        config=config, input=input_kind, backend=backend, ep_size=world, device_communication=transport,
+        config=config, input="fp8", backend=backend, ep_size=world, device_communication=transport,
         ranks_per_node=local, mode="perf", perf_scope="all", numerical_contract=CONTRACTS[arm],
         timer_scope="first_window_only", run_id=run_id, build=build, routing=first["routing"],
         paired_weights=first["paired_weights"], timer_ranks=timers, window_tokens=window,
@@ -143,7 +143,7 @@ def read_job(root, arm, *, platform="ubx"):
     return dict(
         root=root, run_id=run_id, backend=backend, ep_size=world, ranks_per_node=local, bs=bs,
         config=config, build=build, routing=first["routing"], paired_weights=first["paired_weights"],
-        precision=precision, input=input_kind,
+        precision=precision, input="fp8",
         window_tokens=window, windows_per_forward=windows, timer_token_range_half_open=[0, min(bs, window)],
         timer_ranks=sorted(timers), devices=devices, cases=cases,
         host_e2e=dict(rank_max_mean_us=latency, global_input_tokens_per_second=throughput, rank_max_rounds_us=slowest),

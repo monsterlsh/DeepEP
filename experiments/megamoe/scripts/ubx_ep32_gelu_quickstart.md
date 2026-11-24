@@ -140,7 +140,7 @@ PY
 
 生成的配置保留预设的 `backend=mte_roce`、`ep_size=32`、`config.model.activation=gelu` 和模型参数。手动模式通过 `node_rank` 区分两台，生成配置时会移除用于 SSH 自动启动的 `node_ip`。性能测试直接跑 `stage=run`。
 
-要换量化精度，修改运行 JSON 外层的 `precision`，可选 `a8w4`、`a8w8`、`a4w4`。要调整每卡 token 数，修改 `config.bs_values`。手动启动时，两台的负载和精度使用相同的值。
+要换量化精度，修改运行 JSON 外层的 `precision`，可选 `a8w4` 或 `a8w8`。要调整每卡 token 数，修改 `config.bs_values`。手动启动时，两台的负载和精度使用相同的值。
 
 ## 3. 查看性能结果
 

@@ -12,24 +12,27 @@ ROWS = {(row.case, row.machine, row.ep_size): row for row in matrix.cases()}
 
 
 def test_matrix_covers_each_workload_once_per_topology():
-    assert len(ROWS) == len(list(matrix.cases())) == 403
+    assert len(ROWS) == len(list(matrix.cases())) == 291
     for machine in matrix.MACHINES:
         for ep in (4, 8, 16):
             rows = [r for r in ROWS.values() if r.machine == machine and r.ep_size == ep]
-            assert Counter(r.case[0] for r in rows) == {"R": 7, "C": 3, "K": 18, "L": 3, "D": 24}
+            assert Counter(r.case[0] for r in rows) == {"R": 7, "C": 3, "K": 12, "L": 2, "D": 16}
             assert len({(r.bs, r.hidden, r.intermediate, r.experts, r.topk, r.shared, r.activation,
-                         r.weight_mode, r.precision, r.groupsize) for r in rows}) == 55
+                         r.weight_mode, r.precision, r.groupsize) for r in rows}) == 40
+    for row in ROWS.values():
+        if row.case[0] in "KLD":
+            assert row.precision == {1: "a8w4", 2: "a8w8"}[int(row.case[1:]) % 3]
     originals = [r for r in ROWS.values() if r.ep_size == 32 or
                  (r.case.startswith("C") and (r.machine, r.ep_size) == ("950pod", 8)) or
                  (r.case.startswith("K") and (r.machine, r.ep_size) == ("ubx", 16))]
     assert {r.case for r in originals} == {f"{family}{i:02}" for family, count in
                                            (("R", 7), ("C", 3), ("K", 54), ("L", 6), ("D", 24))
-                                           for i in range(1, count + 1)}
+                                           for i in range(1, count + 1) if family in ("R", "C") or i % 3}
 
 
 @pytest.mark.parametrize("name,machine,ep,phase,expected", [
-    ("D12", "950pod", 4, "perf", "groupsize=256"),
-    ("D24", "ubx", 16, "perf", "groupsize=512"),
+    ("D11", "950pod", 4, "perf", "groupsize=256"),
+    ("D23", "ubx", 16, "perf", "groupsize=512"),
     ("L04", "950pod", 4, "full", "200"),
     ("L01", "ubx", 4, "full", "200"),
     ("R07", "950pod", 32, "perf", "1 GiB"),
@@ -57,10 +60,10 @@ def test_cpu_golden_remains_available_for_current_full_batch_limit():
     ("R07", "950pod", 8, "perf"),
     ("C01", "ubx", 8, "decode"),
     ("C03", "950pod", 4, "decode"),
-    ("K18", "ubx", 4, "accuracy-skewed"),
+    ("K17", "ubx", 4, "accuracy-skewed"),
     ("K53", "950pod", 8, "golden-skewed"),
     ("K44", "950pod", 4, "prefill"),
-    ("K54", "950pod", 16, "prefill"),
+    ("K53", "950pod", 16, "prefill"),
     ("K20", "ubx", 32, "timer"),
     ("L02", "ubx", 8, "prefill"),
     ("L04", "950pod", 16, "perf"),

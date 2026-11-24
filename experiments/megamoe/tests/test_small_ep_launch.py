@@ -22,7 +22,7 @@ def test_local_devices_workers_golden_and_trace_use_requested_ep(
     model = launcher.read_run_config(launcher.CONFIG_DIR / "target_gelu_k25.json")
     model["model"]["num_experts"] = 384
     model["bs_values"] = [96]
-    job = dict(schema_version=1, machine=machine, mode=mode, precision="a4w4", ep_size=ep, backend="mte",
+    job = dict(schema_version=1, machine=machine, mode=mode, precision="a8w4", ep_size=ep, backend="mte",
                config=model, output_dir=str(tmp_path / "out"), golden_dir=str(tmp_path / "golden"),
                master_addr="192.0.2.1", timer=mode == "perf", profile_memory_peak=False, check_tokens=1)
     if machine == "950pod":
@@ -62,7 +62,9 @@ def test_local_devices_workers_golden_and_trace_use_requested_ep(
             return
         assert {f"--nproc-per-node={local}", f"--nnodes={ep // local}"} <= set(command)
         assert option("--mode") == mode
-        assert option("--backend") == "mte" and option("--input") == "fp4"
+        assert option("--input") == "fp8"
+        if machine == "ubx":
+            assert option("--backend") == "mte"
         if machine == "950pod":
             assert f"--node-rank={node}" in command
         if mode == "perf":
@@ -73,7 +75,7 @@ def test_local_devices_workers_golden_and_trace_use_requested_ep(
             case = directory / "bs_96"
             case.mkdir(parents=True)
             manifest = dict(mode=mode, ep_size=ep, ranks_per_node=local, rank=rank, config=spec, backend="mte",
-                            input="fp4", routing="balanced")
+                            input="fp8", routing="balanced")
             (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             if mode == "perf":
                 timing = dict(rank_max_mean_us=2, global_input_tokens_per_second=1)

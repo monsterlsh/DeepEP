@@ -358,23 +358,23 @@ def test_early_weights_shared_expert_unweighted_and_cache_contract(config):
 
 @pytest.mark.parametrize("world,topk", [(16, 32), (32, 25)])
 @pytest.mark.parametrize("activation,early", [("gelu", 1), ("swiglu", 0)])
-@pytest.mark.parametrize("mma", ["fp8xfp4", "fp8xfp8", "fp4xfp4"])
+@pytest.mark.parametrize("mma", ["fp8xfp4", "fp8xfp8"])
 def test_ubx_mx_routes_across_expert_owners(config, world, topk, activation, early, mma):
     config["model"].update(num_experts=32, num_shared_experts=0, num_topk=topk, activation=activation,
                            topk_weights_type=early, mma_type=mma)
     source = world - 1
-    spec = golden.contract(config, world, 3, "fp4" if mma == "fp4xfp4" else "fp8", "balanced", 0)
+    spec = golden.contract(config, world, 3, "fp8", "balanced", 0)
     actual = golden.generate(config, spec, [source], workers=1)[source]
     expected = naive(config, world, source, 3, "balanced", 0)
     for output, reference in zip(actual, expected):
         np.testing.assert_array_equal(output, reference)
 
 
-@pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8", "fp4xfp4"])
+@pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8"])
 def test_gelu_prequant_weights_all_precisions_match_independent_oracle(config, mma_type):
     config["model"].update(activation="gelu", mma_type=mma_type)
-    config["model"]["num_shared_experts"] = 0 if mma_type == "fp4xfp4" else 1
-    input_kind = "fp4" if mma_type == "fp4xfp4" else "fp8"
+    config["model"]["num_shared_experts"] = 1
+    input_kind = "fp8"
     spec = golden.contract(config, 2, 7, input_kind, "random", 0)
     assert spec["numerical_contract"] == "ascend_pre_quant_route_weight_v1"
     actual = golden.generate(config, spec, [0, 1], workers=2, chunk_tokens=2)
@@ -385,3 +385,11 @@ def test_gelu_prequant_weights_all_precisions_match_independent_oracle(config, m
     changed = copy.deepcopy(config)
     changed["model"]["activation"] = "swiglu"
     assert golden.contract(changed, 2, 7, input_kind, "random", 0) != spec
+
+
+def test_golden_rejects_unsupported_activation_formats(config):
+    with pytest.raises(ValueError, match="Golden input"):
+        golden.contract(config, 2, 7, "fp4", "random", 0)
+    config["model"]["mma_type"] = "fp4xfp4"
+    with pytest.raises(ValueError, match="mma_type must"):
+        golden.contract(config, 2, 7, "bf16", "random", 0)

@@ -10,7 +10,7 @@ Golden contract. This module does not import Torch or initialize HCCL on import.
 
 import math
 import struct
-from .numerics import normalize_clamp
+from .numerics import normalize_clamp, validate_mma_type
 
 
 def _positive_fp32(name, value):
@@ -95,6 +95,8 @@ class CascadeReference:
     """
 
     def __init__(self, model, raw, shared_raw=None, *, host_group):
+        self.mma_type = model.get("mma_type", "fp8xfp4")
+        validate_mma_type(self.mma_type)
         self.torch, self.npu, self.dist = _runtime()
         _check_process_group(self.dist, host_group)
         self.rank, self.world = host_group.rank(), host_group.size()
@@ -121,13 +123,10 @@ class CascadeReference:
         self.topk_weights_type = model.get("topk_weights_type", int(self.activation == "gelu"))
         if type(self.topk_weights_type) is not int or self.topk_weights_type not in (0, 1):
             raise ValueError("topk_weights_type must be 0 or 1")
-        self.mma_type = model.get("mma_type", "fp8xfp4")
-        if self.mma_type not in ("fp8xfp4", "fp8xfp8", "fp4xfp4"):
-            raise ValueError("mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4")
         if self.activation == "gelu" and "activation_clamp" in model:
             raise ValueError("activation_clamp is only defined for SwiGLU")
         if self.mma_type == "fp8xfp8" and self.shared_experts:
-            raise ValueError("Shared experts in the cascade require A8W4 or A4W4")
+            raise ValueError("Shared experts in the cascade require A8W4")
         self._situ_glu = None
         if self.activation == "situglu":
             # aclnnSituGlu multiplies by FP32 reciprocals internally; reject
@@ -147,10 +146,6 @@ class CascadeReference:
         self.e8m0 = self._tensor_dtype("float8_e8m0fnu")
         self.e8m0_operator = self._operator_dtype("float8_e8m0fnu")
         self.fp4 = None if self.mma_type == "fp8xfp8" else self._operator_dtype("float4_e2m1fn_x2")
-        if self.mma_type == "fp4xfp4":
-            self.activation_storage_dtype = self.torch.uint8
-        else:
-            self.activation_storage_dtype = self.fp8
         self.weights = self._prepare_weights(raw, self.local_experts, "routed")
         if self.shared_experts:
             self.shared_weights = self._prepare_weights(shared_raw, self.shared_experts, "shared")
@@ -204,11 +199,9 @@ class CascadeReference:
             # The raw GMM1 rows are [gate | up], including at decode batch sizes.
             if fp8_weights:
                 data = data.view(self.fp8)
-            elif self.mma_type == "fp8xfp4":
+            else:
                 data = self.npu.npu_format_cast(data, 29, customize_dtype=self.fp8, input_dtype=self.fp4)
                 scale = scale.view(self.e8m0)
-            # Native MXFP4 grouped matmul accepts E2M1 weights in ND format,
-            # with x_dtype and weight_dtype describing the packed uint8 storage.
             prepared.append((data.transpose(1, 2), scale.transpose(1, 2)))
         return tuple(prepared)
 
@@ -220,12 +213,8 @@ class CascadeReference:
         return scale.contiguous().view(self.e8m0).reshape(rows, k // 64, 2)
 
     def _quantize(self, x):
-        destination = self.fp4 if self.mma_type == "fp4xfp4" else self.fp8
-        data, scale = self.npu.npu_dynamic_mx_quant(x, axis=-1, dst_type=destination, block_size=32)
-        if self.mma_type == "fp4xfp4" and data.element_size() == 1:
-            data = data.view(self.torch.uint8)
-        expected_shape = (x.shape[0], x.shape[1] // (2 if self.mma_type == "fp4xfp4" else 1))
-        if data.dtype != self.activation_storage_dtype or tuple(data.shape) != expected_shape:
+        data, scale = self.npu.npu_dynamic_mx_quant(x, axis=-1, dst_type=self.fp8, block_size=32)
+        if data.dtype != self.fp8 or data.shape != x.shape:
             raise RuntimeError("npu_dynamic_mx_quant returned an unexpected MX activation representation")
         return data, self._normalize_scale(scale, x.shape[0], x.shape[1])
 
@@ -271,15 +260,13 @@ class CascadeReference:
         # Keep the full routing allocation: Finalize requires expandedX and its
         # row map to have matching lengths. Ascend950 GMM permits the group count
         # sum to be smaller than M; only the active prefix participates in GMM.
-        return expanded.view(self.activation_storage_dtype), expanded_scale, row_idx, counts
+        return expanded.view(self.fp8), expanded_scale, row_idx, counts
 
     def _gmm(self, data, scale, counts, weight):
-        if self.mma_type in ("fp8xfp8", "fp4xfp4"):
+        if self.mma_type == "fp8xfp8":
             # Both MX operands are quantized. The operator takes the two E8M0
             # payloads as scale and per_token_scale with explicit dtype enums.
             weight_options = dict(scale=[weight[1]], scale_dtype=self.e8m0_operator)
-            if self.mma_type == "fp4xfp4":
-                weight_options.update(x_dtype=self.fp4, weight_dtype=self.fp4)
             scale = scale.view(self.torch.uint8)
         else:
             weight_options = dict(antiquant_scale=[weight[1]], weight_dtype=self.fp4)
@@ -345,6 +332,14 @@ class CascadeReference:
         result[:active] = (copied_weights * matches).sum(dim=1)
         return result
 
+    def _fp8_input(self, quantized):
+        if not isinstance(quantized, (tuple, list)) or len(quantized) != 2:
+            raise ValueError("Prequantized cascade input requires data and E8M0 scales")
+        data, scale = quantized
+        if data.ndim != 2 or data.shape[1] != self.hidden or data.dtype != self.fp8:
+            raise ValueError("Cascade activation data must be FP8 E4M3 [BS,H]")
+        return data, scale
+
     def forward(self, x, ids, weights, *, input_kind, quantized=None):
         """Return (BF16 local output, int64 local expert receive counts).
 
@@ -359,21 +354,15 @@ class CascadeReference:
             if x.ndim != 2 or x.shape[1] != self.hidden:
                 raise ValueError("Cascade x must have shape [BS, hidden]")
             data, scale = self._quantize(x)
-        elif input_kind in ("fp8", "fp4"):
-            expected_kind = "fp4" if self.mma_type == "fp4xfp4" else "fp8"
-            if input_kind != expected_kind:
-                raise ValueError(f"{self.mma_type} cascade requires input_kind={expected_kind}")
-            if x is not None or not isinstance(quantized, (tuple, list)) or len(quantized) != 2:
+        elif input_kind == "fp8":
+            if x is not None:
                 raise ValueError("Prequantized cascade input requires x=None and the actual buffer views")
-            data, scale = quantized
-            expected_width = self.hidden // (2 if self.mma_type == "fp4xfp4" else 1)
-            if data.ndim != 2 or data.shape[1] != expected_width or data.dtype != self.activation_storage_dtype:
-                raise ValueError("Cascade activation data has the wrong packed shape or dtype")
+            data, scale = self._fp8_input(quantized)
             if data.device.type != "npu" or scale.device != data.device:
                 raise ValueError("Cascade activation data and scales must reside on the same NPU")
             scale = self._normalize_scale(scale, data.shape[0], self.hidden)
         else:
-            raise ValueError("Cascade input_kind must be bf16, fp8 or fp4")
+            raise ValueError("Cascade input_kind must be bf16 or fp8")
         bs = data.shape[0]
         if bs <= 0 or tuple(ids.shape) != (bs, self.topk) or tuple(weights.shape) != (bs, self.topk):
             raise ValueError("Cascade ids/weights must have shape [positive BS, top-k]")

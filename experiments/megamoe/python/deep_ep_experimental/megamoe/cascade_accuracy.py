@@ -39,9 +39,7 @@ def run_cascade_accuracy(args, config, group, rank_dir, sample_peak):
             if args.input == "bf16":
                 activation = torch.from_numpy(x).to(device="npu", dtype=torch.bfloat16)
             else:
-                packed = mma == "fp4xfp4"
-                data = torch.empty((bs, hidden // 2 if packed else hidden), device="npu",
-                                   dtype=torch.uint8 if packed else torch.float8_e4m3fn)
+                data = torch.empty((bs, hidden), device="npu", dtype=torch.float8_e4m3fn)
                 scales = torch.empty((bs, hidden // 32), device="npu", dtype=torch.float8_e8m0fnu)
                 copy_quantized_input(x, mma, data, scales)
                 quantized = (data, scales)

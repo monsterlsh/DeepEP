@@ -108,15 +108,15 @@ def test_only_complete_json_replaces_a_published_record(tmp_path):
 
 
 @pytest.mark.parametrize("dual", [False, True])
-def test_mte_packed_fp4_cache_requires_matching_backend_and_input(tmp_path, dual):
+def test_mte_cache_requires_matching_backend_and_input(tmp_path, dual):
     previous, output = case(tmp_path, dual=dual)
-    identity = dict(previous.identity, backend="mte", input="fp4")
+    identity = dict(previous.identity, backend="mte", input="fp8")
     cache = AccuracyCache(tmp_path, identity)
     with pytest.raises(ValueError, match="manifest does not match"):
         cache.publish(output)
     for manifest_path in output.glob("rank_*/manifest.json"):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest.update(backend="mte", input="fp4")
+        manifest.update(backend="mte", input="fp8")
         if not dual:
             # Legacy single-reference MTE reports omitted the field.
             manifest.pop("dual_reference")
@@ -124,6 +124,10 @@ def test_mte_packed_fp4_cache_requires_matching_backend_and_input(tmp_path, dual
     cache.publish(output)
     assert cache.lookup() == output
     assert previous.lookup() is None
+    manifest_path = output / "rank_0/manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    atomic_write_json(manifest_path, dict(manifest, input="bf16"))
+    assert cache.lookup() is None
 
 
 def test_same_entry_lock_serializes_workers(tmp_path):

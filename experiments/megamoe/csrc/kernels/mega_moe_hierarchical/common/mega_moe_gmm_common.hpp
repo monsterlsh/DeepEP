@@ -31,9 +31,6 @@ namespace GmmKernel {
 template <typename A, typename B>
 inline constexpr bool UsesA8W4Prologue = std::is_same_v<A, fp8_e4m3fn_t> && std::is_same_v<B, fp4x2_e2m1_t>;
 
-template <typename A>
-inline constexpr bool UsesNativeFp4Weights = std::is_same_v<A, fp4x2_e2m1_t>;
-
 constexpr uint32_t L1_TILE_K = 256U;
 
 // 根据数据类型路径选择对应的 BlockMmad 实现。

@@ -70,7 +70,7 @@ def test_l04_pairs_profile_both_arms(tmp_path, monkeypatch, options, expected, a
 
 def test_native_timer_rank_list(tmp_path, monkeypatch):
     cfgdir = tmp_path / "configs"
-    data = job(tmp_path, mode="perf", timer=True, precision="a4w4")
+    data = job(tmp_path, mode="perf", timer=True, precision="a8w4")
     args = l0_pod._settings(data, cfgdir, NODES)
     out = tmp_path / "out"
     out.mkdir()
@@ -78,7 +78,7 @@ def test_native_timer_rank_list(tmp_path, monkeypatch):
     commands = []
     monkeypatch.setattr(l0_pod.runner, "run_logged", lambda command, *a: commands.append(command))
     monkeypatch.setattr(l0_pod.runner, "pod_perf_report", lambda *a: "")
-    l0_pod.runner.run_pod_case(args, "w4a4", args.python, {}, 0)
+    l0_pod.runner.run_pod_case(args, "w4a8", args.python, {}, 0)
     command, = commands
     assert "--timer" in command and command[command.index("--timer-ranks") + 1] == ",".join(map(str, range(0, 32, 2)))
     with pytest.raises(ValueError, match="timer"):

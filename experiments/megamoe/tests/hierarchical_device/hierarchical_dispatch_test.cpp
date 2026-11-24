@@ -204,10 +204,9 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     t.roceScratchUbOffset = kScratchOffset;
     t.hierarchicalSequence = invocation;
     Check(UseDecodeRailRouting(&t), "fixture requires the production decode rail layout");
-    const uint32_t packing = mode == GROUPED_MATMUL_MODE_A4W4_NZ ? 2U : 1U;
-    const PeermemSizeParams sizes{capacity, topk, hidden, 12U, 32U, 2U, packing, early, false,
+    const PeermemSizeParams sizes{capacity, topk, hidden, 12U, 32U, 2U, early, false,
                                   TOPO_TYPE_MTE_ROCE, true, 16U};
-    const uint32_t weightOffset = Ops::Base::CeilAlign(hidden / packing, 256U) +
+    const uint32_t weightOffset = Ops::Base::CeilAlign(hidden, 256U) +
                                   Ops::Base::CeilAlign(hidden / 32U, 32U);
     const uint32_t recordBytes = weightOffset + (early ? Ops::Base::CeilAlign(topk * 4U, 32U) : 0U);
     const uint32_t rowBytes = (recordBytes + 479U) / 480U * 512U;
@@ -235,7 +234,7 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     RoceTest::signalObserved = RoceTest::scalarEventSet = RoceTest::mteCanRead = false;
     std::vector<float> weights(bs * topk);
     for (uint32_t i = 0; i < weights.size(); ++i) weights[i] = (static_cast<int32_t>(i % 19) - 7) / 8.0F;
-    Params params{&t, PeermemInfo(local.data(), &t, packing), reinterpret_cast<uint8_t*>(weights.data())};
+    Params params{&t, PeermemInfo(local.data(), &t), reinterpret_cast<uint8_t*>(weights.data())};
     params.peermemInfo.dispatchPacketPtr = local.data() + dataBase;
     params.peermemInfo.relayPayloadPtr = params.peermemInfo.dispatchPacketPtr + capacity * rowBytes;
     params.peermemInfo.compactPtr = params.peermemInfo.relayPayloadPtr + capacity * rowBytes;
@@ -499,8 +498,8 @@ int main()
             CheckDispatch(rank, 7U, 64U, 3584U, 8U, "last", 0xffffffffU);
             // Appending K32 weights adds a 512-byte packet in both cases.
             CheckDispatch(rank, 7U, 32U, 1280U, 32U, "mixed", 257U, GROUPED_MATMUL_MODE_GENERAL, true);
-            CheckDispatch(rank, 7U, 32U, 2560U, 32U, "mixed", 257U, GROUPED_MATMUL_MODE_A4W4_NZ, true);
-            CheckDispatch(rank, 7U, 32U, 2560U, 32U, "mixed", 257U, GROUPED_MATMUL_MODE_A4W4_NZ, false);
+            CheckDispatch(rank, 7U, 32U, 1280U, 32U, "mixed", 257U, GROUPED_MATMUL_MODE_A8W4, true);
+            CheckDispatch(rank, 7U, 32U, 1280U, 32U, "mixed", 257U, GROUPED_MATMUL_MODE_A8W4, false);
             {
                 CheckDispatch(rank, 32U, 64U, 3456U, 8U, "mixed", 257U);
                 CheckDispatch(rank, 7U, 32U, 1024U, 1U, "remote", 0xffffffffU);

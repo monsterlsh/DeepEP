@@ -104,8 +104,7 @@ __aicore__ inline LocalTensor<uint8_t> GetDispatchCopyBuffer(const TokenDispatch
                                                            const TokenDispatchScratch<ActivationType>& scratch,
                                                            int32_t bufferIdx)
 {
-    // Records and their field offsets are measured in bytes. AscendC indexes
-    // an FP4 tensor in logical nibbles, which would halve these offsets.
+    // Records and their field offsets are measured in bytes.
     return LocalTensor<uint8_t>(
         TPosition::VECCALC,
         scratch.copyTmpBaseAddr + static_cast<uint32_t>(bufferIdx) * context.quantTokenScaleAlignBytes,

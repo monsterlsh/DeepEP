@@ -941,7 +941,7 @@ __aicore__ inline void RunReadyGmm1ActivationTileA8W4(
 {
     using GmmConfig =
         GmmKernel::Config<GmmKernel::UsesA8W4Prologue<ElementA, ElementB>, 0, ElementA, ElementB, ElementC,
-                          ElementMxScaleA, ElementMxScaleB, GmmKernel::UsesNativeFp4Weights<ElementA>,
+                          ElementMxScaleA, ElementMxScaleB, false,
                           TopkWeightsPrefetch, false, false, false, true, FuseGateUp>;
     auto config = GmmConfig::BuildGmm1ProblemConfig(problemShape, blockJob, Gmm1TileM);
     auto layouts = GmmConfig::BuildLayouts(config);
@@ -982,7 +982,7 @@ __aicore__ inline void RunGmm1A8W4(BlockEpilogueActivationMxQuant<ElementA, Elem
 {
     using GmmConfig =
         GmmKernel::Config<GmmKernel::UsesA8W4Prologue<ElementA, ElementB>, 0, ElementA, ElementB, ElementC,
-                          ElementMxScaleA, ElementMxScaleB, GmmKernel::UsesNativeFp4Weights<ElementA>,
+                          ElementMxScaleA, ElementMxScaleB, false,
                           TopkWeightsPrefetch, IsShared, false, false, IsWaveFlagGrained, FuseGateUp>;
     auto config = GmmConfig::BuildGmm1ProblemConfig(problemShape, blockJob, Gmm1TileM);
 
@@ -1030,7 +1030,7 @@ __aicore__ inline void RunGmm1A8W4(BlockEpilogueActivationMxQuant<ElementA, Elem
 }
 
 template <typename ActivationType, typename WeightType, typename ActivationOutType, typename QuantScaleType,
-          uint32_t ActivationElementsPerByte, bool EnableA8W4, bool TopkWeightsPrefetch, typename BlockEpilogue>
+          bool EnableA8W4, bool TopkWeightsPrefetch, typename BlockEpilogue>
 __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
     const GmmExecutionConfig& gmmConfig, const MoeSyncWorkspaceLayout& syncLayout, const WorkspaceInfo& workspace,
     const ExpertWeightTensorListAddrs& weights, BlockEpilogue& epilogueOp, GMMAddrInfo& gmmAddrInfo,
@@ -1043,7 +1043,6 @@ __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
     }
 
     constexpr uint32_t weightElementsPerByte = PackedElementTraits<WeightType>::ELEMENTS_PER_BYTE;
-    constexpr uint32_t outputElementsPerByte = PackedElementTraits<ActivationOutType>::ELEMENTS_PER_BYTE;
     int64_t n = Get<N_VALUE>(state.problemShape);
     int64_t k = Get<K_VALUE>(state.problemShape);
     int64_t expertOffset = state.expertIdx;
@@ -1065,7 +1064,7 @@ __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
                                        expertOffset * syncLayout.activationFlagSlotCountPerExpert +
                                        static_cast<uint64_t>(expertMGroupOffset) * INT_CACHELINE;
     gmmAddrInfo.aGlobal =
-        workspace.dispatchRevDataPtr + globalTokenStartIndex * k / ActivationElementsPerByte * sizeof(ActivationType);
+        workspace.dispatchRevDataPtr + globalTokenStartIndex * k * sizeof(ActivationType);
     gmmAddrInfo.aScaleGlobal = workspace.dispatchRevScalePtr + globalTokenStartIndex * scaleK * sizeof(QuantScaleType);
     gmmAddrInfo.bGlobal =
         GetExpertWeightAddr<ActivationType>(weights.weight1, gmmConfig.isPerExpertWeightTensor, state.expertIdx,
@@ -1085,7 +1084,7 @@ __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
             int64_t scaleN = Ops::Base::CeilDiv(n / activationFactor, static_cast<int64_t>(MXFP_DIVISOR_SIZE)) *
                              MXFP_MULTI_BASE_SIZE;
             AscendC::Coord<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t> vecBaseOffset{
-                globalTokenStartIndex * n / activationFactor / outputElementsPerByte,
+                globalTokenStartIndex * n / activationFactor,
                 globalTokenStartIndex * scaleN,
                 expertOffset * syncLayout.activationFlagSlotCountPerExpert / INT_CACHELINE + expertMGroupOffset,
                 0L,
@@ -1118,8 +1117,7 @@ __aicore__ inline void RunGmm1GenericByWeightFormat(const GmmExecutionConfig& gm
                                                     void* persistentBlockMmadContext = nullptr,
                                                     bool allowWeightL2Bypass = false)
 {
-    if (gmmConfig.groupedMatmulMode == GROUPED_MATMUL_MODE_A8W8_NZ ||
-        gmmConfig.groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ) {
+    if (gmmConfig.groupedMatmulMode == GROUPED_MATMUL_MODE_A8W8_NZ) {
         RunGmm1Generic<QuantOutType, ActivationOutType, QuantOutType, bfloat16_t, QuantScaleType, QuantScaleType, true,
                        Gmm1TileM, EpilogueTileM, TopkWeightsPrefetch, IsShared, IsGmm1Interleaved, IsWaveFlagGrained>(
             epilogueOp, gmmParams, problemShape, gmmAddrInfo, runtimeState.startBlockIdx, runtimeState.vecSetSyncCom,
@@ -1145,7 +1143,6 @@ __aicore__ inline void UpdateSharedExpertGmm1GlobalBuffer(const MoeStageCommonCo
                                                           uint32_t sharedExpertIdx)
 {
     constexpr uint32_t weightElemsPerByte = PackedElementTraits<WeightType>::ELEMENTS_PER_BYTE;
-    constexpr uint32_t outputElemsPerByte = PackedElementTraits<ActivationOutType>::ELEMENTS_PER_BYTE;
     uint64_t m = commonConfig.tokenNum;
     uint64_t n = commonConfig.gmm1OutputDim;
     uint64_t k = commonConfig.tokenHiddenDim;
@@ -1176,7 +1173,7 @@ __aicore__ inline void UpdateSharedExpertGmm1GlobalBuffer(const MoeStageCommonCo
 
     if constexpr (g_coreType == AIV) {
         AscendC::Coord<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t> vecBaseOffset{
-            static_cast<int64_t>(expertIdx * m * activationN / outputElemsPerByte),
+            static_cast<int64_t>(expertIdx * m * activationN),
             static_cast<int64_t>(expertIdx * m * scaleN),
             0L,
             0L,

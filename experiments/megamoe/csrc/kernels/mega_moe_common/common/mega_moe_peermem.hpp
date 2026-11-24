@@ -162,11 +162,11 @@ HOST_DEVICE uint32_t CalcSendMaskExpertCapacity(const MegaMoeTilingData* t, uint
 }
 
 // 单 token 的量化记录字节数 = 量化数据 + mx scale（prefetch 场景再拼 topk 权重），按 32B 对齐。
-HOST_DEVICE int64_t CalcQuantTokenScaleBytes(int64_t h, uint32_t elemsPerByte, int64_t topK, bool topkWeightsPrefetch)
+HOST_DEVICE int64_t CalcQuantTokenScaleBytes(int64_t h, int64_t topK, bool topkWeightsPrefetch)
 {
     uint32_t mxScaleNum = Ops::Base::CeilDiv(static_cast<uint32_t>(h), static_cast<uint32_t>(ALIGN_32));
     uint32_t dataBytes =
-        Ops::Base::CeilAlign(static_cast<uint32_t>(h) / elemsPerByte, static_cast<uint32_t>(ALIGN_256)) *
+        Ops::Base::CeilAlign(static_cast<uint32_t>(h), static_cast<uint32_t>(ALIGN_256)) *
         static_cast<uint32_t>(sizeof(int8_t));
     uint32_t scaleBytes = mxScaleNum * static_cast<uint32_t>(sizeof(int8_t));
     uint32_t tokenScaleBytes = Ops::Base::CeilAlign(dataBytes + scaleBytes, static_cast<uint32_t>(ALIGN_32));
@@ -198,7 +198,6 @@ struct PeermemSizeParams {
     int64_t moeExpertPerRank;
     int64_t epWorldSize;
     int64_t yDtypeSize;
-    uint32_t elemsPerByte;
     bool topkWeightsPrefetch;
     bool isQuantCombine;
     int64_t topoType;
@@ -229,7 +228,7 @@ HOST_DEVICE int64_t CalcPeermemLeastSize(const PeermemSizeParams& params)
              : 0;
 
     int64_t tokenScaleBytes =
-        CalcQuantTokenScaleBytes(params.h, params.elemsPerByte, params.topK, params.topkWeightsPrefetch);
+        CalcQuantTokenScaleBytes(params.h, params.topK, params.topkWeightsPrefetch);
     int64_t quantTokenScaleSize = Ops::Base::CeilAlign(params.numMaxTokensPerRank * tokenScaleBytes, ALIGN_512);
     int64_t combineTokenBytes = CalcCombineTokenBytes(params.h, params.yDtypeSize, params.isQuantCombine);
     int64_t combineSendSize =
@@ -251,7 +250,7 @@ struct PeermemInfo {
     GM_ADDR combineSendPtr;
 
     __aicore__ inline PeermemInfo() = default;
-    __aicore__ inline PeermemInfo(GM_ADDR base, const MegaMoeTilingData* tilingData, uint32_t elemsPerByte = 1,
+    __aicore__ inline PeermemInfo(GM_ADDR base, const MegaMoeTilingData* tilingData,
                                   uint32_t serverNum = 1)
     {
         rankSyncInWorldPtr = base;
@@ -277,7 +276,7 @@ struct PeermemInfo {
         }
 
         int64_t tokenScaleBytes =
-            CalcQuantTokenScaleBytes(static_cast<int64_t>(tilingData->h), elemsPerByte,
+            CalcQuantTokenScaleBytes(static_cast<int64_t>(tilingData->h),
                                      static_cast<int64_t>(tilingData->topK), tilingData->topkWeightsPrefetch == 1);
         if (tilingData->topoType == TOPO_TYPE_MTE) {
             quantTokenScalePtr = base + offset;

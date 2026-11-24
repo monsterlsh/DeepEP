@@ -71,6 +71,14 @@ def test_batch_run_label_uses_resolved_case(configuration, options, expected):
     assert launcher.batch_run_label(plan) == expected
 
 
+def test_batch_plan_rejects_unsupported_model_precision(configuration, tmp_path):
+    config = dict(bs_values=[96], model=dict(mma_type="fp4xfp4", num_experts=384))
+    source = tmp_path / "model.json"
+    source.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(ValueError, match="Unsupported model.mma_type"):
+        launcher.make_plan(launcher.parse_args([*configuration, "--config", str(source)]))
+
+
 def test_batch_preparation_passes_readable_unique_directory_to_workers(configuration, tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setitem(sys.modules, "fcntl", SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=lambda *_: None))

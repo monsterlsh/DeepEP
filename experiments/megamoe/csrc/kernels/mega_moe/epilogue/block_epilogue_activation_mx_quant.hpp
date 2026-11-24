@@ -32,7 +32,6 @@
 #include "kernels/mega_moe_common/epilogue/block_epilogue_ub_layout.hpp"
 #include "kernels/mega_moe_common/epilogue/quant/mx_quant_common.hpp"
 #include "kernels/mega_moe_common/epilogue/quant/mx_quant_compute_scale.hpp"
-#include "kernels/mega_moe_common/epilogue/quant/mxfp4_quant.hpp"
 #include "kernels/mega_moe_common/epilogue/quant/mxfp8_quant.hpp"
 
 namespace ActivationQuantMsg {
@@ -165,18 +164,11 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
 {
     AscendC::DataCopyExtParams ub2GmParams{1, 0, 0, 0, 0};
     ub2GmParams.blockCount = blockCount;  // 128
-    if constexpr (AscendC::IsSameType<DataTypeOut, fp4x2_e2m1_t>::value ||
-                  AscendC::IsSameType<DataTypeOut, fp4x2_e1m2_t>::value) {
-        ub2GmParams.blockLen = singleN >> 1;
-        ub2GmParams.dstStride = (n - singleN) >> 1;
-        offset = offset >> 1;
-    } else {
-        uint64_t nDstUbAligned =
-            Ops::Base::CeilAlign(static_cast<uint64_t>(singleN), static_cast<uint64_t>(AscendC::ONE_BLK_SIZE));
-        ub2GmParams.blockLen = singleN;  // 256
-        ub2GmParams.srcStride = (nDstUbAligned - singleN) / AscendC::ONE_BLK_SIZE;
-        ub2GmParams.dstStride = n - singleN;
-    }
+    uint64_t nDstUbAligned =
+        Ops::Base::CeilAlign(static_cast<uint64_t>(singleN), static_cast<uint64_t>(AscendC::ONE_BLK_SIZE));
+    ub2GmParams.blockLen = singleN;  // 256
+    ub2GmParams.srcStride = (nDstUbAligned - singleN) / AscendC::ONE_BLK_SIZE;
+    ub2GmParams.dstStride = n - singleN;
     AscendC::DataCopyPad(dst[offset], src, ub2GmParams);
 }
 
@@ -390,10 +382,6 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
                                          scaleCount, scaleLoopCount);
     if constexpr (IsSameType<DataTypeOut, fp8_e4m3fn_t>::value || IsSameType<DataTypeOut, fp8_e5m2_t>::value) {
         MxQuant::QuantizeMxFp8Data<DataTypeOut>(ubPointers.activationOutput, ubPointers.reciprocalScale,
-                                                ubPointers.quantOutput, dataCount, dataLoopCount);
-    }
-    if constexpr (IsSameType<DataTypeOut, fp4x2_e2m1_t>::value || IsSameType<DataTypeOut, fp4x2_e1m2_t>::value) {
-        MxQuant::QuantizeMxFp4Data<DataTypeOut>(ubPointers.activationOutput, ubPointers.reciprocalScale,
                                                 ubPointers.quantOutput, dataCount, dataLoopCount);
     }
 }

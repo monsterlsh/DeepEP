@@ -209,7 +209,7 @@ protected:
     }
 };
 
-// Native MX FP8/FP4 needs only the cube. A slice-scoped object owns its
+// Native MX FP8 needs only the cube. A slice-scoped object owns its
 // PIPE events; there is no separate vector-side weight prologue.
 template <class Config>
 class DirectMxMatmulPipeline {
@@ -233,7 +233,7 @@ class DirectMxMatmulPipeline {
     using L0 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<128>>;
     using Block = Catlass::Gemm::Block::MegaMoeBlockMmadMx<Policy, L1, L0, A, W, Out, void, TileCopy>;
     static_assert(std::is_same_v<A, W>, "Native MX matmul requires matching activation and weight formats");
-    static_assert(!std::is_same_v<A, fp4x2_e2m1_t> || C::IS_WEIGHT_NZ, "Native FP4 weights require NZ layout");
+    static_assert(std::is_same_v<A, fp8_e4m3fn_t>, "Expected FP8 activations");
 
     Catlass::Gemm::Block::MegaMoeResource resource_;
     Block block_;

@@ -9,7 +9,7 @@ namespace HierarchicalMegaMoeImpl {
 // Control records are plan-private. Every payload class is independently sized
 // against the root envelope so a view may use different H, K and packet strides.
 inline int64_t LayoutArena(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t h,
-                           int64_t ranks_per_node, uint32_t domain, uint32_t configs, uint32_t input_elements_per_byte,
+                           int64_t ranks_per_node, uint32_t domain, uint32_t configs,
                            bool early_topk_weights, HierarchicalMegaMoeArenaOffsets& out)
 {
     if (configs < 1 || configs > 4096 || domain >= configs) throw std::invalid_argument("invalid MegaMoE plan domain");
@@ -35,7 +35,7 @@ inline int64_t LayoutArena(int64_t world, int64_t experts, int64_t tokens, int64
     const int64_t stride = offset;
     const int64_t origin = domain * stride + dump;
     offset = stride * configs;
-    const int64_t plain = CalcQuantTokenScaleBytes(h, input_elements_per_byte, topk, early_topk_weights);
+    const int64_t plain = CalcQuantTokenScaleBytes(h, topk, early_topk_weights);
     const int64_t packet = static_cast<int64_t>(DispatchPacketCount(static_cast<uint32_t>(plain))) * RAIL_PACKET_BYTES;
     out.route = reserve(Ops::Base::CeilAlign(tokens, int64_t{32}) * 4 * experts * world) - origin;
     out.quant = reserve(tokens * plain) - origin;

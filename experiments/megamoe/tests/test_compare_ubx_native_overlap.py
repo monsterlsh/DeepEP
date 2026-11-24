@@ -81,8 +81,7 @@ def job(tmp_path, arm, backend, *, identity=False, precision="w4a8", pod=False, 
     world = ep or (32 if pod or backend == "mte_roce" else 16)
     transport = overlap.TRANSPORT[backend]
     local = min(world, 8 if pod else 16)
-    mma_type, input_kind = {"w4a8": ("fp8xfp4", "fp8"), "w8a8": ("fp8xfp8", "fp8"),
-                            "w4a4": ("fp4xfp4", "fp4")}[precision]
+    mma_type = {"w4a8": "fp8xfp4", "w8a8": "fp8xfp8"}[precision]
     root = tmp_path / arm / f"perf-{precision}"
     sample = list(range(0, world, local // 4 if pod else local))
     config = dict(bs_values=[80], seed=1234, iters=2, warmup=1, alignment=dict(rows=4, cols=4, repeats=1),
@@ -96,7 +95,7 @@ def job(tmp_path, arm, backend, *, identity=False, precision="w4a8", pod=False, 
     for rank in range(world):
         ranked = root / f"rank_{rank}"
         manifest = dict(
-            config=config, input=input_kind, backend=backend, ep_size=world, device_communication=transport,
+            config=config, input="fp8", backend=backend, ep_size=world, device_communication=transport,
             rank=rank, local_rank=rank % local, ranks_per_node=local, mode="perf", perf_scope="all",
             numerical_contract=overlap.CONTRACTS[arm], timer_scope="first_window_only", run_id=f"job-{arm}",
             build=dict(source_sha256="a" * 64, megamoe=dict(enabled=True, timer=True, mte_roce=True)), routing="balanced",
@@ -115,9 +114,8 @@ def job(tmp_path, arm, backend, *, identity=False, precision="w4a8", pod=False, 
     return root
 
 
-@pytest.mark.parametrize(("precision", "input_kind"), [("w4a8", "fp8"), ("w4a4", "fp4")])
-def test_ep16_legacy_manifests_and_disjoint_phase_envelopes(tmp_path, monkeypatch, capsys, precision, input_kind):
-    gelu, swiglu = (job(tmp_path, arm, "mte", precision=precision) for arm in ("gelu", "swiglu"))
+def test_ep16_legacy_manifests_and_disjoint_phase_envelopes(tmp_path, monkeypatch, capsys):
+    gelu, swiglu = (job(tmp_path, arm, "mte") for arm in ("gelu", "swiglu"))
 
     def raw(path, words, decode):
         assert path.relative_to(path.parents[2]).as_posix() == "bs_80/timer/rank_0_npu_time.bin"
@@ -132,8 +130,8 @@ def test_ep16_legacy_manifests_and_disjoint_phase_envelopes(tmp_path, monkeypatc
     assert "physical_mapping=unverified" in console
     assert "Full-batch timer-off host E2E  GELU 0.110 ms  SwiGLU 0.110 ms" in console
     assert result["schema"] == "ubx_native_first_window_overlap_v1"
-    assert result["case"]["precision"] == precision
-    assert result["case"]["input"] == input_kind
+    assert result["case"]["precision"] == "w4a8"
+    assert result["case"]["input"] == "fp8"
     assert result["case"]["timer_token_range_half_open"] == [0, 64]
     assert result["case"]["model"]["num_topk"] == 25
     assert result["arms"]["gelu"]["host_e2e"]["rank_max_mean_us"] == 110
@@ -170,7 +168,7 @@ def test_ep32_exported_trace_uses_only_local_async_lifetime(tmp_path):
 
 
 def test_950pod_first_window_uses_four_nodes_and_all_even_ranks(tmp_path, monkeypatch):
-    a, b = (job(tmp_path, arm, "mte", identity=True, precision="w4a4", pod=True) for arm in ("gelu", "swiglu"))
+    a, b = (job(tmp_path, arm, "mte", identity=True, pod=True) for arm in ("gelu", "swiglu"))
     monkeypatch.setattr(overlap, "binary_spans", lambda path, size, decode: decode(mte_raw(path.parents[3].name)))
     path = tmp_path / "result.json"
     overlap.main(["--platform", "950pod", "--gelu", str(a), "--swiglu", str(b), "--output", str(path)])
@@ -212,12 +210,11 @@ def test_incomplete_selected_roce_trace_fails(tmp_path):
         overlap.compare(gelu, swiglu)
 
 
-@pytest.mark.parametrize(("precision", "input_kind"), [("w4a4", "fp4"), ("w8a8", "fp8")])
-def test_ep32_reports_native_precision_and_rejects_mixed_precision(tmp_path, precision, input_kind):
-    gelu, swiglu = (job(tmp_path, arm, "mte_roce", precision=precision) for arm in ("gelu", "swiglu"))
+def test_ep32_reports_native_precision_and_rejects_mixed_precision(tmp_path):
+    gelu, swiglu = (job(tmp_path, arm, "mte_roce", precision="w8a8") for arm in ("gelu", "swiglu"))
     result = overlap.compare(gelu, swiglu)
-    assert result["case"]["precision"] == precision
-    assert result["case"]["input"] == input_kind
+    assert result["case"]["precision"] == "w8a8"
+    assert result["case"]["input"] == "fp8"
     assert result["case"]["timer_token_range_half_open"] == [0, 64]
     assert result["arms"]["gelu"]["phases"]["Total"]["overlap_rate"] == pytest.approx(95 / 140)
     assert all(row["combine_endpoint"] == "local_mte_retired_row" for row in result["arms"]["swiglu"]["ranks"])

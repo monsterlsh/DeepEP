@@ -38,7 +38,6 @@ private:
     using QuantScaleOutType = typename MegaMoeBase::QuantScaleOutType;
     using ActivationQuantOutType = typename MegaMoeBase::ActivationQuantOutType;
 
-    static constexpr uint32_t A_ELEMS_PER_BYTE = MegaMoeBase::A_ELEMS_PER_BYTE;
     static constexpr uint32_t GMM1_TILE_M = MegaMoeBase::GMM1_TILE_M;
     static constexpr uint32_t EPILOGUE_TILE_M = MegaMoeBase::EPILOGUE_TILE_M;
     // 一个逻辑任务对应一对 gate/up；生产、SwiGLU 和 GMM2 ready 必须使用同一粒度。
@@ -153,7 +152,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm1
         return;
     }
     UpdateMoeExpertGmm1GlobalBuffer<ActivationType, Weight1Type, ActivationQuantOutType, QuantScaleOutType,
-                                    A_ELEMS_PER_BYTE, true, TopkWeightsPrefetch>(
+                                    true, TopkWeightsPrefetch>(
         gmmExecutionConfig_, syncWorkspaceLayout_, params_.workspaceInfo, moeWeightTensorListAddrs_, epilogueOp_,
         gmmAddrInfo, state, tokenStartIndexInExpert, gmm1TilesPerMGroup);
     gmmAddrInfo.timer = timer_.Enabled() ? &timer_ : nullptr;
@@ -281,7 +280,7 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     uint32_t tilesPerM =
         Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / commonConfig_.activationFactor, static_cast<uint32_t>(GMM1_TASK_N));
     UpdateMoeExpertGmm1GlobalBuffer<ActivationType, Weight1Type, ActivationQuantOutType, QuantScaleOutType,
-                                    A_ELEMS_PER_BYTE, true, TopkWeightsPrefetch>(
+                                    true, TopkWeightsPrefetch>(
         gmmExecutionConfig_, syncWorkspaceLayout_, params_.workspaceInfo, moeWeightTensorListAddrs_, epilogueOp_, addr,
         state, begin.tokenIndexInExpert, tilesPerM);
     addr.timer = timer_.Enabled() ? &timer_ : nullptr;

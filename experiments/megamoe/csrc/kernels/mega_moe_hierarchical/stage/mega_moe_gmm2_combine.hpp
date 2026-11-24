@@ -936,7 +936,7 @@ __aicore__ inline void RunGmm2A8W4(const AscendC::Shape<int64_t, int64_t, int64_
                   "Fused GMM1 readiness requires routed wave counters");
     using GmmConfig =
         GmmKernel::Config<GmmKernel::UsesA8W4Prologue<ElementA, ElementB>, 0, ElementA, ElementB, ElementC,
-                          ElementMxScaleA, ElementMxScaleB, GmmKernel::UsesNativeFp4Weights<ElementA>,
+                          ElementMxScaleA, ElementMxScaleB, false,
                           TopkWeightsPrefetch, IsShared, IsLayered, false, IsWaveFlagGrained, SourceGmm1Fused>;
     auto config = GmmConfig::BuildGmm2ProblemConfig(problemShape, blockJob, Gmm1TileM);
 
@@ -983,7 +983,6 @@ __aicore__ inline void UpdateMoeExpertGmm2GlobalBuffer(const GmmExecutionConfig&
                                                        uint32_t rowOffsetInExpert = 0U)
 {
     constexpr uint32_t weightElementsPerByte = PackedElementTraits<WeightType>::ELEMENTS_PER_BYTE;
-    constexpr uint32_t activationOutputElementsPerByte = PackedElementTraits<ActivationOutType>::ELEMENTS_PER_BYTE;
     uint64_t gmm1OutputDim = static_cast<uint64_t>(Get<N_VALUE>(state.problemShape));
     uint64_t tokenHiddenDim = static_cast<uint64_t>(Get<K_VALUE>(state.problemShape));
     uint64_t globalTokenStartIndex = static_cast<uint64_t>(state.globalTokenStartIndex) + rowOffsetInExpert;
@@ -997,9 +996,8 @@ __aicore__ inline void UpdateMoeExpertGmm2GlobalBuffer(const GmmExecutionConfig&
 
     gmmAddrInfo.gmm2OutGlobal = workspace.gmm2MmadResPtr + globalTokenStartIndex * tokenHiddenDim * sizeof(bfloat16_t);
     gmmAddrInfo.metaInfoGlobal = workspace.metaInfoPtr + globalTokenStartIndex * META_INFO_SIZE * sizeof(int32_t);
-    gmmAddrInfo.aGlobal = workspace.activationQuantDataPtr + globalTokenStartIndex * activationOutputWidth /
-                                                                 activationOutputElementsPerByte *
-                                                                 sizeof(ActivationOutType);
+    gmmAddrInfo.aGlobal =
+        workspace.activationQuantDataPtr + globalTokenStartIndex * activationOutputWidth * sizeof(ActivationOutType);
     gmmAddrInfo.aScaleGlobal =
         workspace.activationQuantScalePtr + globalTokenStartIndex * activationScaleWidth * sizeof(QuantScaleType);
     gmmAddrInfo.bGlobal = GetExpertWeightAddr<WeightType>(
@@ -1034,7 +1032,6 @@ __aicore__ inline void UpdateSharedExpertGmm2GlobalBuffer(const MoeStageCommonCo
                                                           const ExpertWeightTensorListAddrs& weights,
                                                           GMMAddrInfo& gmmAddrInfo, uint32_t sharedExpertIdx)
 {
-    constexpr uint32_t activationElementsPerByte = PackedElementTraits<ActivationType>::ELEMENTS_PER_BYTE;
     constexpr uint32_t weightElementsPerByte = PackedElementTraits<WeightType>::ELEMENTS_PER_BYTE;
     uint64_t tokenNum = commonConfig.tokenNum;
     uint64_t tokenHiddenDim = commonConfig.tokenHiddenDim;
@@ -1047,7 +1044,7 @@ __aicore__ inline void UpdateSharedExpertGmm2GlobalBuffer(const MoeStageCommonCo
         workspace.sharedExpertResultPtr + sharedExpertTokenStartIndex * tokenHiddenDim * sizeof(bfloat16_t);
     gmmAddrInfo.aGlobal =
         workspace.sharedExpertActivationDataPtr +
-        sharedExpertTokenStartIndex * activationOutputWidth / activationElementsPerByte * sizeof(ActivationType);
+        sharedExpertTokenStartIndex * activationOutputWidth * sizeof(ActivationType);
     gmmAddrInfo.aScaleGlobal = workspace.sharedExpertActivationScalePtr +
                                sharedExpertTokenStartIndex * activationScaleWidth * sizeof(QuantScaleType);
     gmmAddrInfo.bGlobal = GetExpertWeightAddr<WeightType>(
@@ -1065,7 +1062,7 @@ __aicore__ inline void UpdateSharedExpertGmm2GlobalBuffer(const MoeStageCommonCo
 // 供普通模板、Wave 模板和共享专家的 GMM2 阶段复用。
 // 使用调用方传入的 block 任务执行 GMM2，并保持所选同步约定不变。
 template <uint8_t CombineMode, typename GenericElementA, typename A8W4ElementA, typename WeightType,
-          typename QuantScaleType, bool EnableA8W4, bool EnableA4W4, uint32_t Gmm1TileM, bool TopkWeightsPrefetch,
+          typename QuantScaleType, bool EnableA8W4, uint32_t Gmm1TileM, bool TopkWeightsPrefetch,
           bool IsShared, bool IsGmm1Interleaved = false, bool IsWaveFlagGrained = false,
           bool NotifyCombineTileReady = false>
 __aicore__ inline void RunGmm2ByMode(const GmmExecutionConfig& gmmConfig, const GMMAddrInfo& gmmAddrInfo,
@@ -1074,13 +1071,12 @@ __aicore__ inline void RunGmm2ByMode(const GmmExecutionConfig& gmmConfig, const 
                                      uint32_t rowOffsetInExpert = 0U, const Params* params = nullptr,
                                      int32_t* gmTileSequence = nullptr)
 {
-    if constexpr (EnableA8W4 || EnableA4W4) {
+    if constexpr (EnableA8W4) {
         RunGmm2A8W4<A8W4ElementA, WeightType, bfloat16_t, QuantScaleType, QuantScaleType, Gmm1TileM,
                     TopkWeightsPrefetch, IsShared, false, IsWaveFlagGrained, NotifyCombineTileReady>(
             problemShape, gmmAddrInfo, runtimeState.startBlockIdx, gmmConfig.blockJob,
             static_cast<uint32_t>(Get<M_VALUE>(problemShape)), 0U, params, gmTileSequence);
-    } else if (gmmConfig.groupedMatmulMode == GROUPED_MATMUL_MODE_A8W8_NZ ||
-               gmmConfig.groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ) {
+    } else if (gmmConfig.groupedMatmulMode == GROUPED_MATMUL_MODE_A8W8_NZ) {
         RunGmm2Generic<CombineMode, GenericElementA, GenericElementA, bfloat16_t, QuantScaleType, QuantScaleType, true,
                        false, Gmm1TileM, TopkWeightsPrefetch, IsShared, IsGmm1Interleaved, IsWaveFlagGrained,
                        NotifyCombineTileReady>(problemShape, gmmAddrInfo, runtimeState.startBlockIdx,

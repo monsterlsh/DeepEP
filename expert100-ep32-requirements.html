@@ -134,7 +134,7 @@
     </p>
     <p>主要使用方为算子开发、精度验证和性能验证人员。完成条件是：两个场景使用一致的需求定义，在目标拓扑和配置下完成新流程，并满足最终确认的精度标准。</p>
     <div class="note">
-      <strong>核心目标：</strong>新增 GELU，复用并扩展 Quant 前 Logits 加权，TopK 最大支持 32，逐步覆盖 8 卡单机、16 卡单机和 32 卡跨机，支持 A8W4、A8W8、A4W4，同时控制 UBX 与主干代码差异。
+      <strong>核心目标：</strong>新增 GELU，复用并扩展 Quant 前 Logits 加权，TopK 最大支持 32，逐步覆盖 8 卡单机、16 卡单机和 32 卡跨机，支持 A8W4、A8W8，同时控制 UBX 与主干代码差异。
     </div>
   </section>
 
@@ -174,8 +174,8 @@
         </tr>
         <tr>
           <td>量化</td>
-          <td>采用 MX 量化，每 32 个元素共享 E8M0 Scale；公共 API 支持 FP8×FP4 和 FP8×FP8，A4W4 已有内核路径但未在公共 API 开放。</td>
-          <td>优先继承现有量化语义；A4W4 需要补齐公开配置和完整验证。</td>
+          <td>采用 MX 量化，每 32 个元素共享 E8M0 Scale；公共 API 支持 FP8×FP4 和 FP8×FP8。</td>
+          <td>优先继承现有量化语义。</td>
         </tr>
         <tr>
           <td>TopK / 拓扑</td>
@@ -184,7 +184,7 @@
         </tr>
         <tr>
           <td>精度判定</td>
-          <td>Golden 当前使用统一的混合误差规则，没有按 A8W4/A8W8/A4W4 分别定义阈值。</td>
+          <td>Golden 当前使用统一的混合误差规则，没有按 A8W4/A8W8 分别定义阈值。</td>
           <td>先沿用现有规则，是否按精度分别设定阈值留待验证数据决策。</td>
         </tr>
       </tbody>
@@ -292,28 +292,22 @@ GMM1 → GELU → Logits/TopK 加权 → Quant → GMM2 → Finalize（不再加
     </table>
     <p>核心实现不得固定依赖 8 卡拓扑。各阶段通过不代表后续阶段自动通过，16 卡和 32 卡需分别留存验证结果。</p>
 
-    <h3><span class="req-id">FR-05</span> A8W4、A8W8、A4W4</h3>
+    <h3><span class="req-id">FR-05</span> A8W4、A8W8</h3>
     <table>
       <thead><tr><th>模式</th><th>逻辑数据类型</th><th>当前基础</th><th>目标</th></tr></thead>
       <tbody>
         <tr><td>A8W4</td><td>FP8 E4M3 激活 + FP4 E2M1 权重</td><td>公共 API 已有</td><td>适配 GELU 和 Quant 前加权。</td></tr>
         <tr><td>A8W8</td><td>FP8 E4M3 激活 + FP8 E4M3 权重</td><td>公共 API 已有</td><td>适配 GELU 和 Quant 前加权。</td></tr>
-        <tr><td>A4W4</td><td>FP4 E2M1 激活 + FP4 E2M1 权重</td><td>内核已有路径，公共 API 未开放</td><td>补齐公开配置、权重准备、Golden 和精度验证。</td></tr>
       </tbody>
     </table>
     <h4>D5：量化格式 <span class="badge tbd">TBD</span></h4>
     <table>
       <thead><tr><th>方案</th><th>规则</th><th>启用条件</th></tr></thead>
       <tbody>
-        <tr><td><strong>A：全部继承 MX32 + E8M0（推荐）</strong></td><td>每 32 个元素共享一个 Scale，沿用当前输入、权重和中间 Quant 语义。</td><td>默认方案，保持两个分支和三种模式的一致性。</td></tr>
+        <tr><td><strong>A：全部继承 MX32 + E8M0（推荐）</strong></td><td>每 32 个元素共享一个 Scale，沿用当前输入、权重和中间 Quant 语义。</td><td>默认方案，保持两个分支和两种模式的一致性。</td></tr>
         <tr><td><strong>B：按目标模型引入其他量化粒度</strong></td><td>仅针对明确不兼容的模型格式新增配置、数据布局和 Golden。</td><td>只有目标输入格式证明 MX32 无法直接消费时启用，不作为预先扩展。</td></tr>
       </tbody>
     </table>
-    <h4>D6：A4W4 开放方式 <span class="badge tbd">TBD</span></h4>
-    <ul>
-      <li><strong>方案 A（最终推荐）：</strong>通过统一公共配置暴露 A4W4，两个分支的配置语义一致，并覆盖完整测试。</li>
-      <li><strong>方案 B（阶段备选）：</strong>先通过内部内核配置完成 A4W4 功能验证，再开放公共 API。该方案只能作为开发阶段安排，不能替代最终公开支持。</li>
-    </ul>
 
     <h3><span class="req-id">FR-06</span> 目标配置</h3>
     <table>
@@ -341,7 +335,7 @@ GMM1 → GELU → Logits/TopK 加权 → Quant → GMM2 → Finalize（不再加
       <thead><tr><th>方案</th><th>规则</th><th>建议</th></tr></thead>
       <tbody>
         <tr><td><strong>A：沿用当前统一 Golden 规则（推荐起步）</strong></td><td>混合误差阈值 0.01、超限元素不超过 5%、最大混合误差不超过 0.1。</td><td>先用于 A8W4/A8W8 和新增流程的对比，不在没有数据时预设新阈值。</td></tr>
-        <tr><td><strong>B：按精度模式分别设阈值</strong></td><td>根据目标模型、参考实现和实测误差分别定义 A8W4/A8W8/A4W4 标准。</td><td>统一规则不适用时启用；新阈值必须在验收前评审，不能为通过测试临时放宽。</td></tr>
+        <tr><td><strong>B：按精度模式分别设阈值</strong></td><td>根据目标模型、参考实现和实测误差分别定义 A8W4/A8W8 标准。</td><td>统一规则不适用时启用；新阈值必须在验收前评审，不能为通过测试临时放宽。</td></tr>
       </tbody>
     </table>
     <h4>D8：MTE / URMA 最终覆盖范围 <span class="badge tbd">TBD，详细设计前确定</span></h4>
@@ -355,7 +349,7 @@ GMM1 → GELU → Logits/TopK 加权 → Quant → GMM2 → Finalize（不再加
     <p><span class="badge recommended">推荐</span> 先确认目标实际后端，再决定 D8。开发顺序可先在限制较少的路径打通功能，但阶段实现不能代替最终范围承诺。</p>
     <h4>D9：精度模式与拓扑的组合覆盖 <span class="badge tbd">TBD</span></h4>
     <ul>
-      <li><strong>方案 A（推荐）：</strong>最终三种精度模式均覆盖 8 卡、16 卡和 32 卡目标场景。</li>
+      <li><strong>方案 A（推荐）：</strong>最终两种精度模式均覆盖 8 卡、16 卡和 32 卡目标场景。</li>
       <li><strong>方案 B：</strong>定义明确的支持矩阵，部分模式仅覆盖指定拓扑；必须在交付前公开限制，不能静默跳过组合。</li>
     </ul>
   </section>
@@ -364,7 +358,7 @@ GMM1 → GELU → Logits/TopK 加权 → Quant → GMM2 → Finalize（不再加
     <h2>7. 推荐方案组合</h2>
     <div class="decision">
       <strong>推荐基线，不代表已经批准：</strong>
-      标准单路 GELU + 精确 erf 公式 + GELU 固定 Quant 前加权 + FP32 加权后转 BF16 + MX32/E8M0 + 保留现有 SwiGLU 行为 + 统一开放 A4W4 + 先 8 卡再 16/32 卡 + 先沿用当前 Golden 规则。
+      标准单路 GELU + 精确 erf 公式 + GELU 固定 Quant 前加权 + FP32 加权后转 BF16 + MX32/E8M0 + 保留现有 SwiGLU 行为 + 先 8 卡再 16/32 卡 + 先沿用当前 Golden 规则。
     </div>
     <table>
       <thead><tr><th>决策点</th><th>首选</th><th>备选及触发条件</th></tr></thead>
@@ -374,10 +368,9 @@ GMM1 → GELU → Logits/TopK 加权 → Quant → GMM2 → Finalize（不再加
         <tr><td>D3 旧流程</td><td>仅 GELU 固定前移</td><td>需要统一所有激活默认行为时再全局迁移。</td></tr>
         <tr><td>D4 中间类型</td><td>FP32 → BF16 → Quant</td><td>BF16 舍入精度不足时改 FP32 直接 Quant。</td></tr>
         <tr><td>D5 量化格式</td><td>MX32 + E8M0</td><td>目标模型格式不兼容时新增明确配置。</td></tr>
-        <tr><td>D6 A4W4</td><td>最终统一公开支持</td><td>开发阶段可先内部验证，再开放接口。</td></tr>
         <tr><td>D7 精度阈值</td><td>先沿用现有统一规则</td><td>数据证明不适用时按模式评审独立阈值。</td></tr>
         <tr><td>D8 后端范围</td><td>先明确实际目标后端</td><td>若要求双后端，则同步解除 URMA 现有限制。</td></tr>
-        <tr><td>D9 组合覆盖</td><td>三种模式覆盖全部目标拓扑</td><td>若存在限制，交付明确的支持矩阵。</td></tr>
+        <tr><td>D9 组合覆盖</td><td>两种模式覆盖全部目标拓扑</td><td>若存在限制，交付明确的支持矩阵。</td></tr>
       </tbody>
     </table>
   </section>
@@ -389,7 +382,7 @@ GMM1 → GELU → Logits/TopK 加权 → Quant → GMM2 → Finalize（不再加
       <li>GELU 在 GMM1 后执行，公式与 Golden 一致，UBX 与非 UBX 数值语义一致。</li>
       <li>Logits 在 Quant 前完成，Finalize 无重复加权，共享专家规则保持不变。</li>
       <li>TopK25 和 TopK32 均通过功能验证，非法 TopK 有明确错误反馈。</li>
-      <li>A8W4、A8W8、A4W4 均覆盖完整新流程。</li>
+      <li>A8W4、A8W8 均覆盖完整新流程。</li>
       <li>现有 SwiGLU 的 type 0/1 及既有精度模式完成回归，不发生非预期行为变化。</li>
     </ul>
     <h3>拓扑与目标配置</h3>
@@ -413,7 +406,6 @@ GMM1 → GELU → Logits/TopK 加权 → Quant → GMM2 → Finalize（不再加
       <thead><tr><th>时点</th><th>需要确定的事项</th></tr></thead>
       <tbody>
         <tr><td>详细设计前</td><td>D1 GELU 结构、D2 公式、D3 旧流程兼容、D4 中间类型、D5 量化格式、D8 后端范围。</td></tr>
-        <tr><td>公共接口开发前</td><td>D6 A4W4 配置方式及两个分支统一的参数定义。</td></tr>
         <tr><td>最终验收前</td><td>D7 精度阈值、D9 模式与拓扑支持矩阵、性能验收指标。</td></tr>
       </tbody>
     </table>

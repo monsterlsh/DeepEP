@@ -1,4 +1,4 @@
-"""Exercise MTE dispatch with the logical-nibble indexing used by AscendC FP4 tensors."""
+"""Exercise MTE dispatch of FP8 payloads, E8M0 scales and routing metadata."""
 
 from pathlib import Path
 import shutil
@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 
-def test_packed_fp4_record_fields_and_workspace_rows_keep_byte_offsets(tmp_path):
+def test_fp8_record_fields_and_workspace_rows_keep_byte_offsets(tmp_path):
     compiler = next((path for name in ("c++", "g++", "clang++") if (path := shutil.which(name))), None)
     if compiler is None:
         pytest.skip("The dispatch probe requires a host C++17 compiler")
@@ -24,7 +24,6 @@ def test_packed_fp4_record_fields_and_workspace_rows_keep_byte_offsets(tmp_path)
 #include <cassert>
 #include <cstdint>
 #include <cstring>
-#include <type_traits>
 #define __aicore__
 #define __gm__
 using TEventID = int;
@@ -34,14 +33,13 @@ enum class HardEvent { MTE3_MTE2, MTE2_MTE3, MTE3_S, MTE2_S, S_MTE3 };
 }
 template <AscendC::HardEvent> void SetFlag(TEventID) {}
 template <AscendC::HardEvent> void WaitFlag(TEventID) {}
-struct Fp4 { uint8_t bits; };
-template <typename T> constexpr int elementsPerByte = std::is_same_v<T, Fp4> ? 2 : 1;
+struct Fp8 { uint8_t bits; };
 std::array<uint8_t, 8192> ub{};
 template <typename T> struct LocalTensor {
     uint8_t* address;
     explicit LocalTensor(uint8_t* p) : address(p) {}
     LocalTensor(TPosition, uint32_t offset, uint32_t) : address(ub.data() + offset) {}
-    LocalTensor operator[](uint64_t offset) const { return LocalTensor(address + offset * sizeof(T) / elementsPerByte<T>); }
+    LocalTensor operator[](uint64_t offset) const { return LocalTensor(address + offset * sizeof(T)); }
     template <typename U> LocalTensor<U> ReinterpretCast() const { return LocalTensor<U>(address); }
     T GetValue(uint32_t i) const { T value; std::memcpy(&value, (*this)[i].address, sizeof(T)); return value; }
     void SetValue(uint32_t i, T value) { std::memcpy((*this)[i].address, &value, sizeof(T)); }
@@ -49,13 +47,13 @@ template <typename T> struct LocalTensor {
 template <typename T> struct GlobalTensor {
     uint8_t* address;
     void SetGlobalBuffer(T* p) { address = reinterpret_cast<uint8_t*>(p); }
-    GlobalTensor operator[](uint64_t offset) const { return {address + offset * sizeof(T) / elementsPerByte<T>}; }
+    GlobalTensor operator[](uint64_t offset) const { return {address + offset * sizeof(T)}; }
 };
 template <typename T> void DataCopy(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t elements) {
-    std::memcpy(dst.address, src.address, elements * sizeof(T) / elementsPerByte<T>);
+    std::memcpy(dst.address, src.address, elements * sizeof(T));
 }
 template <typename T> void DataCopy(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t elements) {
-    std::memcpy(dst.address, src.address, elements * sizeof(T) / elementsPerByte<T>);
+    std::memcpy(dst.address, src.address, elements * sizeof(T));
 }
 struct DataCopyExtParams { uint32_t count, bytes, srcStride, dstStride, padding; };
 template <typename T> void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, DataCopyExtParams copy) {
@@ -80,7 +78,7 @@ struct Params {
         + functions
         + r"""
 int main() {
-    constexpr uint32_t tokenBytes = 2048, scaleBytes = 128, recordBytes = 2304;
+    constexpr uint32_t tokenBytes = 2048, scaleBytes = 64, recordBytes = 2240;
     std::array<uint8_t, 3 * recordBytes> peer{};
     std::array<uint8_t, 4 * tokenBytes> tokens{};
     std::array<uint8_t, 4 * scaleBytes> scales{};
@@ -88,7 +86,7 @@ int main() {
     Tiling tiling{25};
     TokenDispatchConfig config{tokenBytes, scaleBytes, recordBytes, 1};
     Params params{&tiling, {tokens.data(), scales.data(), meta.data()}};
-    TokenDispatchScratch<Fp4> scratch{0, tokenBytes, scaleBytes, LocalTensor<int32_t>(ub.data() + 6144)};
+    TokenDispatchScratch<Fp8> scratch{0, tokenBytes, scaleBytes, LocalTensor<int32_t>(ub.data() + 6144)};
     auto record = peer.data() + 2 * recordBytes;
     std::memset(record, 0x5a, tokenBytes);
     std::memset(record + tokenBytes, 0x77, scaleBytes);
@@ -96,7 +94,7 @@ int main() {
     std::memcpy(record + tokenBytes + scaleBytes + 4 * 19, &weight, 4);
     GlobalTensor<uint8_t> peerBytes{peer.data()};
     FetchDispatchTokenAndMetaInfo<false, true>(config, params, scratch, 1, 2 * 25 + 19, 17, peerBytes);
-    StoreDispatchTokenAndMetaInfo<Fp4, uint8_t, true>(config, params, scratch, 1, 2);
+    StoreDispatchTokenAndMetaInfo<Fp8, uint8_t, true>(config, params, scratch, 1, 2);
     assert(std::memcmp(tokens.data() + 3 * tokenBytes, record, tokenBytes) == 0);
     assert(std::memcmp(scales.data() + 3 * scaleBytes, record + tokenBytes, scaleBytes) == 0);
     assert(tokens[3 * tokenBytes - 1] == 0 && scales[3 * scaleBytes - 1] == 0);

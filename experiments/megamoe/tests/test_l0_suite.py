@@ -15,10 +15,8 @@ PRESETS = launcher.SCRIPT.parent / "configs" / "l0"
 CASES = [
     ("L01", "ubx", "a8w4", "fp8xfp4"),
     ("L02", "ubx", "a8w8", "fp8xfp8"),
-    ("L03", "ubx", "a4w4", "fp4xfp4"),
     ("L04", "950pod", "a8w4", "fp8xfp4"),
     ("L05", "950pod", "a8w8", "fp8xfp8"),
-    ("L06", "950pod", "a4w4", "fp4xfp4"),
 ]
 
 
@@ -74,11 +72,16 @@ def test_l0_preset_and_default_plan(plan, case, machine, precision, mma):
         assert jobs["paired"] == "planned" and "swiglu" not in jobs
     else:
         assert "swiglu" in jobs
-    if case == "L06":
-        assert all(jobs[name] == "planned" for name in ("gelu-accuracy", "swiglu-accuracy", "gelu", "swiglu"))
 
 
-@pytest.mark.parametrize("case", ["L01", "L04", "L05", "L06"])
+@pytest.mark.parametrize("preset,retired", [("L01", "L03"), ("L04", "L06")])
+def test_retired_case_numbers_are_rejected(tmp_path, preset, retired):
+    data = launcher.read_run_config(PRESETS / f"{preset}.json")
+    with pytest.raises(ValueError, match="L01/L02"):
+        l0_suite.run_l0(tmp_path / "run.json", dict(data, case=retired), plan=True)
+
+
+@pytest.mark.parametrize("case", ["L01", "L02", "L04", "L05"])
 def test_l0_filters_select_disjoint_accuracy_and_performance_jobs(plan, case):
     def names(*args):
         return [job["name"] for job in plan(case, *args)["jobs"]]

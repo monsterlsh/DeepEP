@@ -50,6 +50,7 @@ def test_prefill_routes_payload_and_weight_through_uneven_two_rank_splits(monkey
     def run_rank(rank, data, scale, ids, weights):
         cascade = object.__new__(prefill_cascade.PrefillCascade)
         cascade.torch = torch
+        cascade.fp8 = torch.float8_e4m3fn
         cascade.dist = SimpleNamespace(all_to_all_single=exchange(rank))
         cascade.npu = SimpleNamespace(
             npu_moe_init_routing_v2=init_routing, npu_moe_re_routing=re_routing, npu_moe_finalize_routing=finalize,
@@ -61,22 +62,21 @@ def test_prefill_routes_payload_and_weight_through_uneven_two_rank_splits(monkey
             assert rows.shape[0] <= 2
             assert int(counts.sum()) == rows.shape[0]
             experts = torch.arange(rank * 2, rank * 2 + 2).repeat_interleave(counts)
-            values = rows[:, 0] + scales[:, 0, 0] + experts * 2
+            values = rows[:, 0].float() + scales[:, 0, 0] + experts * 2
             if routing_weights is not None:
                 values = values * routing_weights
             return values[:, None].expand(-1, cascade.hidden).to(torch.bfloat16)
 
         cascade._ffn = ffn
         cascade._normalize_scale = lambda scales, *shape: scales
-        # Use packed byte payloads like FP4 plus an independent scale payload.
-        data = torch.tensor(data, dtype=torch.uint8)[:, None].repeat(1, 2)
+        data = torch.tensor(data, dtype=torch.float32)[:, None].repeat(1, cascade.hidden).to(cascade.fp8)
         scale = torch.tensor(scale, dtype=torch.uint8)[:, None, None].repeat(1, 1, 2)
         ids = torch.tensor(ids, dtype=torch.int32)
         if empty_owner:
             ids = ids.remainder(2) + 2
         weights = torch.tensor(weights, dtype=torch.float32)
-        actual = cascade.forward(None, ids, weights, input_kind="fp4", quantized=(data, scale))
-        expected = ((data[:, 0, None] + scale[:, 0, :] + ids * 2) * weights).sum(dim=1)
+        actual = cascade.forward(None, ids, weights, input_kind="fp8", quantized=(data, scale))
+        expected = ((data[:, 0, None].float() + scale[:, 0, :] + ids * 2) * weights).sum(dim=1)
         assert torch.equal(actual, expected[:, None].expand(-1, 4).to(torch.bfloat16))
 
     with ThreadPoolExecutor(2) as pool:

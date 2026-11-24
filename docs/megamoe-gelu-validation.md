@@ -82,7 +82,7 @@ done
 
 ## EP32 验收清单
 
-在节点 0 分别选 GELU 和 SwiGLU 的 EP32 运行 JSON。先用 B257 验证建链和尾窗，再对目标 B39280 跑全量。A8W4、A8W8、A4W4 分开记录，K25、K32 均测 `balanced` 与 `skewed`。内存排查可先按每卡抽查 8 个 token，正式精度使用 `check_tokens=0`。EP16 单机按同一矩阵另出结果，热点路由还应核实零接收 rank 的计数。
+在节点 0 分别选 GELU 和 SwiGLU 的 EP32 运行 JSON。先用 B257 验证建链和尾窗，再对目标 B39280 跑全量。A8W4、A8W8 分开记录，K25、K32 均测 `balanced` 与 `skewed`。内存排查可先按每卡抽查 8 个 token，正式精度使用 `check_tokens=0`。EP16 单机按同一矩阵另出结果，热点路由还应核实零接收 rank 的计数。
 
 | 检查 | 判据或读数 |
 | --- | --- |

@@ -50,7 +50,6 @@ private:
     torch::Tensor example_;
     int64_t intermediate_, topk_, experts_, world_, max_tokens_, shared_experts_;
     bool is_a8w4_;
-    bool is_a4w4_ = false;
     bool windowed_;
     int64_t timeout_seconds_;
     std::string activation_;

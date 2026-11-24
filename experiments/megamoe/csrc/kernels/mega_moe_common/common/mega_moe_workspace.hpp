@@ -38,9 +38,7 @@ HOST_DEVICE bool MteA8W4LinearStorageEligible(const MegaMoeTilingData& tilingDat
 
 HOST_DEVICE uint32_t MteWorkspaceWindowSlots(const MegaMoeTilingData& tilingData)
 {
-    const bool unsupported = tilingData.topoType != TOPO_TYPE_MTE || tilingData.combineQuantMode != COMBINE_NO_QUANT ||
-                             tilingData.groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
-                             tilingData.groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ;
+    const bool unsupported = tilingData.topoType != TOPO_TYPE_MTE || tilingData.combineQuantMode != COMBINE_NO_QUANT;
     return WaveWindowSlotCount(!unsupported && !MteA8W4LinearStorageEligible(tilingData),
                                tilingData.groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4);
 }
@@ -173,16 +171,9 @@ private:
         geluLutPtr = tilingData->geluLutWords ? base : nullptr;
         workspaceSize = Ops::Base::CeilAlign(static_cast<int64_t>(tilingData->geluLutWords) * SIZE_INT_32, ALIGN_512);
         const int64_t rowCapacity = static_cast<int64_t>(MteWorkspaceRowCapacity(*tilingData));
-        const int64_t dispatchElementsPerByte = tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
-                                                        tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ
-                                                    ? 2
-                                                    : 1;
-        // 混合 A4W4 的 ActivationQuant 提升为 FP8；仅泛型 A4W4_NZ 保持 FP4 激活输出。
-        const int64_t activationElementsPerByte =
-            tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ ? 2 : 1;
         dispatchRevDataPtr = base + workspaceSize;
         workspaceSize += Ops::Base::CeilAlign(
-            SIZE_INT_8 * rowCapacity * tilingData->h / dispatchElementsPerByte, ALIGN_512);
+            SIZE_INT_8 * rowCapacity * tilingData->h, ALIGN_512);
         dispatchRevScalePtr = base + workspaceSize;
 
         int64_t dispatchScaleElementsPerToken =
@@ -201,7 +192,7 @@ private:
 
         activationQuantDataPtr = base + workspaceSize;
         workspaceSize += Ops::Base::CeilAlign(SIZE_INT_8 * rowCapacity * tilingData->hiddenDim /
-                                                  ActivationFactor(tilingData->actMode) / activationElementsPerByte,
+                                                  ActivationFactor(tilingData->actMode),
                                               ALIGN_512);
 
         activationQuantScalePtr = base + workspaceSize;
@@ -248,9 +239,7 @@ private:
         // 每个 AIC 的就绪序列与前面的 flag 连续存放，使 ResetFlagList 能用同一次 MTE reset 清理；
         // 每个序列独占一个 64B cache line。
         // W4 GMM1 activation 始终使用该序号；采用 tile Combine 的非量化路径也复用它。
-        bool isW4Mode = tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 ||
-                        tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
-                        tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ;
+        const bool isW4Mode = tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4;
         if (isW4Mode || (tilingData->topoType == TOPO_TYPE_MTE && tilingData->combineQuantMode == COMBINE_NO_QUANT)) {
             flagGmmToEpiloguePtr = base + workspaceSize;
             workspaceSize += static_cast<int64_t>(tilingData->aicNum) * INT_CACHELINE * SIZE_INT_32;
@@ -300,18 +289,14 @@ private:
         flagResetElementCount = (workspaceSize - flagRegionBeginOffset) / SIZE_INT_32;
 
         // A8W4 / Combine 量化路径的条件 workspace 分配。
-        // 以下条件分配与 mega_moe.h 编译期守卫 (ENABLE_A8W4 / ENABLE_A4W4 / CombineQuantMode) 一致，
+        // 以下条件分配与 mega_moe.h 编译期守卫 (ENABLE_A8W4 / CombineQuantMode) 一致，
         // 由 TilingKey 保证同步。
         // W4 Wave-ahead Dispatch 与 layered A8W4 都会跨 Activation 保留 cumsum；Activation 会覆盖对应 UB，
         // 因此需要逐物理 block 的 GM 备份。A8W8 的 cumsum 常驻 AIV1 UB 并按 wave 连续推进，不需要该备份。
         cumsumInfoPtr = nullptr;
         gmm1MmadResPtr = nullptr;
         gmm2MmadResPtr = nullptr;
-        bool activationOverwritesDispatchCumsum =
-            tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 ||
-            (tilingData->topoType == TOPO_TYPE_MTE && (tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
-                                                       tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ));
-        if (activationOverwritesDispatchCumsum) {
+        if (isW4Mode) {
             // cumsumInfo：逐核备份 cumsum 状态，每核 moeExpertPerRank × epWorldSize 个 int32。
             cumsumInfoPtr = base + workspaceSize;
             workspaceSize += Ops::Base::CeilAlign(static_cast<int64_t>(SIZE_INT_32 * tilingData->moeExpertPerRank *
@@ -325,10 +310,8 @@ private:
             workspaceSize += SIZE_BF_16 * rowCapacity * tilingData->hiddenDim;
         }
         // gmm2MmadRes：GMM2 matmul 输出，布局为 rowCapacity × h 个 BF16；
-        // A8W4 GMM1、A4W4 混合路径、A4W4_NZ 和 Combine 量化路径需要该区域。
+        // A8W4 GMM1 和 Combine 量化路径需要该区域。
         if (tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 ||
-            tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
-            tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ ||
             tilingData->combineQuantMode != COMBINE_NO_QUANT || tilingData->topoType == TOPO_TYPE_URMA ||
             useMteWaveCombine) {
             if (useMteWaveCombine) {

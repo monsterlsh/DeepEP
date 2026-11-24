@@ -30,11 +30,9 @@ def contract(config, world, bs, input_kind, routing, check_tokens):
 
     if world <= 0 or config["model"]["num_experts"] % world:
         raise ValueError("Global experts must divide positive EP size")
-    if input_kind not in ("bf16", "fp8", "fp4") or routing not in ("balanced", "random", "skewed", "random-balanced"):
+    if input_kind not in ("bf16", "fp8") or routing not in ("balanced", "random", "skewed", "random-balanced"):
         raise ValueError("Invalid Golden input/routing")
-    mma_type = config["model"].get("mma_type", "fp8xfp4")
-    if (input_kind == "fp4") != (mma_type == "fp4xfp4") and input_kind != "bf16":
-        raise ValueError("Golden input storage must match the configured activation precision")
+    numerics.validate_mma_type(config["model"].get("mma_type", "fp8xfp4"))
     token_indices(bs, check_tokens)
     # 权重/输入或参考算法变化自动失效；编译参数、性能轮数不影响 Golden。
     source = inspect.getsource(numerics) + inspect.getsource(reference) + inspect.getsource(inputs) + Path(__file__).read_text(encoding="utf-8")
@@ -302,7 +300,7 @@ def main():
     parser.add_argument("--ep-size", type=int, required=True)
     parser.add_argument("--ranks", required=True, help="Source ranks on this host, e.g. 0-7")
     parser.add_argument("--golden-dir", type=Path, default=Path("benchmark-golden"))
-    parser.add_argument("--input", choices=("bf16", "fp8", "fp4"), default="bf16")
+    parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
     parser.add_argument("--routing", choices=("balanced", "random", "skewed", "random-balanced"), default="balanced")
     parser.add_argument("--check-tokens", type=int, default=0)
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)

@@ -97,23 +97,23 @@ int main() {
     // Six GMM1 N256 tiles per GELU M group and four rounds on 28 cores give 19 groups.
     const PlatformInfo platform{28, 56, 248*1024, 0, 0};
     for (int bs : {255, 256, 257, 4095, 4096}) {
-        auto gelu = MakeTiling(bs, 4096, 1536, 25, 100, 8, bs, 0, true, false, 0, platform, 1, "gelu");
+        auto gelu = MakeTiling(bs, 4096, 1536, 25, 100, 8, bs, 0, true, 0, platform, 1, "gelu");
         assert(gelu.mGroupsPerWave == 19U);
         for (int early : {0, 1}) {
-            auto swiglu = MakeTiling(bs, 4096, 3072, 25, 100, 8, bs, 0, true, false, 0, platform, early, "swiglu");
+            auto swiglu = MakeTiling(bs, 4096, 3072, 25, 100, 8, bs, 0, true, 0, platform, early, "swiglu");
             assert(swiglu.mGroupsPerWave == (bs <= 256 ? 5U : 10U));
         }
     }
     // A six-row decode Combine ring ends at the table for H6144; prefill uses two rows.
     for (int bs : {256, 257, 2048}) for (int h : {4096, 6144, 6400, 8192}) for (int k : {25, 32}) {
-        auto plan = MakeTiling(bs, h, 1536, k, 100, 8, bs, 0, true, false, 0, platform, 1, "gelu");
+        auto plan = MakeTiling(bs, h, 1536, k, 100, 8, bs, 0, true, 0, platform, 1, "gelu");
         assert(MteGeluLutFits(plan, platform.ub) == (bs > 256 || h <= 6144));
         assert(!MteGeluLutFits(plan, platform.ub - 1));  // Combine metadata no longer fits.
         plan.dispatchBufferConfig.routeItemsPerBatch = 65536;
         assert(!MteGeluLutFits(plan, platform.ub));  // The Dispatch index buffer reaches the table.
     }
     {
-        auto plan = MakeTiling(1, 1024, 256, 1, 1, 8, 1, 0, true, false, 0, platform, 1, "gelu");
+        auto plan = MakeTiling(1, 1024, 256, 1, 1, 8, 1, 0, true, 0, platform, 1, "gelu");
         const WorkspaceInfo original(nullptr, &plan);
         for (uint16_t words : {0, 640, 7928, 8192}) {
             plan.geluLutWords = words;
@@ -130,7 +130,7 @@ int main() {
             assert(std::all_of(memory.begin() + sizes.workspaceSize, memory.end(), [](uint8_t v) {return v == 0xcc;}));
         }
     }
-    auto t = MakeTiling(257, 4096, 1536, 25, 100, 8, 257, 0, true, false, 0, platform, 1, "gelu");
+    auto t = MakeTiling(257, 4096, 1536, 25, 100, 8, 257, 0, true, 0, platform, 1, "gelu");
     const unsigned capacity = MteWorkspaceRowCapacity(t);
     assert(capacity == 3 * 19 * 256 && capacity < t.maxOutputSize);
     int32_t counts[800]{};
@@ -185,8 +185,8 @@ int main() {
             auto mapping = policy.WaveStorage(5, start);
             assert(MapWaveRow(mapping, start + 17) == (reuse ? 2 * tile.mGroupsPerWave * 256 : start) + 17);
         };
-        auto full = MakeTiling(2048, 4096, 1536, 25, 25, 32, 2048, 0, true, false, 0, prefill, 1, "gelu");
-        auto tail = MakeTiling(368, 4096, 1536, 25, 25, 32, 2048, 0, true, false, 0, prefill, 1, "gelu");
+        auto full = MakeTiling(2048, 4096, 1536, 25, 25, 32, 2048, 0, true, 0, prefill, 1, "gelu");
+        auto tail = MakeTiling(368, 4096, 1536, 25, 25, 32, 2048, 0, true, 0, prefill, 1, "gelu");
         const auto linear = MteWorkspaceRowCapacity(full);
         assert(full.mGroupsPerWave == geluGroups);
         assert(linear == 51200 && MteWorkspaceWindowSlots(full) == 3 && MteWorkspaceWindowed(full));
@@ -206,24 +206,24 @@ int main() {
         for (unsigned rows : {51200U, 51201U, full.maxOutputSize}) {
             checkStorage(full, rows);
         }
-        auto late = MakeTiling(2048, 4096, 3072, 25, 25, 32, 2048, 0, true, false, 0, prefill, 0, "swiglu");
+        auto late = MakeTiling(2048, 4096, 3072, 25, 25, 32, 2048, 0, true, 0, prefill, 0, "swiglu");
         assert(MteWorkspaceRowCapacity(late) == 3 * swigluGroups * 256);
         assert(!MteGeluLinearWindowEligible(late) && MteTokenCombineRowBufferCount(late, true) == 2);
-        auto local = MakeTiling(2048, 4096, 1536, 25, 50, 16, 2048, 0, true, false, 0, prefill, 1, "gelu");
+        auto local = MakeTiling(2048, 4096, 1536, 25, 50, 16, 2048, 0, true, 0, prefill, 1, "gelu");
         assert(MteWorkspaceRowCapacity(local) == 3 * geluGroups * 256);
-        auto large = MakeTiling(4096, 4096, 1536, 25, 25, 32, 4096, 0, true, false, 0, prefill, 1, "gelu");
+        auto large = MakeTiling(4096, 4096, 1536, 25, 25, 32, 4096, 0, true, 0, prefill, 1, "gelu");
         assert(MteWorkspaceRowCapacity(large) == 3 * geluGroups * 256);
 
         // UBX EP16 W256 already has enough ring-sized rows at I1536/K25.
-        const auto ubx = MakeTiling(256, 4096, 1536, 25, 50, 16, 256, 0, true, false, 0, prefill, 1, "gelu");
+        const auto ubx = MakeTiling(256, 4096, 1536, 25, 50, 16, 256, 0, true, 0, prefill, 1, "gelu");
         assert(MteWorkspaceRowCapacity(ubx) == 3 * geluGroups * 256);
         assert(MteGeluLinearWindowEligible(ubx) && MteTokenCombineRowBufferCount(ubx, true) == 6);
         checkStorage(ubx, 6400U);
 
         // The same EP16 topology needs 8,192 rows at I4096/K32 and retains the
         // original wave stride on skew. The 112-row tail needs no expansion.
-        const auto wide = MakeTiling(256, 4096, 4096, 32, 50, 16, 256, 0, true, false, 0, prefill, 1, "gelu");
-        const auto wideTail = MakeTiling(112, 4096, 4096, 32, 50, 16, 256, 0, true, false, 0, prefill, 1, "gelu");
+        const auto wide = MakeTiling(256, 4096, 4096, 32, 50, 16, 256, 0, true, 0, prefill, 1, "gelu");
+        const auto wideTail = MakeTiling(112, 4096, 4096, 32, 50, 16, 256, 0, true, 0, prefill, 1, "gelu");
         const unsigned wideRing = aic == 28 ? 5376 : 6144;
         assert(wide.mGroupsPerWave * 3 * 256 == wideRing && MteWorkspaceWindowSlots(wide) == 3);
         assert(MteWorkspaceRowCapacity(wide) == 8192 && MteWorkspaceRowCapacity(wideTail) == wideRing);
@@ -240,7 +240,7 @@ int main() {
     // resident row layout so the independent AIV1 scheduler can run.
     const PlatformInfo pod{32, 64, 248 * 1024, 0, 0};
     for (int bs : {96, 4096}) for (int shared : {0, 1}) {
-        auto legacy = MakeTiling(bs, 7168, 6144, 6, 12, 32, bs, 0, true, false, shared, pod, 0, "swiglu");
+        auto legacy = MakeTiling(bs, 7168, 6144, 6, 12, 32, bs, 0, true, shared, pod, 0, "swiglu");
         assert(MteWorkspaceWindowSlots(legacy) == 1 && !MteWorkspaceWindowed(legacy));
         assert(MteWorkspaceRowCapacity(legacy) == static_cast<uint64_t>(bs) * 32 * 6);
         StoragePolicy<false> policy{{&legacy, {nullptr, nullptr}}, {32, 12, 2},
@@ -257,34 +257,33 @@ int main() {
         gelu.actMode = static_cast<uint8_t>(MegaMoeActMode::GELU);
         assert(MteWorkspaceWindowed(gelu));
     }
-    auto large = MakeTiling(4096, 7168, 6144, 6, 12, 32, 65536, 0, true, false, 1, pod, 0, "swiglu");
+    auto large = MakeTiling(4096, 7168, 6144, 6, 12, 32, 65536, 0, true, 1, pod, 0, "swiglu");
     assert(MteWorkspaceWindowSlots(large) == 3 && MteWorkspaceWindowed(large));
-    // The public 39,280 rows include a 112-row tail at W256. Both GMM inputs
-    // are nibble-packed in A4W4, including the output of GELU/SwiGLU.
+    // Check FP8 dispatch and activation workspace rows for a full window and a tail.
     for (int world : {4, 8, 16, 32}) for (int topk : {25, 32}) for (int rows : {256, 39280 % 256}) {
         const int local = (world == 4 ? 384 : 800) / world;
         for (int early : {0, 1}) for (bool gelu : {true, false}) {
             auto t = MakeTiling(rows, 4096, gelu ? 1536 : 3072, topk, local, world, 256, 0,
-                                false, true, 0, platform, early, gelu ? "gelu" : "swiglu");
-            assert(t.groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ);
-            assert(t.dispatchBufferConfig.copyBufferBytes == CalcQuantTokenScaleBytes(4096, 2, topk, early));
+                                false, 0, platform, early, gelu ? "gelu" : "swiglu");
+            assert(t.groupedMatmulMode == GROUPED_MATMUL_MODE_GENERAL);
+            assert(t.dispatchBufferConfig.copyBufferBytes == CalcQuantTokenScaleBytes(4096, topk, early));
             WorkspaceInfo w(nullptr, &t);
             auto capacity = MteWorkspaceRowCapacity(t);
-            assert(w.dispatchRevScalePtr - w.dispatchRevDataPtr == int64_t(capacity) * 2048);
-            assert(w.activationQuantScalePtr - w.activationQuantDataPtr == int64_t(capacity) * 768);
+            assert(w.dispatchRevScalePtr - w.dispatchRevDataPtr == int64_t(capacity) * 4096);
+            assert(w.activationQuantScalePtr - w.activationQuantDataPtr == int64_t(capacity) * 1536);
             assert(t.maxOutputSize == unsigned(256 * world * std::min(topk, local)));
         }
     }
     for (int world : {4, 8, 16, 32}) for (int topk : {25, 32}) for (bool w4 : {true, false}) {
         const int local = (world == 4 ? 384 : 800) / world;
-        PeermemSizeParams params{256, topk, 4096, local, world, 2, 1, true, false, TOPO_TYPE_MTE, true};
+        PeermemSizeParams params{256, topk, 4096, local, world, 2, true, false, TOPO_TYPE_MTE, true};
         const auto required = AlignUp<int64_t>(EXCEPTION_DUMP_REGION_SIZE + CalcPeermemLeastSize(params), 2LL << 20);
         assert(required < (1LL << 30));
         params.numMaxTokensPerRank = 39280;
         assert(CalcPeermemLeastSize(params) > (1LL << 30));
         int64_t previous = 0;
         for (int bs : {256, 112}) {
-            auto t = MakeTiling(bs, 4096, 1536, topk, local, world, 256, 0, w4, false, 0,
+            auto t = MakeTiling(bs, 4096, 1536, topk, local, world, 256, 0, w4, 0,
                                 PlatformInfo{28, 56, 248*1024, 0, 0}, 1, "gelu");
             WorkspaceInfo info(nullptr, &t);
             assert(t.numMaxTokensPerRank == 256 && t.bs == bs);
@@ -300,13 +299,13 @@ int main() {
     // Reconstruct the device SendAndQuantBuffInit layout, including both padded weight records.
     for (int topk : {25, 32}) {
         for (uint32_t ub = 160 * 1024; ub < 248 * 1024; ub += 32) {
-            auto t = MakeTiling(2048, 1024, 256, topk, 25, 32, 2048, 0, true, false, 0,
+            auto t = MakeTiling(2048, 1024, 256, topk, 25, 32, 2048, 0, true, 0,
                                 PlatformInfo{28, 56, ub, 0, 0}, 1, "gelu");
             WorkspaceInfo info(nullptr, &t);
             auto reset = std::max(info.flagResetElementCount, info.gmm1TileStatusElementCount);
             auto resetBytes = 4 * AlignUp(std::min<int64_t>(CeilDiv<int64_t>(reset, 56), DISPATCH_RESET_BATCH),
                                           int64_t{INT32_PER_256B});
-            uint32_t rowBytes = CalcQuantTokenScaleBytes(1024, 1, topk, true);
+            uint32_t rowBytes = CalcQuantTokenScaleBytes(1024, topk, true);
             assert(rowBytes == 1024 + 32 + 128);
             auto fixed = resetBytes + 2048 + 2 * rowBytes + 2 * 1024 * sizeof(uint16_t) +
                          AlignUp(CalcSendMaskExpertCapacity(&t, 56) * 4U, 32U);

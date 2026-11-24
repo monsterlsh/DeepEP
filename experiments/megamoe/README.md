@@ -20,7 +20,7 @@ python3 "$RUN" --run-config "$CASES/ubx_ep32_target.json"
 
 通用预设的 `_comments` 包含字段说明和可选值。设置 `"plan": true` 或追加 `--plan` 可预览解析结果。
 
-按验收清单测 EP4、EP8、EP16，可先列出场景，再生成一份运行 JSON。例如在 UBX 的 .84 上测 EP4 的 TopK25 GELU Finalize 加权 A8W4。两平台的每组参数、限制和多机命令见[分平台 EP 验收矩阵](../../docs/megamoe-topk32-gelu-a4w4-test-checklist.md#分平台-ep-验收矩阵)。
+按验收清单测 EP4、EP8、EP16，可先列出场景，再生成一份运行 JSON。例如在 UBX 的 .84 上测 EP4 的 TopK25 GELU Finalize 加权 A8W4。两平台的每组参数、限制和多机命令见[分平台 EP 验收矩阵](../../docs/megamoe-topk32-gelu-test-checklist.md#分平台-ep-验收矩阵)。
 
 ```bash
 MATRIX=experiments/megamoe/scripts/acceptance_cases.py
@@ -56,11 +56,11 @@ bash experiments/megamoe/scripts/build_ubx.sh
 | `config.bs_values` | 每卡 token 数，填一个值 | `[257]` |
 | `profile_memory_peak` | 逐卡采样 HBM 已用容量。精度默认开启，性能默认关闭 | `true` / `false` |
 
-独立显存轮可用 `python experiments/megamoe/scripts/run_megamoe.py --run-config experiments/megamoe/scripts/configs/l0/L01.json --only memory`。L01–L06 均使用这个入口。各 BS 的 `resources.json` 保存逐 rank 峰值和全组最小余量。通用 JSON 和直接 torchrun 的用法见[单 case 显存复测](../../docs/megamoe-topk32-gelu-a4w4-test-checklist.md#ubx-与-950pod-显存复测)。
+独立显存轮可用 `python experiments/megamoe/scripts/run_megamoe.py --run-config experiments/megamoe/scripts/configs/l0/L01.json --only memory`。L01、L02、L04、L05 均使用这个入口。各 BS 的 `resources.json` 保存逐 rank 峰值和全组最小余量。通用 JSON 和直接 torchrun 的用法见[单 case 显存复测](../../docs/megamoe-topk32-gelu-test-checklist.md#ubx-与-950pod-显存复测)。
 
 `config` 还包含 `warmup`、`iters`、`seed` 和 `alignment`。外层 `routing` 选择路由数据分布。复用同一份 GELU 预设时，可在复制的 JSON 外层设 `"activation": "swiglu"` 切换到 SwiGLU Finalize 加权。外层 `topk` 和 `bs` 可覆盖内嵌值。EP32 自动拉起时脚本向两台节点传递同一份内嵌模型。
 
-- 四份 UBX JSON 默认 `mode=both`、`precision=all`，先测精度，再测性能。单测时将 `mode` 设为 `accuracy` 或 `perf`，将 `precision` 设为 `a8w4`、`a8w8` 或 `a4w4`。也接受 `w4a8`、`w8a8`、`w4a4`。A4W4 使用 packed FP4 激活与 FP4 权重。
+- 四份 UBX JSON 默认 `mode=both`、`precision=all`，先测精度，再测性能。单测时将 `mode` 设为 `accuracy` 或 `perf`，将 `precision` 设为 `a8w4` 或 `a8w8`。也接受别名 `w4a8`、`w8a8`。
 - JSON 中的 `topk` 可设为 1–32，`routing` 可选 `balanced`、`skewed`、`random` 或 `random-balanced`。`check_tokens=0` 全量比对，正数按每卡抽查。`dual_reference=true` 加做 NPU 级联比对。`weighting=early|late` 选择量化前或 Finalize 加权。
 - 运行 JSON 可指定 `golden_dir`、`run_base`、`output_dir`、`python`、`cann_env`。相对路径以运行 JSON 所在目录为起点。
 - 省略 `output_dir` 时，单项作业按实际平台、EP、后端、精度、任务、激活与加权、TopK、每卡 BS、路由和启动时间命名，例如 `ubx-ep16-mte-a8w4-perf-gelu-early-k25-bs4096-balanced-20261124-143005/`。L0 清单使用较短的 Case 目录名，例如 `L01-ubx-ep32-a8w4-memory-20261124-143005/`。实际路径见启动日志。
@@ -83,8 +83,8 @@ URMA 的 `compare` 支持 EP16/EP32 的 A8W4、A8W8。A 为 GELU 提前加权，
 
 | 激活 | GMM1 融合算子 | 精度 |
 | --- | --- | --- |
-| `swiglu` | `torch_npu.npu_grouped_matmul_swiglu_quant_v2`，沿用 `moe_test` Decode 路径 | A8W4、A8W8、A4W4 |
-| `gelu` | `cann_ops_transformer.ops.grouped_matmul_activation_quant`，使用 NZ 格式的 GMM1 权重 | A8W8、A4W4 |
+| `swiglu` | `torch_npu.npu_grouped_matmul_swiglu_quant_v2`，沿用 `moe_test` Decode 路径 | A8W4、A8W8 |
+| `gelu` | `cann_ops_transformer.ops.grouped_matmul_activation_quant`，使用 NZ 格式的 GMM1 权重 | A8W8 |
 
 两种路径都在 Combine 应用路由权重。运行需要包含本功能的 MegaMoE wheel、支持对应算子的 `torch_npu` / CANN，以及可用的 HCCL EP 组。GELU 还需要提供上述 Torch 接口的 CANN `ops-transformer`。 [CANN 融合算子说明](https://github.com/hicann/ops-transformer/blob/master/gmm/grouped_matmul_activation_quant/docs/torchapi_grouped_matmul_activation_quant.md)
 
@@ -96,7 +96,7 @@ python3 experiments/megamoe/scripts/run_megamoe.py \
 ```
 
 - UBX 从节点 0 执行。运行 JSON 的 `backend` 决定融合通信后端，可沿用预设的 EP16 `mte` 和 EP32 `mte_roce`，也可选 `urma`。
-- 测 GELU 时，把运行 JSON 的 `precision` 设为 `a8w8` 或 `a4w4`，并在 `config.model` 中设置 `activation=gelu`、`topk_weights_type=0`。A4W4 需要原生 MTE 或 MTE+RoCE，以及支持 MXFP4 的 Decode Dispatch 和 GMM1 算子。`decode_comparison.json` 记录实际 GMM1 算子，以及级联的 GELU tanh 近似和 MegaMoE 的 GELU erf。两侧激活实现和 GMM1 舍入口径不同，这组数据用于性能对照。
+- 测 GELU 时，把运行 JSON 的 `precision` 设为 `a8w8`，并在 `config.model` 中设置 `activation=gelu`、`topk_weights_type=0`。`decode_comparison.json` 记录实际 GMM1 算子，以及级联的 GELU tanh 近似和 MegaMoE 的 GELU erf。两侧激活实现和 GMM1 舍入口径不同，这组数据用于性能对照。
 - Decode 要求后加权、零共享专家、无 clamp，使用 `moe_test` 的测试范围，每卡 BS ≤ 512、TopK ≤ 16、专家数 ≤ 1024。运行配置也接受 `"compare_decode_cascade": true`。
 - 950POD 在 [现有运行 JSON](scripts/configs/950pod_target.json) 中设置 `mode=perf`、`compare_decode_cascade=true`、`precision=a8w4`，把内嵌 `config` 替换为 [Decode 模型 JSON](python/deep_ep_experimental/megamoe/configs/ep32_roce_decode.json) 的内容。多机沿用每台的 `node_rank`、B05 的主地址和统一输出目录，用同一入口传入运行 JSON。
 - 统一入口给两条路径提供同一份预量化 MX 输入，输入量化在测量前完成。直接用 `torchrun --module deep_ep_experimental.megamoe.benchmark` 启动时可以选择 `--input bf16`，前提是融合后端支持 BF16 输入。此时级联也会在 Dispatch 前做本地 MX 量化。回归比较时保持两次运行的 `input` 一致。
@@ -121,7 +121,7 @@ python3 experiments/megamoe/scripts/run_megamoe.py \
   --run-config /shared/megamoe/ubx-ep32-gelu-perf.json --compare-prefill-cascade
 ```
 
-将 JSON 的 `precision` 改为 `a8w8` 可测 A8W8。支持原生 A4W4 的融合后端可显式设置 `a4w4`，其中 UBX 的 A4W4 大 case 使用 `mte_roce`。950POD 使用 [运行 JSON](scripts/configs/950pod_target.json)，设置 `mode=perf`、`compare_prefill_cascade=true`、`ep_size=32` 和新的 `output_dir`。各节点填写自己的 `node_rank`，沿用相同的 B05 主地址和模型配置。不同的精度或后端使用不同的输出目录。
+将 JSON 的 `precision` 改为 `a8w8` 可测 A8W8。950POD 使用 [运行 JSON](scripts/configs/950pod_target.json)，设置 `mode=perf`、`compare_prefill_cascade=true`、`ep_size=32` 和新的 `output_dir`。各节点填写自己的 `node_rank`，沿用相同的 B05 主地址和模型配置。不同的精度或后端使用不同的输出目录。
 
 SwiGLU 用相同的 AllToAll 级联入口，模型设置 `activation=swiglu`、`topk_weights_type=0`。产物为 `rank_0/bs_39280/prefill_comparison.json`，沿用 Decode 的三种计时和加速比口径。级联每个源 rank 按 4096 token 分窗，专家侧按 32768 个展开行计算 FFN。单轮报告覆盖整轮 token，包括各窗路由整理、AllToAll 和输出汇总。
 
@@ -129,7 +129,7 @@ SwiGLU 用相同的 AllToAll 级联入口，模型设置 `activation=swiglu`、`
 
 在 UBX 上对照 GELU 提前加权与 SwiGLU 后加权，按[UBX 掩盖率 A/B 快速开始](scripts/ubx_overlap_quickstart.md)生成运行 JSON、采集两组打点并读取结果。指南分别说明 EP16 MTE、EP32 MTE+RoCE 的本地阶段指标和 URMA 的通信完成指标。
 
-单机 EP16 MTE 可用 `precision=a4w4`、`timer: true` 采集 W4A4 首窗，需安装支持 `mte_a4w4_timer_enabled` 的 wheel。双机 EP32 MTE+RoCE 也支持 W4A4 打点。
+单机 MTE 使用 `precision=a8w4`、`timer: true` 采集首窗。双机 EP32 MTE+RoCE 可分别采集 A8W4 和 A8W8。
 
 要在 MTE+RoCE 上采集设备 timer，在两台 UBX 安装同一份开启 `DEEPEP_MEGAMOE_TIMER` 的新 wheel。复制 EP32 预设，设置 `backend=mte_roce`、`mode=perf`、`precision=a8w4`、`timer: true`，填写 `output_dir`，从节点 0 启动。正式的 `profiling.json` 和同步端到端耗时先按关闭 timer 测量。随后独立诊断轮为默认采样 rank 记录首窗。
 
@@ -154,11 +154,11 @@ python3 experiments/megamoe/scripts/analyze_megamoe_profile.py "$OUT" --overlap 
 python3 "$RUN" --run-config "$CASES/950pod_target.json"
 ```
 
-将 `config.bs_values` 改为 `[257]`、`check_tokens` 改为 `8` 可快速抽样验证。将 `config.model.num_topk` 改为 `32` 可运行 K32。EP8、EP16、EP32 都可显式选择 `precision=a4w4`。零共享专家的原生融合用 `precision=all` 运行 `a8w4`、`a8w8`、`a4w4`。带共享专家的 950POD 原生融合用 `all` 运行 A8W4 和 A4W4。GELU 提前加权设置 `activation=gelu`、`topk_weights_type=1`，SwiGLU 后加权设置 `activation=swiglu`、`topk_weights_type=0`。每组使用独立的 `output_dir`。
+将 `config.bs_values` 改为 `[257]`、`check_tokens` 改为 `8` 可快速抽样验证。将 `config.model.num_topk` 改为 `32` 可运行 K32。零共享专家的原生融合用 `precision=all` 运行 `a8w4`、`a8w8`。带共享专家的 950POD 原生融合用 `all` 运行 A8W4。GELU 提前加权设置 `activation=gelu`、`topk_weights_type=1`，SwiGLU 后加权设置 `activation=swiglu`、`topk_weights_type=0`。每组使用独立的 `output_dir`。
 
 B05 和 B07 双机各 8 卡时，在两台的 JSON 中都设 `ep_size=16`、填写相同的 `master_addr`、`output_dir` 和模型与测试参数，`node_rank` 分别设为 `0`、`1`。两台先用 `golden_only: true` 准备各自的 Golden，全部完成后设为 `false`，加上 `skip_golden: true` 并同时启动精度测试。四台各 8 卡对应 `ep_size=32` 和节点序号 0–3。报告位于本轮目录的 `accuracy/rank_<r>/bs_<B>/accuracy.json`，`precision=all` 时按精度分目录。
 
-测 EP32 性能时，在四台 950POD 节点分别使用同一份模型和测试设置，将 `mode` 改为 `perf`、`ep_size` 改为 `32`，并填写相同的 B05 `master_addr`、两个端口及新的 `output_dir`。B05 的 `node_rank` 为 0，其他三台依次设为 1、2、3。各节点使用本机的 Python 和 CANN 路径，同时执行上面的统一入口。`perf` 直接启动每机 8 卡的 torchrun，收集 kernel 耗时、同步端到端时延和全组吞吐。每个 rank 的报告位于 `perf/rank_<r>/bs_<B>/profiling.json`，运行身份记录在同一 rank 的 `manifest.json`。`precision=all` 时按实际运行的精度写入 `perf-w4a8`、`perf-w8a8` 或 `perf-w4a4`。
+测 EP32 性能时，在四台 950POD 节点分别使用同一份模型和测试设置，将 `mode` 改为 `perf`、`ep_size` 改为 `32`，并填写相同的 B05 `master_addr`、两个端口及新的 `output_dir`。B05 的 `node_rank` 为 0，其他三台依次设为 1、2、3。各节点使用本机的 Python 和 CANN 路径，同时执行上面的统一入口。`perf` 直接启动每机 8 卡的 torchrun，收集 kernel 耗时、同步端到端时延和全组吞吐。每个 rank 的报告位于 `perf/rank_<r>/bs_<B>/profiling.json`，运行身份记录在同一 rank 的 `manifest.json`。`precision=all` 时按实际运行的精度写入 `perf-w4a8` 或 `perf-w8a8`。
 
 精度验收矩阵、历史实测结果及原始产物判读见 [GELU 验证手册](../../docs/megamoe-gelu-validation.md)。非 UBX 的性能配对、固定窗口和隔离进程实验见[配对测试说明](scripts/paired_benchmark.md)。
 
@@ -208,7 +208,7 @@ FP8 输入仍需打包到通信区，因此流水中的 `AIV_QUANT` 此时表示
 
 调用 `w1, w2 = transform_weights_for_mega_moe(raw_w1, raw_w2)` 得到 Ascend NZ 权重。FP4 routed GMM1 一次准备两套 weight/scale：实际 B≤256 使用 `[gate128, up128]` 融合布局，B>256 使用 `[gate | up]` 配对布局。转换不进入计时区间，但额外保留一份 GMM1 权重和 scale；GMM2 不复制。
 
-原生 A4W4 使用 `transform_weights_for_mega_moe(raw_w1, raw_w2, activation=..., mma_type="fp4xfp4")`。两层都把 `uint8` 视为 packed bytes 转成 NZ，每个 C0 有 32 字节，即 64 个 FP4 值。SwiGLU 的 W1 保持 `[gate | up]`，两层均传入完整的返回权重对。A8W4 解量化前处理使用 C0=32 个 FP4 值的权重格式。
+A8W4 解量化前处理使用 C0=32 个 FP4 值的权重格式。
 请完整保留返回的 `w1`，不要解包后重组、原地修改或自行搬运其张量；权重更新或设备变化时从原始 ND 重新转换。共享专家将首维 L 换成 S，并传入 `shared=True`，使用 planar 权重布局。
 不能直接传入已经做过 CUDA 专用重排的权重。
 

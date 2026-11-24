@@ -30,28 +30,27 @@ void CheckCase(const char* mma, const char* activation, int topk, int bs, int ti
     constexpr int hidden = 4096;
     constexpr int intermediate = 1536;
     const uint8_t mode = MmaMode(mma);
-    const uint32_t input_packing = std::string_view(mma) == "fp4xfp4" ? 2U : 1U;
     const bool gelu = std::string_view(activation) == "gelu";
     const bool early = timing == 1;
     const auto tiling = MakeTiling(bs, hidden, intermediate, topk, 25, 32, bs, 0, platform, activation, mode, timing);
 
     assert(tiling.hiddenDim == (gelu ? intermediate : 2 * intermediate));
     assert(tiling.groupedMatmulMode == mode && tiling.topkWeightsPrefetch == timing);
-    assert(DispatchElementsPerByte(mode) == input_packing && IntermediateWidth(tiling) == intermediate);
+    assert(IntermediateWidth(tiling) == intermediate);
     assert(tiling.maxOutputSize == static_cast<uint32_t>(bs * 32 * 25));
     const uint32_t tile_n = !gelu && std::string_view(mma) == "fp8xfp4" ? 128U : 256U;
     const uint32_t early_status_slots = ((bs + 7U) / 8U) * (intermediate / tile_n);
     assert(tiling.mGroupsPerWave != 0 && tiling.maxTilesPerExpert == (early ? early_status_slots : 0U));
     assert(tiling.roceScratchUbOffset + HIERARCHICAL_ROCE_UB_BYTES == platform.ub);
 
-    const uint32_t expected_record = hidden / input_packing + hidden / 32U + (early ? 128U : 0U);
+    const uint32_t expected_record = hidden + hidden / 32U + (early ? 128U : 0U);
     const uint32_t packets = (expected_record + 479U) / 480U;
     assert(QuantizedRecordBytes(tiling) == expected_record);
     assert(HierarchicalDispatchPacketCount(&tiling) == packets);
     assert(tiling.dispatchBufferConfig.copyBufferBytes == packets * 480U);
 
     HierarchicalMegaMoeArenaOffsets arena{};
-    const auto heap = LayoutArena(32, 25, bs, topk, hidden, 16, 0, 1, input_packing, early, arena);
+    const auto heap = LayoutArena(32, 25, bs, topk, hidden, 16, 0, 1, early, arena);
     const auto row_bytes = static_cast<int64_t>(packets) * 512;
     assert(arena.combine - arena.quant >= bs * expected_record);
     assert(arena.packetSend - arena.relay == bs * row_bytes);
@@ -71,9 +70,9 @@ void CheckCase(const char* mma, const char* activation, int topk, int bs, int ti
         return reinterpret_cast<uintptr_t>(second) - reinterpret_cast<uintptr_t>(first);
     };
     const uint64_t rows = tiling.maxOutputSize;
-    assert(bytes_between(layout.dispatchRevDataPtr, layout.dispatchRevScalePtr) == rows * hidden / input_packing);
+    assert(bytes_between(layout.dispatchRevDataPtr, layout.dispatchRevScalePtr) == rows * hidden);
     assert(bytes_between(layout.activationQuantDataPtr, layout.activationQuantScalePtr) ==
-           rows * intermediate / input_packing);
+           rows * intermediate);
     assert(bytes_between(layout.gmm1MmadResPtr, layout.gmm2MmadResPtr) >= rows * tiling.hiddenDim * 2);
     assert(layout.gmm1TileStatusElementCount == (early ? (25 * early_status_slots + 1) * INT_CACHELINE : 0));
 
@@ -87,7 +86,7 @@ void CheckCase(const char* mma, const char* activation, int topk, int bs, int ti
 int main()
 {
     static_assert(sizeof(HierarchicalMegaMoeTilingData) == 368);
-    for (const auto* mma : {"fp8xfp4", "fp8xfp8", "fp4xfp4"}) {
+    for (const auto* mma : {"fp8xfp4", "fp8xfp8"}) {
         for (const auto* activation : {"gelu", "swiglu"}) {
             for (int timing : {0, 1}) {
                 for (int topk : {25, 32}) {
@@ -98,6 +97,7 @@ int main()
             }
         }
     }
+    Rejects([] { MmaMode("unsupported"); });
     Rejects([] { CheckArenaGeometry(32, 25, 257, 25, 4096, 0); });
     Rejects([] { CheckArenaGeometry(32, 25, 32, 33, 4096, 0); });
     Rejects([] { CheckArenaGeometry(16, 25, 32, 25, 4096, 0); });

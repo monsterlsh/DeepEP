@@ -71,8 +71,7 @@ def main():
 
     local, require_w8a8 = int(sys.argv[1]), sys.argv[2] == "1"
     backend = sys.argv[3] if len(sys.argv) > 3 else "urma"
-    precision = sys.argv[4] if len(sys.argv) > 4 else None
-    require_timer = len(sys.argv) > 5 and sys.argv[5] == "1"
+    require_timer = len(sys.argv) > 4 and sys.argv[4] == "1"
     count = torch.npu.device_count()
     if count < local:
         sys.exit(f"UBX 每机需要 {local} 张可见 NPU，当前只有 {count} 张。")
@@ -89,12 +88,6 @@ def main():
         sys.exit("当前 MegaMoE wheel 未启用新版 MTE+RoCE 矩阵精度与分块支持。")
     if backend == "mte_roce" and require_timer and not getattr(extension, "mte_roce_timer_enabled", False):
         sys.exit("MTE+RoCE 设备 timer 需要两台节点安装支持此功能并启用 DEEPEP_MEGAMOE_TIMER 的 wheel。")
-    if backend == "mte" and precision == "w4a4":
-        if not getattr(extension, "mte_a4w4_enabled", False):
-            sys.exit("当前 MegaMoE wheel 未启用单机 MTE W4A4。")
-        if require_timer and not (getattr(extension, "timer_enabled", False) and
-                                  getattr(extension, "mte_a4w4_timer_enabled", False)):
-            sys.exit("单机 MTE W4A4 设备 timer 需要安装启用此功能的 DEEPEP_MEGAMOE_TIMER wheel。")
     print(f"[UBX] MegaMoE wheel: {extension.__file__}", flush=True)
 
 

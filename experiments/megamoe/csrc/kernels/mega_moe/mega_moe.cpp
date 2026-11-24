@@ -21,7 +21,7 @@ using namespace AscendC;
 // Explicit types replace asc_opc dtype/format/tiling-key specialisation.
 // A8W4's existing matmul prologue continues to interpret weights as NZ/C0_32.
 // Batch scheduling preserves the old ACL schemMode=1 cross-core contract.
-template <bool IsA8W4, bool FuseGateUp = false, bool EarlyWeights = false, bool IsA4W4 = false>
+template <bool IsA8W4, bool FuseGateUp = false, bool EarlyWeights = false>
 __schedmode__(1) __global__
     __mix__(1, 2) void mega_moe_kernel(GM_ADDR context, GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_ids,
                                        GM_ADDR topk_weights, GM_ADDR weight1, GM_ADDR weight2, GM_ADDR weight_scales1,
@@ -34,15 +34,7 @@ __schedmode__(1) __global__
     InitSocState();
     util_set_ffts_config(ffts_addr);
     constexpr int32_t kDispatchE4M3 = 4;
-    if constexpr (IsA4W4) {
-        MegaMoeImpl::MegaMoeA8W8Wave<bfloat16_t, bfloat16_t, float, fp4x2_e2m1_t, MegaMoeImpl::E2M1_QUANT,
-                                     MegaMoeImpl::COMBINE_NO_QUANT, EarlyWeights, false>
-            op;
-        op.Init(context, x, topk_ids, topk_weights, weight1, weight2, nullptr, weight_scales1, weight_scales2, x_scales,
-                shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
-                workspace, &tiling, nullptr, timer);
-        op.Process();
-    } else if constexpr (IsA8W4) {
+    if constexpr (IsA8W4) {
         MegaMoeImpl::MegaMoeA8W4Wave<bfloat16_t, bfloat16_t, float, fp4x2_e2m1_t, kDispatchE4M3,
                                      MegaMoeImpl::COMBINE_NO_QUANT, EarlyWeights, FuseGateUp>
             op;
@@ -62,9 +54,8 @@ __schedmode__(1) __global__
 #endif
 }
 
-extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
-    uint32_t block_dim, uint32_t ub_bytes, void* stream, bool is_a8w4, bool is_a4w4, uint8_t* context, uint8_t* x,
-    uint8_t* x_scales,
+extern "C" __attribute__((visibility("default"))) void mega_moe_fp8_input_kernel_do(
+    uint32_t block_dim, uint32_t ub_bytes, void* stream, bool is_a8w4, uint8_t* context, uint8_t* x, uint8_t* x_scales,
     uint8_t* topk_ids, uint8_t* topk_weights, uint8_t* weight1, uint8_t* weight2, uint8_t* weight_scales1,
     uint8_t* weight_scales2, uint8_t* shared_weight1, uint8_t* shared_weight2, uint8_t* shared_weight_scales1,
     uint8_t* shared_weight_scales2, uint8_t* y, uint8_t* expert_token_nums, uint8_t* workspace, uint8_t* timer,
@@ -74,12 +65,7 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
     static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
     if (tiling.topkWeightsPrefetch) {
     // 按本次实际 BS 编译期特化；不改变 wave 预算、Dispatch/Combine 或共享专家策略。
-    if (is_a4w4) {
-        mega_moe_kernel<false, false, true, true><<<block_dim, ub_bytes, stream>>>(
-            context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
-            shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
-            workspace, timer, tiling, ffts_addr);
-    } else if (is_a8w4 && tiling.actMode != static_cast<uint8_t>(MegaMoeImpl::MegaMoeActMode::GELU) &&
+    if (is_a8w4 && tiling.actMode != static_cast<uint8_t>(MegaMoeImpl::MegaMoeActMode::GELU) &&
         tiling.bs <= MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS) {
         mega_moe_kernel<true, true, true><<<block_dim, ub_bytes, stream>>>(
             context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
@@ -98,12 +84,7 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
     }
     } else {
     // 按本次实际 BS 编译期特化；不改变 wave 预算、Dispatch/Combine 或共享专家策略。
-    if (is_a4w4) {
-        mega_moe_kernel<false, false, false, true><<<block_dim, ub_bytes, stream>>>(
-            context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
-            shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
-            workspace, timer, tiling, ffts_addr);
-    } else if (is_a8w4 && tiling.actMode != static_cast<uint8_t>(MegaMoeImpl::MegaMoeActMode::GELU) &&
+    if (is_a8w4 && tiling.actMode != static_cast<uint8_t>(MegaMoeImpl::MegaMoeActMode::GELU) &&
         tiling.bs <= MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS) {
         mega_moe_kernel<true, true><<<block_dim, ub_bytes, stream>>>(
             context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,

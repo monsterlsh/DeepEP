@@ -590,7 +590,7 @@ void CheckCase(uint32_t sourceRank, uint32_t bs, uint32_t capacity, uint32_t top
     t.hierarchicalSequence = sequence;
     t.sharedExpertNum = shared ? 1U : 0U;
     mainUbLimit = CalcGatewayCombineReduceUbBytes(&t);
-    const PeermemSizeParams sizes{capacity,           topk, hidden, 12U, 32U, 2U, 1U, early, false,
+    const PeermemSizeParams sizes{capacity,           topk, hidden, 12U, 32U, 2U, early, false,
                                   TOPO_TYPE_MTE_ROCE, true, 16U};
     heapBytes = CalcPeermemLeastSize(sizes);
     std::vector<uint8_t> sourceHeap(heapBytes, 0xA5), gatewayHeap(heapBytes, 0xA5);

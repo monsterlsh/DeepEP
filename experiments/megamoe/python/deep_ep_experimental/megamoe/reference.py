@@ -10,7 +10,7 @@ are modeled; this is not a bitwise emulator of Cube accumulation or exp.
 import math
 
 import numpy as np
-from .numerics import normalize_clamp
+from .numerics import normalize_clamp, validate_mma_type
 
 FP4 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=np.float32)
 _code = np.arange(127)
@@ -53,20 +53,6 @@ def gelu(x):
     return (0.5 * x * (1.0 + erf)).astype(np.float32)
 
 
-def fp4_encode(x):
-    """Round finite values to packed E2M1 codes with nearest-even semantics."""
-    x = np.asarray(x, dtype=np.float32)
-    if not np.isfinite(x).all():
-        raise ValueError("FP4 conversion requires finite values")
-    value = np.minimum(np.abs(x), 6)
-    upper = np.searchsorted(FP4[:8], value).clip(0, 7)
-    lower = np.maximum(upper - 1, 0)
-    dl, du = value - FP4[lower], FP4[upper] - value
-    choose_low = (dl < du) | ((dl == du) & ((lower % 2) == 0))
-    code = np.where(choose_low, lower, upper).astype(np.uint8)
-    return code | (np.signbit(x).astype(np.uint8) << 3)
-
-
 def quantize_input(x):
     """ComputeMaxExp/ComputeScale: floor(log2(block_amax))-8, block size 32."""
     x = bf16(x)
@@ -87,36 +73,17 @@ def dequantize_input(codes, scales):
 
 def quantize_activation(x, mma_type="fp8xfp4"):
     """Quantize logical values to the public activation's MX32/E8M0 storage pair."""
-    if mma_type in ("fp8xfp4", "fp8xfp8"):
-        return quantize_input(x)
-    if mma_type != "fp4xfp4":
-        raise ValueError(f"Unknown MegaMoE mma_type: {mma_type!r}")
-    x = bf16(x)
-    if x.shape[-1] % 32 or not np.isfinite(x).all():
-        raise ValueError("Finite inputs and K divisible by 32 are required")
-    blocks = x.reshape(*x.shape[:-1], x.shape[-1] // 32, 32)
-    maximum = np.abs(blocks).max(axis=-1)
-    # E2M1 has maximum exponent two; FP8 E4M3 uses eight in quantize_input.
-    exponent = np.maximum(np.floor(np.log2(np.maximum(maximum, 2.0**-119))) - 2, -127)
-    scale = np.exp2(exponent).astype(np.float32)
-    codes = fp4_encode((blocks / scale[..., None]).reshape(x.shape))
-    packed = codes[..., ::2] | (codes[..., 1::2] << 4)
-    return packed, (exponent + 127).astype(np.uint8)
+    validate_mma_type(mma_type)
+    return quantize_input(x)
 
 
 def dequantize_activation(codes, scales, mma_type="fp8xfp4"):
-    if mma_type in ("fp8xfp4", "fp8xfp8"):
-        return dequantize_input(codes, scales)
-    if mma_type != "fp4xfp4":
-        raise ValueError(f"Unknown MegaMoE mma_type: {mma_type!r}")
-    packed = np.asarray(codes, dtype=np.uint8)
-    values = np.empty((*packed.shape[:-1], packed.shape[-1] * 2), dtype=np.float32)
-    values[..., ::2], values[..., 1::2] = FP4[packed & 15], FP4[packed >> 4]
-    scale = np.exp2(np.asarray(scales, dtype=np.int16) - 127).astype(np.float32)
-    return values * np.repeat(scale, 32, axis=-1)
+    validate_mma_type(mma_type)
+    return dequantize_input(codes, scales)
 
 
 def unpack_weight(pair, mma_type="fp8xfp4"):
+    validate_mma_type(mma_type)
     data, scales = pair
     data = np.asarray(data, dtype=np.uint8)
     if mma_type == "fp8xfp8":
@@ -133,8 +100,7 @@ def make_weights(experts, hidden, intermediate, seed, activation="swiglu", mma_t
     """Generate finite E4M3 or packed E2M1 weights with non-uniform E8M0 scales."""
     if activation not in ("swiglu", "gelu"):
         raise ValueError("activation must be 'swiglu' or 'gelu'")
-    if mma_type not in ("fp8xfp4", "fp8xfp8", "fp4xfp4"):
-        raise ValueError(f"Unknown MegaMoE mma_type: {mma_type!r}")
+    validate_mma_type(mma_type)
     fp8_weights = mma_type == "fp8xfp8"
     rng = np.random.default_rng(seed)
     result = []
@@ -175,6 +141,7 @@ def expert_forward(x, w1, w2, activation_clamp=None, route_weights=None, activat
 
 def local_reference(x, indices, weights, l1, l2, first_expert, activation="swiglu", mma_type="fp8xfp4", topk_weights_type=0):
     """One rank's contribution to one source rank. l1/l2 contain local experts only."""
+    validate_mma_type(mma_type)
     result = np.zeros_like(x, dtype=np.float32)
     early_weights = topk_weights_type == 1
     for local in range(len(l1)):

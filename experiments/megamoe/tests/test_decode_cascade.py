@@ -15,7 +15,7 @@ from deep_ep_experimental.megamoe.decode_cascade import DecodeCascade
         ({"activation_clamp": 7.0}, [32], "unclamped SwiGLU"),
         ({"topk_weights_type": 1}, [32], "Finalize weights"),
         ({"num_shared_experts": 1}, [32], "zero shared experts"),
-        ({"mma_type": "invalid"}, [32], "A8W4, A8W8 and A4W4"),
+        ({"mma_type": "fp4xfp4"}, [32], "A8W4 and A8W8"),
         ({"num_topk": 25}, [32], "TopK <= 16"),
         ({"num_experts": 1056}, [32], "experts <= 1024"),
         ({}, [32, 1024], "BS <= 512"),
@@ -90,44 +90,7 @@ def test_gelu_decode_uses_a_single_cann_fusion_with_nz_weight(monkeypatch):
     assert result == ("quantized_gelu", "gelu_scale")
 
 
-@pytest.mark.parametrize("activation", ["gelu", "swiglu"])
-def test_fp4_decode_gmm1_keeps_fp4_input_weights_and_output(monkeypatch, activation):
-    torch = pytest.importorskip("torch")
-    e8m0 = getattr(torch, "float8_e8m0fnu", None)
-    if e8m0 is None:
-        pytest.skip("E8M0 torch dtype unavailable")
-    config = load_config("ep32_roce_decode")
-    config["model"].update(activation=activation, mma_type="fp4xfp4", topk_weights_type=0)
-    _validate_cascade_comparison(SimpleNamespace(mode="perf", timer=False), config, "decode")
-
-    weight_bytes = torch.zeros((2, 128, 64), dtype=torch.uint8)
-    scale_bytes = torch.full((2, 128, 2, 2), 119, dtype=torch.uint8)
-    gelu_op, swiglu_op = object(), object()
-
-    def format_cast(weight, format_id):
-        assert format_id == 29 and weight.shape == weight_bytes.shape and weight.is_contiguous()
-        return weight.clone()
-
-    monkeypatch.setattr(decode_cascade, "load_fused_gelu_op", lambda: gelu_op)
-    cascade = object.__new__(DecodeCascade)
-    cascade.activation, cascade.mma_type, cascade.e8m0 = activation, "fp4xfp4", e8m0
-    cascade.fp4, cascade.e8m0_operator = 296, 293
-    cascade.torch = torch
-    cascade.weights = ((weight_bytes.transpose(1, 2), scale_bytes.transpose(1, 2)), None)
-    cascade.npu = SimpleNamespace(npu_format_cast=format_cast, npu_grouped_matmul_swiglu_quant_v2=swiglu_op)
-    gmm1, options = cascade._prepare_gmm1()
-    assert options["x_dtype"] == options["weight_dtype"] == cascade.fp4
-    assert options["weight"][0].shape == (2, 64, 128)
-    assert options["weight_scale"][0].shape == (2, 2, 128, 2)
-    if activation == "gelu":
-        assert gmm1 is gelu_op and options["y_dtype"] == cascade.fp4
-        assert options["weight"][0].data_ptr() != weight_bytes.data_ptr()
-    else:
-        assert gmm1 is swiglu_op and options["quant_dtype"] == cascade.fp4
-        assert options["weight"][0].data_ptr() == weight_bytes.data_ptr()
-
-
-@pytest.mark.parametrize(("mma_type", "input_kind"), [("fp8xfp4", "bf16"), ("fp8xfp4", "fp8"), ("fp4xfp4", "fp4")])
+@pytest.mark.parametrize(("mma_type", "input_kind"), [("fp8xfp4", "bf16"), ("fp8xfp4", "fp8"), ("fp8xfp8", "fp8")])
 def test_decode_cascade_routes_prequantized_input_and_combine_metadata(mma_type, input_kind):
     calls = []
 
@@ -140,13 +103,13 @@ def test_decode_cascade_routes_prequantized_input_and_combine_metadata(mma_type,
 
     cascade = object.__new__(DecodeCascade)
     cascade.mma_type = mma_type
-    cascade.fp4 = 296
+    cascade.fp8 = "e4m3"
     cascade.world = 32
     cascade.hidden = 3584
     cascade.communication = {"group_ep": "hccl-decode", "ep_world_size": 32, "ep_rank_id": 3}
     cascade.gmm1_options = {"group_list_type": 1}
     cascade.weights = (None, "gmm2_weights")
-    data = object()
+    data = SimpleNamespace(ndim=2, shape=(32, 3584), dtype=cascade.fp8)
     scale = SimpleNamespace(flatten=lambda dim: ("input_scale", dim))
     cascade._quantize = record("quantize", (data, scale))
     cascade._gmm = record("gmm2", "expanded_output")
@@ -169,7 +132,7 @@ def test_decode_cascade_routes_prequantized_input_and_combine_metadata(mma_type,
     assert dispatch[2]["x"] is data
     assert dispatch[2]["scales"] == ("input_scale", 1)
     assert dispatch[2]["quant_mode"] == 0
-    assert dispatch[2]["x_dtype"] == dispatch[2]["y_dtype"] == (296 if mma_type == "fp4xfp4" else 24)
+    assert dispatch[2]["x_dtype"] == dispatch[2]["y_dtype"] == 24
     assert dispatch[2]["global_bs"] == combine[2]["global_bs"] == 1024
     assert gmm1[2]["x_scale"] == (64, 56, 2)
     assert gmm1[2]["group_list"] == "counts"
