@@ -83,7 +83,8 @@ def collect_overlap(base, root):
                    str(Path(base_python).parent.parent / "lib"), *map(str, argv)]
     else:
         env = {key: base[field] for key, field in (("PYTHON", "python"), ("UBX_CANN_SETUP", "cann_env")) if base.get(field)}
-        command = ["bash", "-c", runner.node_script(runner.REPO_ROOT, env, runner.ENV_SCRIPT, argv)]
+        # This offline reader imports the installed timer protocol and needs no device-side Python paths.
+        command = ["bash", "-c", runner.node_script(runner.REPO_ROOT, env, runner.ENV_SCRIPT, ["-I", *argv])]
     subprocess.run(command, check=True)
     metrics = json.loads(result.read_text(encoding="utf-8"))
     a, b = (metrics["arms"][arm]["host_e2e"]["rank_max_mean_us"] for arm in ("gelu", "swiglu"))

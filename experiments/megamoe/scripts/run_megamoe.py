@@ -6,6 +6,7 @@ import argparse
 from copy import copy
 from functools import cache
 import getpass
+from importlib.machinery import PathFinder
 from ipaddress import IPv4Address
 import json
 import os
@@ -47,11 +48,14 @@ A8_PRECISIONS = ("w4a8", "w8a8")
 WEIGHT_MODE = {"gelu": 1, "swiglu": 0}
 DEVICE_CHECK = """
 import sys
+import socket
 import torch
 import torch_npu
+import deep_ep
 from deep_ep._machine import board_id, physical_device
 from deep_ep_experimental.megamoe.api import _extension
 
+print(f"[UBX] {socket.gethostname()} python={sys.executable} deep_ep={deep_ep.__file__}", flush=True)
 local, require_w8a8 = int(sys.argv[1]), sys.argv[2] == "1"
 backend = sys.argv[3] if len(sys.argv) > 3 else "urma"
 precision = sys.argv[4] if len(sys.argv) > 4 else None
@@ -859,6 +863,23 @@ def run_comparison(args, env, python, check_device):
     return report_comparison(args, plan)
 
 
+def ubx_wheel_env(environment):
+    """Let every child use the chosen environment's wheel while retaining CANN Python modules."""
+    env = dict(environment, PYTHONSAFEPATH="1", PYTHONNOUSERSITE="1")
+    env.pop("PYTHON_EXEC", None)  # torchrun otherwise allows a different worker interpreter.
+    paths = []
+    for entry in env.pop("PYTHONPATH", "").split(os.pathsep):
+        if not entry:  # An empty PYTHONPATH component adds the current checkout even with -P.
+            continue
+        path = os.path.abspath(entry)
+        if any(PathFinder.find_spec(name, [path]) is not None for name in ("deep_ep", "deep_ep_experimental")):
+            continue
+        paths.append(path)
+    if paths:
+        env["PYTHONPATH"] = os.pathsep.join(paths)
+    return env
+
+
 def main(argv=None, run_config=None):
     argv = sys.argv[1:] if argv is None else argv
     args = parse_args(argv, run_config)
@@ -886,8 +907,7 @@ def main(argv=None, run_config=None):
         command = 'set -e; source "$1" --preserve-python; shift; exec "$PYTHON" "$@"'
         worker = ["--worker"] if args.run_config is None else []
         os.execvpe("bash", ["bash", "-c", command, "ubx-env", str(ENV_SCRIPT), str(SCRIPT), *worker, *argv], env)
-    env.pop("PYTHON_EXEC", None)  # Probe, torchrun and its workers must use the same Python.
-    env["PYTHONSAFEPATH"] = "1"
+    env = ubx_wheel_env(env)
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS"):
         env[name] = "1"
     env["GOLDEN_DIR"] = str(Path(env.get("GOLDEN_DIR") or REPO_ROOT / "benchmark-golden").resolve())

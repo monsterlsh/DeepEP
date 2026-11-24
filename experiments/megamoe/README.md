@@ -51,7 +51,7 @@ bash experiments/megamoe/scripts/build_ubx.sh
 - 四份 UBX JSON 默认 `mode=both`、`precision=all`，先测精度，再测性能。单测时将 `mode` 设为 `accuracy` 或 `perf`，将 `precision` 设为 `a8w4`、`a8w8` 或 `a4w4`。也接受 `w4a8`、`w8a8`、`w4a4`。A4W4 使用 packed FP4 激活与 FP4 权重。
 - JSON 中的 `topk` 可设为 1–32，`routing` 可选 `balanced`、`skewed`、`random` 或 `random-balanced`。`check_tokens=0` 全量比对，正数按每卡抽查。`dual_reference=true` 加做 NPU 级联比对。`weighting=early|late` 选择量化前或 Finalize 加权。
 - 运行 JSON 可指定 `golden_dir`、`run_base`、`output_dir`、`python`、`cann_env`。相对路径以运行 JSON 所在目录为起点。
-- EP16 的 JSON 用 `master_addr` 设置本机地址，预设为 `127.0.0.1`。EP32 的 JSON 在 `node_ip` 填两台机器的 IPv4，预设为 `["90.90.93.84", "90.90.93.184"]`。从第一台启动，脚本会通过 SSH 拉起第二台。默认取第一项作为 torchrun 和 SHMEM 的主地址，也可以在 JSON 显式设置 `master_addr`。
+- EP16 的 JSON 用 `master_addr` 设置本机地址，预设为 `127.0.0.1`。EP32 的 JSON 在 `node_ip` 填两台机器的 IPv4，预设为 `["90.90.93.84", "90.90.93.188"]`。从第一台启动，脚本会通过 SSH 拉起第二台。默认取第一项作为 torchrun 和 SHMEM 的主地址，也可以在 JSON 显式设置 `master_addr`。
 - EP32 手动运行时，两台的 JSON 分别设 `node_rank` 为 `0`、`1`，填相同的 `master_addr`、`output_dir`，并移除 `node_ip`。精度先在两台运行 `stage=prepare`，再在两台运行 `stage=run`。性能直接设 `stage=run`。
 - EP16 可复用通过校验的 CPU Golden 和 NPU 精度报告。`force_cpu: true` 重算 Golden，`force_npu: true` 重测 NPU，`force: true` 重跑两段。EP32 的 NPU 精度每轮实测。
 - 每个精度的输出在本轮的 `accuracy-<精度>` 和 `perf-<精度>` 下。检查 `rank_<r>/manifest.json` 的后端与规模，以及 `bs_<B>/accuracy.json` 的校验结果。正式性能读 MTE 系列的 `profiling.json` 或 URMA 的 `performance.json`，同步端到端字段为 `host_e2e.rank_max_mean_us`。

@@ -29,7 +29,8 @@ def ubx(tmp_path, monkeypatch):
     monkeypatch.setenv("PYTHON", sys.executable)
     monkeypatch.setenv("UBX_CANN_LOADED", "test-cann")
     monkeypatch.setenv("PYTHON_EXEC", "unexpected-worker-python")
-    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(map(str, (launcher.SCRIPT.parents[1] / "python", launcher.REPO_ROOT))))
+    source_paths = (launcher.SCRIPT.parents[1] / "python", launcher.REPO_ROOT)
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(map(str, source_paths)))
     for name in ("CHECK_TOKENS", "DUAL_REFERENCE", "ROUTING"):
         monkeypatch.delenv(name, raising=False)
 
@@ -43,6 +44,7 @@ def ubx(tmp_path, monkeypatch):
 
     def probe(command, *, env, **kwargs):
         assert command[0] == sys.executable and "PYTHON_EXEC" not in env
+        assert not env.get("PYTHONPATH") and env["PYTHONNOUSERSITE"] == "1"
         if "-c" in command:
             state.device_checks.append(int(command[-1]))
             if state.fail_device:
@@ -55,12 +57,14 @@ def ubx(tmp_path, monkeypatch):
 
     def logged(command, env, log):
         assert command[0] == sys.executable and "PYTHON_EXEC" not in env
+        assert not env.get("PYTHONPATH") and env["PYTHONNOUSERSITE"] == "1"
 
         def option(name):
             return command[command.index(name) + 1]
 
         if "--module" not in command:
-            original(command, env, log)
+            # This test runs the real CPU Golden from source without installing an NPU wheel.
+            original(command, dict(env, PYTHONPATH=os.pathsep.join(map(str, source_paths))), log)
             state.prepared.append(json.loads(Path(option("--summary")).read_text(encoding="utf-8")))
             return
         assert command[:3] == [sys.executable, "-c", "from torch.distributed.run import main; main()"]

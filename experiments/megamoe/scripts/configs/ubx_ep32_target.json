@@ -81,7 +81,7 @@
     }
   },
   "routing": "balanced",
-  "node_ip": ["90.90.93.84", "90.90.93.184"],
+  "node_ip": ["90.90.93.84", "90.90.93.188"],
   "master_port": 29500,
   "shmem_port": 29180,
   "check_tokens": 0,

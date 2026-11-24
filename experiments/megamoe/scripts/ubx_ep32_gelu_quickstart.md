@@ -5,7 +5,7 @@
 | 节点 | IPv4 | 手动启动时的 `node_rank` |
 | --- | --- | ---: |
 | 主节点 | `90.90.93.84` | 0 |
-| 第二台 | `90.90.93.184` | 1 |
+| 第二台 | `90.90.93.188` | 1 |
 
 仓库目录为 `/mnt/share/l00911701/DeepEP-UBX`。两台之间需要互通 torchrun TCP 29500、SHMEM TCP 29180 和 NPU RoCE 数据面。
 
@@ -22,21 +22,41 @@ export SHMEM_ROOT=/path/to/shmem/install/shmem
 PIP_NO_INDEX=1 bash experiments/megamoe/scripts/build_ubx.sh
 ```
 
-脚本会在本机安装 wheel，打印 `[BUILD] Installed:` 对应的 `dist/build-*/` 下的 wheel 路径及 SHA-256。在 **90.90.93.184** 安装同一份 wheel。第二台能从共享目录读取 wheel 时，直接填构建输出的路径。使用独立磁盘时，先拷入 wheel 再安装。
+脚本会在本机安装 wheel，打印 `[BUILD] Installed:` 对应的 `dist/build-*/` 下的 wheel 路径及 SHA-256。在 **90.90.93.188** 安装同一份 wheel。第二台能从共享目录读取 wheel 时，直接填构建输出的路径。使用独立磁盘时，先拷入 wheel 再安装。
 
 ```bash
 cd /mnt/share/l00911701/DeepEP-UBX
 source experiments/megamoe/scripts/ubx_env.sh
 WHEEL=/path/to/ascend_deepep-实际文件名.whl
 sha256sum "$WHEEL"
-"$PYTHON" -m pip install --no-index --no-deps --force-reinstall "$WHEEL"
+"$PYTHON" -I -m pip --isolated install --no-index --no-deps --force-reinstall "$WHEEL"
 ```
+
+在 node1 的同一个终端验证实际加载路径和 L01 所需的功能。该检查只加载扩展。
+
+```bash
+"$PYTHON" -I - <<'PY'
+import sys
+import deep_ep
+import torch_npu
+from deep_ep_experimental.megamoe.api import _extension
+
+print("Python", sys.executable, "deep_ep", deep_ep.__file__, flush=True)
+ext = _extension()
+print("MegaMoE", ext.__file__)
+for flag in ("mte_roce_enabled", "mte_roce_mx_enabled", "mte_roce_timer_enabled"):
+    if not getattr(ext, flag, False):
+        raise SystemExit(f"UBX L01 requires {flag}")
+PY
+```
+
+若旧日志停在 `require_native("MegaMoE")` 并显示 `is not implemented in DeepEP`，说明当时导入的 `deep_ep` 目录缺少与当前 Python 匹配的 `_C`。若上面的隔离检查成功，使用更新后的 UBX 启动脚本重跑，启动器会过滤 `PYTHONPATH` 中的源码目录、空项和用户级包。若隔离检查也报同一错误，核对打印的解释器、安装路径以及 wheel 的 SHA-256，并用上面的安装命令将 node0 那份 wheel 装入该环境。
 
 ## 2. 生成 JSON 并启动
 
 ### 方案 A：用 `node_ip` 从主节点自动启动
 
-适用于 **90.90.93.84** 可以免交互 SSH 到 **90.90.93.184** 的环境。两台使用同一份 wheel、相同绝对路径的 checkout 和 Python。SSH 登录名或端口有差异时，在运行 JSON 外层填写 `ssh_user` 或 `ssh_port`。
+适用于 **90.90.93.84** 可以免交互 SSH 到 **90.90.93.188** 的环境。两台使用同一份 wheel、相同绝对路径的 checkout 和 Python。SSH 登录名或端口有差异时，在运行 JSON 外层填写 `ssh_user` 或 `ssh_port`。
 
 启动器会在各自节点加载本机的 CANN 和 Python 运行库环境。默认的 CANN 路径不同于预设时，可在 JSON 外层填写两台都可读的 `cann_env`。
 
@@ -61,7 +81,7 @@ settings = json.loads(preset.read_text(encoding="utf-8"))
 settings.update(
     mode="perf",
     precision="a8w4",
-    node_ip=["90.90.93.84", "90.90.93.184"],
+    node_ip=["90.90.93.84", "90.90.93.188"],
     output_dir=output_dir,
     timer=False,
 )
@@ -83,7 +103,7 @@ PY
 cd /mnt/share/l00911701/DeepEP-UBX
 source experiments/megamoe/scripts/ubx_env.sh
 
-NODE_RANK=0  # 90.90.93.184 上改成 1
+NODE_RANK=0  # 90.90.93.188 上改成 1
 OUT=/tmp/megamoe/ep32-gelu-a8w4-01
 RUN_CONFIG="$OUT/gelu-perf-node${NODE_RANK}.json"
 mkdir -p -- "$OUT"
@@ -125,7 +145,7 @@ PY
 | 节点 | 性能 JSON | 启动日志 |
 | --- | --- | --- |
 | `90.90.93.84` | `$OUT/perf-w4a8/rank_0/bs_39280/profiling.json` | `$OUT/perf-w4a8-node0.log` |
-| `90.90.93.184` | `$OUT/perf-w4a8/rank_16/bs_39280/profiling.json` | `$OUT/perf-w4a8-node1.log` |
+| `90.90.93.188` | `$OUT/perf-w4a8/rank_16/bs_39280/profiling.json` | `$OUT/perf-w4a8-node1.log` |
 
 - `host_e2e.rank_max_mean_us` 是逐轮取最慢 rank 后求均值的同步端到端时延，单位 µs。
 - `host_e2e.global_input_tokens_per_second` 是全组输入吞吐。
@@ -159,7 +179,7 @@ source experiments/megamoe/scripts/ubx_env.sh
 
 ## 5. 查看精度结果
 
-精度通过后日志会打印 `[ACCURACY] 全组报告` 路径。以上面的 `output_dir` 为例，在 `90.90.93.84` 查看 `accuracy-w4a8/rank_0/bs_39280/accuracy.json`，在 `90.90.93.184` 查看 `accuracy-w4a8/rank_16/bs_39280/accuracy.json`。每份报告都是包含全组 32 个 rank 的 JSON 数组，误差检查失败时也会保留报告。
+精度通过后日志会打印 `[ACCURACY] 全组报告` 路径。以上面的 `output_dir` 为例，在 `90.90.93.84` 查看 `accuracy-w4a8/rank_0/bs_39280/accuracy.json`，在 `90.90.93.188` 查看 `accuracy-w4a8/rank_16/bs_39280/accuracy.json`。每份报告都是包含全组 32 个 rank 的 JSON 数组，误差检查失败时也会保留报告。
 
 | 字段 | 怎么看 |
 | --- | --- |

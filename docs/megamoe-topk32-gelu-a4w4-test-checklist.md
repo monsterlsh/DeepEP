@@ -208,7 +208,7 @@ U16 为单机 EP16 MTE。U32 为双机 EP32 MTE+RoCE。按各 case 所在表的�
 
 ### U16 与 U32 启动准备
 
-U16 在 90.90.93.84 使用 16 卡，复制 ubx_ep16_target.json，保留 backend=mte。U32 在 90.90.93.84 发起，两台各 16 卡，节点列表为 90.90.93.84 和 90.90.93.184。复制 ubx_ep32_target.json，将 backend 保持为 mte_roce。双机复用相同路径、wheel 和软件环境，确认 SSH 及训练、SHMEM 和数据面链路可用。
+U16 在 90.90.93.84 使用 16 卡，复制 ubx_ep16_target.json，保留 backend=mte。U32 在 90.90.93.84 发起，两台各 16 卡，节点列表为 90.90.93.84 和 90.90.93.188。复制 ubx_ep32_target.json，将 backend 保持为 mte_roce。双机复用相同路径、wheel 和软件环境，确认 SSH 及训练、SHMEM 和数据面链路可用。
 
 ```bash
 bash experiments/megamoe/scripts/build_ubx.sh

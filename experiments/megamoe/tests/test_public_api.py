@@ -17,6 +17,35 @@ from deep_ep_experimental.megamoe import api
 from deep_ep_experimental.megamoe.validation import check_routing, collective_check
 
 
+def test_extension_loads_with_matching_core(monkeypatch):
+    core = SimpleNamespace(create_megamoe_runtime=object())
+    extension = SimpleNamespace(api_protocol=13)
+    monkeypatch.setattr(api, "require_native", lambda name: core)
+    monkeypatch.setitem(sys.modules, api.__package__ + "._C", extension)
+    assert api._extension.__wrapped__() is extension
+
+
+@pytest.mark.parametrize("missing", [True, False], ids=["missing-core", "shmem-loader-error"])
+def test_extension_reports_native_load_failure(monkeypatch, missing):
+    import deep_ep
+
+    failure = (NotImplementedError("MegaMoE is not implemented in DeepEP")
+               if missing else ImportError("SHMEM checksum mismatch"))
+
+    def require_native(name):
+        assert name == "MegaMoE"
+        raise failure
+
+    monkeypatch.setattr(api, "require_native", require_native)
+    with pytest.raises(ImportError) as caught:
+        api._extension.__wrapped__()
+    if missing:
+        assert caught.value.__cause__ is failure
+        assert all(value in str(caught.value) for value in (sys.executable, deep_ep.__file__, "deep_ep._C", "-m pip"))
+    else:
+        assert caught.value is failure
+
+
 class Device(str):
     @property
     def type(self):

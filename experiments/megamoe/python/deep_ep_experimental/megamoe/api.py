@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 import importlib
+import sys
 import threading
 from typing import TYPE_CHECKING
 
@@ -29,7 +30,17 @@ _TIMER_REQUIREMENTS = "Timer supports W4A8, MTE A4W4 and windowed URMA W8A8 in b
 
 @lru_cache(maxsize=1)
 def _extension():
-    core = require_native("MegaMoE")
+    try:
+        core = require_native("MegaMoE")
+    except NotImplementedError as exc:
+        import deep_ep
+
+        raise ImportError(
+            f"MegaMoE requires deep_ep._C. Python {sys.executable} imported {deep_ep.__file__}, "
+            "which has no native core matching this interpreter. "
+            "Check whether the checkout shadows the installed package, and install the matching "
+            "MegaMoE wheel with this interpreter's -m pip."
+        ) from exc
     if not hasattr(core, "create_megamoe_runtime"):
         raise RuntimeError("Install a wheel built with DEEPEP_BUILD_MEGAMOE=ON")
     try:

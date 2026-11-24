@@ -48,7 +48,7 @@ def test_l0_preset_and_default_plan(plan, case, machine, precision, mma):
     assert config["master_port"] != config["shmem_port"]
     if machine == "ubx":
         assert config["backend"] == "mte_roce"
-        assert config["node_ip"] == ["90.90.93.84", "90.90.93.184"]
+        assert config["node_ip"] == ["90.90.93.84", "90.90.93.188"]
     else:
         assert config["backend"] == "mte"
         assert config["nodes"] == ["177.22.21.1", "177.22.22.1", "177.22.27.1", "177.22.28.1"]
