@@ -48,7 +48,7 @@ def test_prefill_routes_payload_and_weight_through_uneven_two_rank_splits(monkey
         return (expanded * scales[:, :, None]).sum(dim=1)
 
     def run_rank(rank, data, scale, ids, weights):
-        cascade = object.__new__(prefill_cascade.GeluPrefillCascade)
+        cascade = object.__new__(prefill_cascade.PrefillCascade)
         cascade.torch = torch
         cascade.dist = SimpleNamespace(all_to_all_single=exchange(rank))
         cascade.npu = SimpleNamespace(

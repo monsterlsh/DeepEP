@@ -19,10 +19,10 @@ def validate_decode_case(config):
     ):
         raise ValueError("Decode comparison requires unclamped SwiGLU or GELU, Finalize weights and zero shared experts")
     mma_type = model.get("mma_type", "fp8xfp4")
-    if activation == "gelu" and mma_type != "fp8xfp8":
-        raise ValueError("Fused GELU Decode requires A8W8; the CANN operator needs matching FP8 operands")
-    if mma_type not in ("fp8xfp4", "fp8xfp8"):
-        raise ValueError("Decode comparison supports A8W4 and A8W8")
+    if activation == "gelu" and mma_type not in ("fp8xfp8", "fp4xfp4"):
+        raise ValueError("Fused GELU Decode requires A8W8 or A4W4 with matching MX operands")
+    if mma_type not in ("fp8xfp4", "fp8xfp8", "fp4xfp4"):
+        raise ValueError("Decode comparison supports A8W4, A8W8 and A4W4")
     # Match moe_test --stage auto so a regression run stays on the Decode workload.
     if max(config["bs_values"]) > 512 or model["num_topk"] > 16 or model["num_experts"] > 1024:
         raise ValueError("Decode comparison requires per-rank BS <= 512, TopK <= 16 and experts <= 1024")
@@ -62,34 +62,43 @@ class DecodeCascade(CascadeReference):
 
     def _prepare_gmm1(self):
         weight, scale = self.weights[0]
+        packed_fp4 = self.mma_type == "fp4xfp4"
         if self.activation == "gelu":
-            # Follow the CANN MXFP8 non-transposed layout. Make the [E,K,N]
-            # byte view contiguous before casting it to NZ, outside timing.
-            weight = weight.view(self.torch.uint8).contiguous().view(self.fp8)
-            nz_weight = self.npu.npu_format_cast(weight, 29, customize_dtype=self.fp8)
-            return load_fused_gelu_op(), dict(
+            if packed_fp4:
+                # Preserve packing along K in the transposed-weight variant.
+                planar = weight.transpose(1, 2).contiguous()
+                nz_weight = self.npu.npu_format_cast(planar, 29).transpose(1, 2)
+            else:
+                weight = weight.view(self.torch.uint8).contiguous().view(self.fp8)
+                nz_weight = self.npu.npu_format_cast(weight, 29, customize_dtype=self.fp8)
+            options = dict(
                 weight=[nz_weight],
                 weight_scale=[scale.contiguous().view(self.e8m0)],
                 activation_type="gelu_tanh",
                 group_list_type=1,
                 quant_mode="mx",
-                y_dtype=self.fp8,
+                y_dtype=self.fp4 if packed_fp4 else self.fp8,
                 weight_scale_dtype=_E8M0,
                 x_scale_dtype=_E8M0,
             )
+            if packed_fp4:
+                options.update(x_dtype=self.fp4, weight_dtype=self.fp4)
+            return load_fused_gelu_op(), options
         options = dict(
             weight=[weight],
             weight_scale=[scale.view(self.e8m0)],
             dequant_mode=2,
             dequant_dtype=self.torch.float32,
             quant_mode=2,
-            quant_dtype=_FP8_E4M3,
+            quant_dtype=self.fp4 if packed_fp4 else _FP8_E4M3,
             group_list_type=1,
             weight_scale_dtype=self.e8m0_operator,
             x_scale_dtype=self.e8m0_operator,
         )
-        if self.mma_type == "fp8xfp4":
+        if self.mma_type != "fp8xfp8":
             options["weight_dtype"] = self.fp4
+        if packed_fp4:
+            options["x_dtype"] = self.fp4
         return self.npu.npu_grouped_matmul_swiglu_quant_v2, options
 
     def forward(self, x, ids, weights, *, input_kind, quantized=None):
@@ -100,16 +109,17 @@ class DecodeCascade(CascadeReference):
             data, scale = quantized
         npu = self.npu
         global_bs = ids.shape[0] * self.world
+        activation_dtype = self.fp4 if self.mma_type == "fp4xfp4" else _FP8_E4M3
         expanded, expanded_scale, assist, counts, ep_counts, tp_counts, _ = npu.npu_moe_distribute_dispatch_v2(
             x=data,
             scales=scale.flatten(1),
-            x_dtype=_FP8_E4M3,
+            x_dtype=activation_dtype,
             scales_dtype=_E8M0,
             expert_ids=ids,
             x_active_mask=None,
             quant_mode=0,
             global_bs=global_bs,
-            y_dtype=_FP8_E4M3,
+            y_dtype=activation_dtype,
             **self.communication,
         )
         intermediate, intermediate_scale = self.gmm1(

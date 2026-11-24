@@ -153,7 +153,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
             TORCH_CHECK(!out || !out->is_alias_of(*tensor), "out must not alias shared inputs");
         }
         const bool fp8 = shared_weight1->scalar_type() == c10::ScalarType::Float8_e4m3fn;
-        TORCH_CHECK((fp8 || shared_weight1->scalar_type() == torch::kUInt8) &&
+        TORCH_CHECK(((fp8 && !fp4_input) || shared_weight1->scalar_type() == torch::kUInt8) &&
                         shared_weight1->scalar_type() == shared_weight2->scalar_type(),
                     "invalid shared projection types");
         const int64_t packing = fp8 ? 1 : 2;

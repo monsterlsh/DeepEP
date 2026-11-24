@@ -8,6 +8,15 @@ import sys
 import pytest
 
 
+def _function_body(source, signature):
+    opening = source.index("{", source.index(signature))
+    end, depth = opening + 1, 1
+    while depth:
+        depth += (source[end] == "{") - (source[end] == "}")
+        end += 1
+    return source[opening:end]
+
+
 def test_mte_ep32_shape_windows(tmp_path):
     compiler = next((path for name in ("c++", "g++", "clang++") if (path := shutil.which(name))), None)
     if compiler is None:
@@ -315,3 +324,27 @@ int main() {
         check=True,
     )
     subprocess.run([str(executable)], check=True, timeout=30)
+
+
+def test_mte_a8w4_prefill_dispatch_preserves_route_coverage(tmp_path):
+    compiler = next((path for name in ("c++", "g++", "clang++") if (path := shutil.which(name))), None)
+    if compiler is None:
+        pytest.skip("The MTE Dispatch probe requires a host C++17 compiler")
+    csrc = Path(__file__).resolve().parents[1] / "csrc"
+    wave = (csrc / "kernels/mega_moe/mega_moe_wave_a8w4.hpp").read_text(encoding="utf-8")
+    fixture = Path(__file__).with_name("mte_prefill_dispatch_test.cpp").read_text(encoding="utf-8")
+    selector = "void DispatchWaveRange("
+    if selector in wave:
+        fixture = fixture.replace("/* SELECTOR */;", _function_body(wave, selector))
+    start = wave.index("ExpertTokenRange firstDispatchRange")
+    stop = wave.index("dispatchPosition = plannedDispatchPosition;", start)
+    first_wave = wave[start : stop + len("dispatchPosition = plannedDispatchPosition;")]
+    next_slice = _function_body(wave, "::DispatchNextExpertSlice(")
+    source = tmp_path / "prefill_dispatch.cpp"
+    source.write_text(
+        fixture.replace("/* FIRST WAVE */", first_wave).replace("/* NEXT SLICE */", next_slice), encoding="utf-8"
+    )
+    executable = tmp_path / ("prefill_dispatch.exe" if sys.platform == "win32" else "prefill_dispatch")
+    subprocess.run([compiler, "-std=c++17", "-I", str(csrc), str(source), "-o", str(executable)], check=True)
+    for window in (256, 257, 2048):
+        subprocess.run([str(executable), str(window)], check=True, timeout=30)

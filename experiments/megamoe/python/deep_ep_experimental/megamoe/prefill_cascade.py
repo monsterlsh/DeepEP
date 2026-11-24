@@ -1,4 +1,4 @@
-"""GELU prefill performance reference with rank-local AllToAll routing."""
+"""Prefill performance reference with rank-local AllToAll routing."""
 
 from .cascade import CascadeReference
 
@@ -7,8 +7,8 @@ PREFILL_TOKEN_WINDOW = 4096
 FFN_ROW_TILE = 32768
 
 
-class GeluPrefillCascade(CascadeReference):
-    """Run the moe_test AllToAll prefill routing pattern with a GELU FFN.
+class PrefillCascade(CascadeReference):
+    """Run the moe_test AllToAll prefill routing pattern with a routed FFN.
 
     Each source window expands only its own routes. The expert owner computes
     in bounded row tiles, preserving the grouping within each GMM tile.
@@ -33,6 +33,8 @@ class GeluPrefillCascade(CascadeReference):
         return codes.view(self.torch.int8).index_select(0, indices).view(codes.dtype)
 
     def _activation_quantize(self, first, route_weights=None):
+        if self.activation != "gelu":
+            return super()._activation_quantize(first, route_weights)
         activated = self.torch.nn.functional.gelu(first.float(), approximate="none")
         if route_weights is not None:
             activated.mul_(route_weights[:, None])
@@ -124,7 +126,7 @@ class GeluPrefillCascade(CascadeReference):
         ).reshape(data.shape[0], self.hidden).to(torch.bfloat16)
 
     def forward(self, x, ids, weights, *, input_kind, quantized=None):
-        """Return one rank's BF16 outputs for a large GELU prefill forward."""
+        """Return one rank's BF16 outputs for a large prefill forward."""
         if input_kind == "bf16":
             data, scale = self._quantize(x)
         else:

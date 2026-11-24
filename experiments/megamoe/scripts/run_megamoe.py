@@ -170,7 +170,7 @@ def cascade_stage(args):
 
 
 def decode_cascade_precisions(model):
-    return ("w8a8",) if model.get("activation") == "gelu" else A8_PRECISIONS
+    return ("w8a8", "w4a4") if model.get("activation") == "gelu" else tuple(MMA_TYPES)
 
 
 def validate_cascade_comparison(stage, model, bs, mode, precisions, dual_reference):
@@ -181,16 +181,16 @@ def validate_cascade_comparison(stage, model, bs, mode, precisions, dual_referen
     if stage == "decode":
         if set(precisions) - set(decode_cascade_precisions(model)):
             if activation == "gelu":
-                raise ValueError("Decode GELU 融合小算子仅支持 A8W8")
-            raise ValueError("Decode SwiGLU 小算子级联对照支持 A8W4 和 A8W8")
+                raise ValueError("Decode GELU 融合小算子支持 A8W8 和 A4W4")
+            raise ValueError("Decode SwiGLU 小算子级联对照支持 A8W4、A8W8 和 A4W4")
         if (activation not in WEIGHT_MODE or type(weight_mode) is not int or weight_mode != 0
                 or model["num_shared_experts"] != 0 or model.get("activation_clamp") is not None):
             raise ValueError("Decode 级联对照要求无截断的 SwiGLU 或 GELU、Finalize 加权、零共享专家")
         if bs > 512 or model["num_topk"] > 16 or model["num_experts"] > 1024:
             raise ValueError("Decode 级联对照要求每卡 BS <= 512、TopK <= 16、专家总数 <= 1024")
-    elif (activation != "gelu" or model["num_shared_experts"] != 0
+    elif (activation not in WEIGHT_MODE or model["num_shared_experts"] != 0
           or type(weight_mode) is not int or weight_mode not in (0, 1)):
-        raise ValueError("Prefill 级联对照要求 GELU、零共享专家，以及提前或 Finalize 加权")
+        raise ValueError("Prefill 级联对照要求 GELU 或 SwiGLU、零共享专家，以及提前或 Finalize 加权")
 
 
 def read_run_config(path):
@@ -358,7 +358,7 @@ def parse_args(argv, run_config=None):
             parser.error("MTE 和 MTE+RoCE 使用独立精度/性能轮，A/B 参数适用于 URMA")
         if args.perf_scope != "all":
             parser.error("MTE 和 MTE+RoCE 使用默认性能采样范围")
-    elif args.precision == "w4a4" and args.cascade_stage != "decode":
+    elif args.precision == "w4a4":
         parser.error("URMA 暂不支持 W4A4。EP16 使用 --backend mte，EP32 使用 --backend mte_roce")
     if args.ep_size == 16:
         if args.node_ip or args.node_rank is not None or args.stage:
@@ -457,8 +457,6 @@ def parse_args(argv, run_config=None):
         model = case_model(args)
         activation = model.get("activation", "swiglu")
         weight_mode = model.get("topk_weights_type", WEIGHT_MODE[activation])
-        if roce and model["num_shared_experts"] and activation != "swiglu":
-            parser.error("MTE+RoCE 共享专家需要 W4A8 SwiGLU")
         if args.backend == "urma" and (model["num_shared_experts"] or activation == "swiglu" and weight_mode != 0):
             parser.error("URMA 入口要求零共享专家，SwiGLU 使用 Finalize 加权")
         validate_geometry(model, args.ep_size)
@@ -467,7 +465,10 @@ def parse_args(argv, run_config=None):
 
     supported = A8_PRECISIONS if args.backend == "urma" else tuple(MMA_TYPES)
     if args.cascade_stage == "decode":
-        supported = decode_cascade_precisions(model)
+        supported = tuple(p for p in decode_cascade_precisions(model) if p in supported)
+    shared_precisions = {"w4a8", "w4a4"} if not roce or activation == "swiglu" else {"w4a4"}
+    if model["num_shared_experts"]:
+        supported = tuple(p for p in supported if p in shared_precisions)
     wanted = supported if args.precision in (None, "all") else (args.precision,)
     if args.mode == "compare" and args.precision is None:
         wanted = comparison_precisions
@@ -495,8 +496,8 @@ def parse_args(argv, run_config=None):
         parser.error("W4A4 需要 fp4 输入，W4A8/W8A8 需要 fp8 输入，混合精度可省略 --input")
     if args.timer and args.backend == "mte" and selected - {"w4a8", "w4a4"}:
         parser.error("本机 MTE 设备 timer 请指定 w4a8 或 w4a4")
-    if model["num_shared_experts"] and selected - {"w4a8"}:
-        parser.error("共享专家要求 W4A8 路由专家")
+    if model["num_shared_experts"] and selected - shared_precisions:
+        parser.error("共享专家要求 W4A8 或 W4A4，MTE+RoCE 的 W4A8 需要 SwiGLU")
     return args
 
 
@@ -947,7 +948,7 @@ def cli(argv=None, run_config=None):
 
 def pod_settings(path, data):
     settings = dict(
-        ep_size=8, node_rank=0, master_addr="",
+        ep_size=8, node_rank=0, master_addr="", rdzv_id="",
         master_port=int(os.environ.get("MASTER_PORT") or 29181),
         shmem_port=int(os.environ.get("SHMEM_PORT") or 29180),
         routing=os.environ.get("ROUTING") or "balanced", check_tokens=int(os.environ.get("CHECK_TOKENS") or 0),
@@ -956,7 +957,8 @@ def pod_settings(path, data):
         run_base=os.environ.get("RUN_BASE") or str(REPO_ROOT / "benchmark-runs"), output_dir="",
         python=os.environ.get("PYTHON") or "", base_python=os.environ.get("BASE_PYTHON") or POD_PYTHON,
         cann_env=os.environ.get("CANN_ENV") or POD_CANN_ENV, backend="mte",
-        golden_only=False, skip_golden=False, plan=False, compare_decode_cascade=False, compare_prefill_cascade=False,
+        golden_only=False, skip_golden=False, plan=False, timer=False,
+        compare_decode_cascade=False, compare_prefill_cascade=False,
     )
     unknown = data.keys() - settings.keys() - {"schema_version", "machine", "mode", "precision", "config", "bs"}
     if unknown:
@@ -994,14 +996,8 @@ def pod_settings(path, data):
 
     args.spec = data["config"]
     model = args.spec["model"]
-    if not args.cascade_stage:
-        if args.precision == "w4a4":
-            if args.ep_size != 32:
-                raise ValueError("950POD A4W4 需要 EP32（四台各 8 卡）")
-            if model.get("activation") not in WEIGHT_MODE or model["num_shared_experts"] != 0:
-                raise ValueError("950POD A4W4 支持 GELU 或 SwiGLU，且要求零共享专家")
-        elif model.get("activation") != "gelu":
-            raise ValueError("950POD 入口需要 GELU 模型")
+    if model.get("activation", "swiglu") not in WEIGHT_MODE:
+        raise ValueError("950POD 支持 GELU 或 SwiGLU")
     validate_geometry(model, args.ep_size)
     if "bs" in data:
         args.bs = data["bs"]
@@ -1012,12 +1008,19 @@ def pod_settings(path, data):
         args.bs = batches[0]
     if type(args.bs) is not int or not 1 <= args.bs <= 65536:
         raise ValueError("bs 必须在 1..65536")
-    precisions = decode_cascade_precisions(model) if args.cascade_stage == "decode" else A8_PRECISIONS
+    if args.cascade_stage == "decode":
+        precisions = decode_cascade_precisions(model)
+    elif model["num_shared_experts"]:
+        precisions = ("w4a8", "w4a4")
+    else:
+        precisions = tuple(MMA_TYPES)
     args.precisions = precisions if args.precision == "all" else (args.precision,)
+    if args.timer and (args.mode != "perf" or args.cascade_stage or "w8a8" in args.precisions):
+        raise ValueError("950POD 设备 timer 需要 A8W4 或 A4W4 原生融合 perf")
     if args.cascade_stage:
         validate_cascade_comparison(args.cascade_stage, model, args.bs, args.mode, args.precisions, args.dual_reference)
-        if args.precision == "w4a4" and args.ep_size != 32:
-            raise ValueError("950POD A4W4 需要 EP32（四台各 8 卡）")
+    if model["num_shared_experts"] and "w8a8" in args.precisions:
+        raise ValueError("950POD 共享专家要求 W4A8 或 W4A4")
     args.python = args.python or args.base_python
     return args
 
@@ -1085,12 +1088,16 @@ def run_pod_case(args, precision, python, env, first):
         python, "-I", "-c", "from torch.distributed.run import main; main()", "--rdzv-backend=static",
         f"--nnodes={args.ep_size // POD_RANKS}", f"--nproc-per-node={POD_RANKS}", f"--node-rank={args.node_rank}",
         f"--master-addr={args.master_addr}", f"--master-port={args.master_port}", "--max-restarts=0",
+        *([f"--rdzv-id={args.rdzv_id}"] if args.rdzv_id else []),
         "--module", f"{MODULE}.benchmark", *options, "--mode", args.mode, "--output-dir", str(output),
     ]
     if args.mode == "accuracy" and args.dual_reference:
         command.append("--dual-reference")
     if args.cascade_stage:
         command.append(f"--compare-{args.cascade_stage}-cascade")
+    if args.timer:
+        ranks = range(0, args.ep_size, POD_RANKS // TIMER_RANKS_PER_NODE)
+        command.extend(("--timer", "--timer-ranks", ",".join(map(str, ranks))))
     with (args.output_dir / f"{args.mode}-{label}.log").open("w", encoding="utf-8") as log:
         run_logged(command, env, log)
         if args.mode == "perf":
@@ -1151,12 +1158,30 @@ def entrypoint(argv=None):
 
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--run-config", required=True, type=Path, help="包含机型和全部测试参数的 JSON")
+    parser.add_argument("--plan", action="store_true", help="只打印运行计划")
+    parser.add_argument("--only", choices=("accuracy", "perf", "prefill"), help="仅运行 L0 清单中选定的阶段")
     add_cascade_arguments(parser)
     args = parser.parse_args(argv)
     path = args.run_config.resolve()
     try:
         data = read_run_config(path)
         stage = cascade_stage(args)
+        if "suite" in data:
+            if stage:
+                raise ValueError("L0 清单选择级联请使用 --only prefill")
+            if __package__:
+                from .l0_suite import run_l0
+            else:
+                sys.path.insert(0, str(SCRIPT.parent))
+                try:
+                    from l0_suite import run_l0
+                finally:
+                    sys.path.pop(0)
+            return run_l0(path, data, only=args.only, plan=args.plan)
+        if args.only:
+            raise ValueError("--only 适用于 L0 清单预设")
+        if args.plan:
+            data["plan"] = True
         if stage:
             data[f"compare_{stage}_cascade"] = True
         if data.get("machine") not in ("ubx", "950pod"):
@@ -1173,7 +1198,7 @@ def entrypoint(argv=None):
             return cli(["--run-config", str(path), *extra], data)
         return run_pod(path, data)
     except subprocess.CalledProcessError as error:
-        print(f"[950 POD] 子进程退出，状态 {error.returncode}。", file=sys.stderr)
+        print(f"[MegaMoE] 子进程退出，状态 {error.returncode}。", file=sys.stderr)
         return error.returncode if error.returncode >= 0 else 128 - error.returncode
     except (OSError, KeyError, ValueError, argparse.ArgumentTypeError) as error:
         parser.error(f"{path}: {error}")

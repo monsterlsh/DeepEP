@@ -1,6 +1,6 @@
 # Copyright (c) 2026, Lu Lu
 
-"""Compare native UBX first-window, rank-local stage envelopes offline."""
+"""Compare native first-window, rank-local stage envelopes on UBX and 950POD."""
 
 import argparse
 from collections import Counter
@@ -10,6 +10,7 @@ import mmap
 from pathlib import Path
 from statistics import mean
 import struct
+import sys
 
 from deep_ep_experimental.megamoe import roce_trace
 from deep_ep_experimental.megamoe.timer import protocol as mte
@@ -19,14 +20,18 @@ if __package__:
     from .summarize_megamoe_overlap import PHASES, aggregate, phase_metrics, read_json, union
     from .ubx_ab_report import CONTRACTS, read_manifests
 else:
-    from summarize_megamoe_overlap import PHASES, aggregate, phase_metrics, read_json, union
-    from ubx_ab_report import CONTRACTS, read_manifests
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from summarize_megamoe_overlap import PHASES, aggregate, phase_metrics, read_json, union
+        from ubx_ab_report import CONTRACTS, read_manifests
+    finally:
+        sys.path.pop(0)
 
 
 TOPOLOGIES = {"mte": (16, "shmem_mte"), "mte_roce": (32, "shmem_mte_roce")}
 TIMER_MODES = {
     "mte": {"fp8xfp4": ("w4a8", "fp8"), "fp4xfp4": ("w4a4", "fp4")},
-    "mte_roce": {"fp8xfp4": ("w4a8", "fp8"), "fp4xfp4": ("w4a4", "fp4")},
+    "mte_roce": {"fp8xfp4": ("w4a8", "fp8"), "fp8xfp8": ("w8a8", "fp8"), "fp4xfp4": ("w4a4", "fp4")},
 }
 GMM = ("AIC_GMM1", "AIC_GMM2")
 MTE_FAMILIES = (*GMM, "AIV_DISPATCH", "AIV_COMBINE")
@@ -44,11 +49,17 @@ def positive_number(value):
     return type(value) in (int, float) and math.isfinite(value) and value > 0
 
 
-def read_job(root, arm):
+def read_job(root, arm, *, platform="ubx"):
     first = read_json(root / "rank_0" / "manifest.json")
     backend = first["backend"]
     require(backend in TOPOLOGIES, f"{root}: expected native UBX mte or mte_roce")
     world, transport = TOPOLOGIES[backend]
+    local = 16
+    if platform == "950pod":
+        require(backend == "mte", f"{root}: 950POD requires MTE")
+        world, local = 32, 8
+    elif platform != "ubx":
+        raise ValueError(f"Unknown platform {platform!r}")
     config = first["config"]
     model = config["model"]
     batches = config["bs_values"]
@@ -70,8 +81,10 @@ def read_job(root, arm):
     windows = (bs + window - 1) // window
     timers = first["timer_ranks"]
     require(isinstance(timers, list) and all(type(rank) is int and 0 <= rank < world for rank in timers)
-            and len(set(timers)) == len(timers) and {rank // 16 for rank in timers} == set(range(world // 16)),
+            and len(set(timers)) == len(timers) and {rank // local for rank in timers} == set(range(world // local)),
             f"{root}: invalid sample rank list or missing node coverage")
+    if platform == "950pod":
+        require(sorted(timers) == list(range(0, world, 2)), f"{root}: expected four even-numbered timer ranks per 950POD node")
     run_id = first["run_id"]
     require(isinstance(run_id, str) and run_id not in ("", "none"), f"{root}: missing benchmark run ID")
     build = first["build"]
@@ -86,7 +99,7 @@ def read_job(root, arm):
     manifests = read_manifests([root], world)
     agreed = dict(
         config=config, input=input_kind, backend=backend, ep_size=world, device_communication=transport,
-        ranks_per_node=16, mode="perf", perf_scope="all", numerical_contract=CONTRACTS[arm],
+        ranks_per_node=local, mode="perf", perf_scope="all", numerical_contract=CONTRACTS[arm],
         timer_scope="first_window_only", run_id=run_id, build=build, routing=first["routing"],
         paired_weights=first["paired_weights"], timer_ranks=timers, window_tokens=window,
         windows_per_forward_by_bs={str(bs): windows},
@@ -94,7 +107,7 @@ def read_job(root, arm):
     devices, cases, host = [], {}, None
     for rank, (directory, manifest) in enumerate(manifests):
         mismatches = [key for key, expected in agreed.items() if manifest.get(key) != expected]
-        require(not mismatches and type(manifest["local_rank"]) is int and manifest["local_rank"] == rank % 16,
+        require(not mismatches and type(manifest["local_rank"]) is int and manifest["local_rank"] == rank % local,
                 f"{directory}: inconsistent rank manifest ({', '.join(mismatches) or 'local_rank'})")
         devices.append(manifest.get("device_identity"))
         case = directory / f"bs_{bs}"
@@ -122,9 +135,9 @@ def read_job(root, arm):
     require(slowest == host["rank_max_rounds_us"] and math.isclose(host["rank_max_mean_us"], latency, rel_tol=1e-12)
             and math.isclose(host["global_input_tokens_per_second"], throughput, rel_tol=1e-12),
             f"{root}: formal host summary disagrees with per-rank timings")
-    devices = validate_devices(root, devices)
+    devices = validate_devices(root, devices, local)
     return dict(
-        root=root, run_id=run_id, backend=backend, ep_size=world, ranks_per_node=16, bs=bs,
+        root=root, run_id=run_id, backend=backend, ep_size=world, ranks_per_node=local, bs=bs,
         config=config, build=build, routing=first["routing"], paired_weights=first["paired_weights"],
         precision=precision, input=input_kind,
         window_tokens=window, windows_per_forward=windows, timer_token_range_half_open=[0, min(bs, window)],
@@ -133,7 +146,7 @@ def read_job(root, arm):
     )
 
 
-def validate_devices(root, devices):
+def validate_devices(root, devices, local):
     if all(device is None for device in devices):
         return None
     require(all(isinstance(device, dict) and isinstance(device.get("host_boot_id"), str)
@@ -141,9 +154,9 @@ def validate_devices(root, devices):
                 and device["physical_device"] >= 0 for device in devices),
             f"{root}: partial or invalid physical device identity")
     ids = [(device["host_boot_id"], device["physical_device"]) for device in devices]
-    require(len(set(ids)) == len(ids) and len({host for host, _ in ids}) == len(ids) // 16
-            and all(len({host for host, _ in ids[start : start + 16]}) == 1 for start in range(0, len(ids), 16)),
-            f"{root}: physical identity contradicts UBX node/rank topology")
+    require(len(set(ids)) == len(ids) and len({host for host, _ in ids}) == len(ids) // local
+            and all(len({host for host, _ in ids[start : start + local]}) == 1 for start in range(0, len(ids), local)),
+            f"{root}: physical identity contradicts node/rank topology")
     return ids
 
 
@@ -287,8 +300,8 @@ def rank_phases(job, rank):
     )
 
 
-def compare(gelu_root, swiglu_root):
-    jobs = {arm: read_job(Path(root), arm) for arm, root in (("gelu", gelu_root), ("swiglu", swiglu_root))}
+def compare(gelu_root, swiglu_root, *, platform="ubx"):
+    jobs = {arm: read_job(Path(root), arm, platform=platform) for arm, root in (("gelu", gelu_root), ("swiglu", swiglu_root))}
     gelu, swiglu = (jobs[arm] for arm in ("gelu", "swiglu"))
     common = ("backend", "ep_size", "ranks_per_node", "bs", "routing", "paired_weights", "precision", "input", "window_tokens",
               "windows_per_forward", "timer_token_range_half_open", "timer_ranks")
@@ -317,7 +330,7 @@ def compare(gelu_root, swiglu_root):
     require([row["combine_endpoint"] for row in arms["gelu"]["ranks"]]
             == [row["combine_endpoint"] for row in arms["swiglu"]["ranks"]], "A/B Combine endpoint types differ")
     return dict(
-        schema="ubx_native_first_window_overlap_v1", scope="rank_local_native_first_window_stage_envelopes",
+        schema=f"{platform}_native_first_window_overlap_v1", scope="rank_local_native_first_window_stage_envelopes",
         physical_mapping="verified" if gelu["devices"] is not None else "unverified", arms=arms,
         case=dict({key: gelu[key] for key in common}, seed=gelu["config"]["seed"],
                   model=comparable_config(gelu)["model"],
@@ -337,11 +350,12 @@ def compare(gelu_root, swiglu_root):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--platform", choices=("ubx", "950pod"), default="ubx")
     for name in ("gelu", "swiglu", "output"):
         parser.add_argument(f"--{name}", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
-        report = compare(args.gelu, args.swiglu)
+        report = compare(args.gelu, args.swiglu, platform=args.platform)
         args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     except (OSError, KeyError, TypeError, ValueError) as error:
         parser.exit(1, f"{parser.prog}: {error}\n")

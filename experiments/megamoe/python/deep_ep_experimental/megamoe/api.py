@@ -267,7 +267,7 @@ class SymmBuffer:
         urma = self._backend_name == "urma"
         roce = self._backend_name == "mte_roce"
         local_mte = self._backend_name == "mte" and (backend == "mte" or mma_type == "fp4xfp4")
-        pod_a4w4_mte = local_mte and mma_type == "fp4xfp4" and size == 32 and ranks_per_node == 8
+        pod_a4w4_mte = local_mte and mma_type == "fp4xfp4" and size in (8, 16, 32) and ranks_per_node == 8
         if topk_weights_type is None:
             topk_weights_type = int(activation == "gelu")
         urma_swiglu = (
@@ -313,12 +313,13 @@ class SymmBuffer:
             if roce:
                 if size != 32 or ranks_per_node != 16:
                     raise ValueError("MTE+RoCE requires EP32 on two 16-rank hosts")
-                if num_shared_experts and (mma_type, activation) != ("fp8xfp4", "swiglu"):
-                    raise ValueError("MTE+RoCE shared experts require W4A8 SwiGLU")
+                if (num_shared_experts and mma_type != "fp4xfp4"
+                        and (mma_type, activation) != ("fp8xfp4", "swiglu")):
+                    raise ValueError("MTE+RoCE shared experts require W4A8 SwiGLU or A4W4")
             if local_mte and not pod_a4w4_mte:
                 if size != 16 or ranks_per_node not in (0, 16):
                     if mma_type == "fp4xfp4":
-                        raise ValueError("MTE A4W4 requires 16 ranks on one host or EP32 on four 8-rank hosts")
+                        raise ValueError("MTE A4W4 requires 16 ranks on one host or EP8/16/32 with 8 ranks per host")
                     raise ValueError("UBX local MTE requires all 16 ranks on one host")
                 ranks_per_node = 16
             if self._urma_windowed:
@@ -343,8 +344,8 @@ class SymmBuffer:
                 raise ValueError("URMA EP32 requires windowed GELU or SwiGLU with Finalize weighting and zero shared experts")
             if urma_window_tokens is not None and not self._urma_windowed:
                 raise ValueError("urma_window_tokens requires a windowed URMA configuration")
-            if mma_type != "fp8xfp4" and num_shared_experts:
-                raise ValueError("Shared experts currently require FP8xFP4 weights")
+            if num_shared_experts and mma_type == "fp8xfp8":
+                raise ValueError("Shared experts require A8W4 or A4W4")
             if num_experts % size or num_experts // size > 128:
                 raise ValueError("Experts must divide EP, with at most 128 local experts")
             if ranks_per_node and size % ranks_per_node:
@@ -372,10 +373,10 @@ class SymmBuffer:
         if pod_a4w4_mte:
             hosts = gather_control(group, "MTE A4W4 host layout", _host_boot_id())
             node_hosts = hosts[::ranks_per_node]
-            if not all(node_hosts) or len(set(node_hosts)) != 4 or hosts != [
+            if not all(node_hosts) or len(set(node_hosts)) != size // ranks_per_node or hosts != [
                 host for host in node_hosts for _ in range(ranks_per_node)
             ]:
-                raise ValueError("MTE A4W4 EP32 requires four contiguous 8-rank hosts")
+                raise ValueError(f"MTE A4W4 EP{size} requires contiguous 8-rank hosts")
         ext = _extension()
         if roce:
             error = None if getattr(ext, "mte_roce_mx_enabled", False) else "install a MegaMoE wheel with MTE+RoCE MX support"
@@ -729,8 +730,8 @@ def transform_weights_for_mega_moe(
     if mma_type not in (None, "fp8xfp4", "fp8xfp8", "fp4xfp4"):
         raise ValueError("mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4")
     native_fp4 = mma_type == "fp4xfp4"
-    if native_fp4 and shared:
-        raise ValueError("Native A4W4 preparation requires routed FP4 weights")
+    if native_fp4 and shared and backend == "urma":
+        raise ValueError("A4W4 shared weights require MTE or MTE+RoCE")
     transformed = []
     for name, value in (("l1_weights", l1_weights), ("l2_weights", l2_weights)):
         if isinstance(value, (_UrmaMxSwiGluWeightPair, _RoceFp8SharedWeightPair)):
@@ -855,17 +856,19 @@ def _check_roce_shared_weights(buffer, shared, l1_pair):
     if any(tensor is None for tensor in shared):
         raise ValueError("MTE+RoCE requires all four shared weights and scales together")
     dtype = shared[0].dtype
-    if dtype not in (torch.uint8, torch.float8_e4m3fn):
+    native_fp4 = buffer.mma_type == "fp4xfp4"
+    if dtype != torch.uint8 and (native_fp4 or dtype != torch.float8_e4m3fn):
         raise ValueError("shared_l1_weights: MTE+RoCE shared weights must be packed FP4 or FP8 E4M3")
     fp8 = dtype == torch.float8_e4m3fn
     packing = 1 if fp8 else 2
     experts, h, i = buffer.num_shared_experts, buffer.hidden, buffer.intermediate_hidden
+    n = i if buffer.activation == "gelu" else 2 * i
     if not experts:
         raise ValueError("Shared expert count does not match the buffer configuration")
     expected = (
-        ("shared_l1_weights", (experts, 2 * i, h // packing), dtype),
+        ("shared_l1_weights", (experts, n, h // packing), dtype),
         ("shared_l2_weights", (experts, h, i // packing), dtype),
-        ("shared_l1_scales", (experts, 2 * i, (h + 63) // 64, 2), torch.float8_e8m0fnu),
+        ("shared_l1_scales", (experts, n, (h + 63) // 64, 2), torch.float8_e8m0fnu),
         ("shared_l2_scales", (experts, h, (i + 63) // 64, 2), torch.float8_e8m0fnu),
     )
     for tensor, (name, shape, expected_dtype) in zip(shared, expected):
@@ -883,7 +886,7 @@ def _check_roce_shared_weights(buffer, shared, l1_pair):
             raise ValueError("Prepare MTE+RoCE FP8 shared GMM1 with shared=True and backend='mte_roce'")
         if any(torch_npu.get_npu_format(weight) != 2 for weight in shared[:2]):
             raise ValueError("MTE+RoCE shared weights require contiguous ND FP8 E4M3")
-    else:
+    elif not native_fp4:
         _check_fp4_weight_format(shared[0], "shared_l1_weights")
         _check_fp4_weight_format(shared[1], "shared_l2_weights")
 
@@ -961,6 +964,9 @@ def _forward_inputs(
     if native_fp4:
         _check_a4w4_weight_format(l1_weights, "l1_weights")
         _check_a4w4_weight_format(l2_weights, "l2_weights")
+        if shared_l1_weights is not None:
+            _check_a4w4_weight_format(shared_l1_weights, "shared_l1_weights")
+            _check_a4w4_weight_format(shared_l2_weights, "shared_l2_weights")
     elif isinstance(l1_weights, _NativeFp4WeightPair) or isinstance(l2_weights, _NativeFp4WeightPair):
         raise ValueError("Prepared A4W4 weights require an A4W4 buffer")
     requires_packed_mx = urma and b.mma_type == "fp8xfp8" and b.activation == "swiglu"

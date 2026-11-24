@@ -1,5 +1,7 @@
 # UBX 上比较 GELU 和 SwiGLU 的通信掩盖率
 
+清单大用例 L01–L03 各有一份现成 JSON，可直接按 [L01 完整验收](#l01-完整验收)中的单条命令运行。下面第 1–3 节供自定义 EP 或单独分析融合 A/B 时使用。
+
 要看 GELU 调度优化在 UBX 上的效果，先跑下面的**原生路径**。EP16 使用单机 MTE，EP32 使用双机 MTE+RoCE。两组作业会给出同一批采样 rank 的**首窗本地阶段掩盖率**，以及每卡全部 39,280 个 token 的 **timer-off 端到端时延**。文末另有 URMA 的通信完成事件 A/B 验收命令。
 
 | 组别 | 激活与权重 | GMM1 K/N | GMM2 K/N |
@@ -50,7 +52,11 @@ for arm, suffix in (("gelu", ""), ("swiglu", "_swiglu")):
     for name, preview in ((arm, False), (f"{arm}-plan", True)):
         (root / f"{name}.json").write_text(json.dumps(dict(job, plan=preview), indent=2) + "\n")
 PY
+```
 
+只测自定义融合 A/B 时，执行下面的命令，再做第 3 节的汇总。
+
+```bash
 "$PYTHON" "$SCRIPTS/run_megamoe.py" --run-config "$OUT/gelu-plan.json"
 "$PYTHON" "$SCRIPTS/run_megamoe.py" --run-config "$OUT/swiglu-plan.json"
 "$PYTHON" "$SCRIPTS/run_megamoe.py" --run-config "$OUT/gelu.json" &&
@@ -84,6 +90,27 @@ for arm in gelu swiglu; do
         --include='rank_3[01]/***' --exclude='*' "90.90.93.184:$dir/" "$dir/"
 done
 ```
+
+## L01 完整验收
+
+在主节点 `90.90.93.84` 的共享 checkout 上运行。两台各 16 卡，使用同一份开启设备 timer 的 UBX wheel，主节点需能通过 SSH 连接 `90.90.93.184`。
+
+```bash
+cd /mnt/share/l00911701/DeepEP-UBX/experiments/megamoe/scripts
+python run_megamoe.py --run-config configs/l0/L01.json
+```
+
+默认先跑 GELU 提前加权、SwiGLU Finalize 加权各自的全量双参考，再测两臂融合性能、汇总首窗掩盖率，最后比较 GELU 融合与 Prefill 级联。每卡 39,280 个 token，EP32、H4096、I1536、E800、K25。只跑性能可在命令末尾加 `--only perf`，只跑精度加 `--only accuracy`，只比较 GELU 级联加 `--only prefill`，预览可加 `--plan`。L02（A8W8）和 L03（A4W4）直接替换文件名。
+
+每次运行在仓库的 `benchmark-runs/` 下新建目录，可用 `RUN_BASE` 指定其他共享盘路径。下表的 `$OUT` 指终端打印的本次输出目录。`run-summary.json` 记录各阶段状态和输出位置。完整的设备显存峰值、HBM 带宽按清单另行采集。
+
+| 检查项 | 结果位置（相对 `$OUT`） | 如何判断 |
+| --- | --- | --- |
+| A、B 全量精度 | `{gelu,swiglu}-accuracy/accuracy-w4a8/rank_0/bs_39280/accuracy.json` | 每臂 32/32 rank 通过，每 rank 检查 39,280 个 token，输出有限且融合和级联的专家计数都与 Golden 一致。 |
+| 融合 A/B 耗时 | `{gelu,swiglu}/perf-w4a8/rank_0/bs_39280/profiling.json` | kernel 取 `rank_max_mean_us`，同步 E2E 取 `host_e2e.rank_max_mean_us`，目标 E2E A/B ≤ 1。 |
+| D / C / Total 掩盖率 | `native-overlap.json` | 比较两臂相同首窗和相同采样 rank 的本地阶段。目标 `gelu_minus_swiglu_pp.Total >= 0`，单位为百分点。 |
+| A 融合与 Prefill 级联 | `gelu-prefill/perf-w4a8/rank_0/bs_39280/prefill_comparison.json` | 记录两臂耗时及级联 / 融合加速比。 |
+| 显存占用及 HBM 带宽 | 各臂的 `resources.json`、单臂设备采样和 HBM profiler 原始数据 | 分别登记设备峰值（GiB）及 HBM 读、写带宽（GB/s），按[转测清单](../../../docs/megamoe-topk32-gelu-a4w4-test-checklist.md)的采集口径补齐。 |
 
 ## B05 的 84.50% 和 58.48% 怎么算
 

@@ -442,8 +442,8 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
                 "mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4");
     TORCH_CHECK(!is_a4w4_ ||
                     (backend == "mte" && ((world == 16 && ranks_per_node == 16) ||
-                                           (world == 32 && ranks_per_node == 8))),
-                "MTE A4W4 requires EP16 on one host or EP32 on four 8-rank hosts");
+                                            (ranks_per_node == 8 && (world == 8 || world == 16 || world == 32)))),
+                 "MTE A4W4 requires EP16 on one host or EP8/16/32 with 8 ranks per host");
     TORCH_CHECK(is_a8w4_ == (resolved_mma_type == "fp8xfp4") && is_a4w4_ == (resolved_mma_type == "fp4xfp4"),
                 "is_a8w4 and mma_type describe different matrix modes");
     TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
@@ -469,8 +469,8 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     } else {
         TORCH_CHECK(intermediate >= 256 && intermediate <= 4096 && intermediate % 128 == 0,
                     "Plan intermediate_hidden must be divisible by 128, in [256,4096]");
-        TORCH_CHECK(shared_experts >= 0 && shared_experts <= 8 && (is_a8w4_ || shared_experts == 0),
-                    "Plan shared experts require W4A8, with count in [0,8]");
+        TORCH_CHECK(shared_experts >= 0 && shared_experts <= 8 && (is_a8w4_ || is_a4w4_ || shared_experts == 0),
+                    "MTE shared experts require A8W4 or A4W4, with count in [0,8]");
     }
     const int64_t input_hidden = example.size(1) * (is_a4w4_ ? 2 : 1);
     const auto required = buffer_size(world, experts, max_tokens, topk, input_hidden, backend, topk_weights_type_,
@@ -630,7 +630,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                     "Shared intermediate is unsupported for the selected backend");
         const auto shared_type = urma ? c10::ScalarType::Float8_e4m3fn : torch::kUInt8;
         TORCH_CHECK(
-            is_a8w4_ && shared_weight1->scalar_type() == shared_type && shared_weight2->scalar_type() == shared_type &&
+            (is_a8w4_ || is_a4w4_) && shared_weight1->scalar_type() == shared_type &&
+                shared_weight2->scalar_type() == shared_type &&
                 shared_weight1->sizes() ==
                     torch::IntArrayRef({shared_experts_, shared_i * (activation_ == "gelu" ? 1 : 2), urma ? h : h / 2}) &&
                 shared_weight2->sizes() == torch::IntArrayRef({shared_experts_, h, urma ? shared_i : shared_i / 2}),
@@ -828,7 +829,7 @@ int64_t mte_plan_bytes(int64_t world, int64_t experts, int64_t tokens, int64_t c
     const bool a4w4 = mma_type == "fp4xfp4";
     const int64_t weight_mode = topk_weights_type == -1 ? static_cast<int64_t>(gelu) : topk_weights_type;
     TORCH_CHECK(weight_mode == 0 || weight_mode == 1, "topk_weights_type must be 0 or 1");
-    TORCH_CHECK(shared_experts >= 0 && shared_experts <= 8 && (w4 || shared_experts == 0),
+    TORCH_CHECK(shared_experts >= 0 && shared_experts <= 8 && (w4 || a4w4 || shared_experts == 0),
                 "Plan shared experts require W4A8, with count in [0,8]");
     // Validate routed dimensions and MMA mode through the same entry point as Plan.
     buffer_size(world, experts, capacity, topk, hidden, "mte", weight_mode, mma_type, false);
@@ -852,8 +853,8 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
     const std::string resolved_mma_type = mma_type.empty() ? "fp8xfp8" : mma_type;
     TORCH_CHECK(resolved_mma_type == "fp8xfp4" || resolved_mma_type == "fp8xfp8" || resolved_mma_type == "fp4xfp4",
                 "mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4");
-    TORCH_CHECK(resolved_mma_type != "fp4xfp4" || (backend == "mte" && (world == 16 || world == 32)),
-                "MTE A4W4 sizing requires EP16 or EP32");
+    TORCH_CHECK(resolved_mma_type != "fp4xfp4" || (backend == "mte" && (world == 8 || world == 16 || world == 32)),
+                "MTE A4W4 sizing requires EP8, EP16 or EP32");
     if (backend == "urma") {
         TORCH_CHECK(resolved_mma_type == "fp8xfp4" || (mma_type == "fp8xfp8" && windowed && (world == 16 || world == 32)),
                     "URMA requires routed FP8xFP4 or windowed EP16/EP32 FP8xFP8");

@@ -399,7 +399,8 @@ def test_shared_fp4_preparation_retains_planar_weights_and_scales(backend):
         np.testing.assert_array_equal(scale.data, sf)
 
 
-def test_a4w4_preparation_casts_planar_bytes_and_marks_generic_nz(backend, monkeypatch):
+@pytest.mark.parametrize("shared", [False, True])
+def test_a4w4_preparation_casts_planar_bytes_and_marks_generic_nz(backend, monkeypatch, shared):
     def cast_bytes(weight, acl_format):
         assert weight.dtype == "uint8" and acl_format == 29
         result = Tensor(weight.data.copy(), weight.dtype, weight.device)
@@ -411,7 +412,7 @@ def test_a4w4_preparation_casts_planar_bytes_and_marks_generic_nz(backend, monke
     weights[:, :, 0] = np.arange(512, dtype=np.uint16) % 251
     scales[:] = np.arange(512, dtype=np.uint16)[None, :, None, None] % 251
     raw = Tensor(weights, "uint8"), Tensor(scales, "float8_e8m0fnu")
-    for pair in api.transform_weights_for_mega_moe(raw, raw, mma_type="fp4xfp4"):
+    for pair in api.transform_weights_for_mega_moe(raw, raw, shared=shared, backend="mte", mma_type="fp4xfp4"):
         np.testing.assert_array_equal(pair[0].data, weights)
         np.testing.assert_array_equal(pair[1].data, scales)
         api._check_a4w4_weight_format(pair, "routed")
@@ -813,7 +814,8 @@ def test_a4w4_rejects_unsupported_topology(backend):
 
 
 @pytest.mark.parametrize("activation", ["gelu", "swiglu"])
-def test_pod_a4w4_target_uses_fp4_mte_full_and_tail_plans(backend, monkeypatch, activation):
+@pytest.mark.parametrize("world", [8, 16, 32])
+def test_pod_a4w4_target_uses_fp4_mte_full_and_tail_plans(backend, monkeypatch, activation, world):
     gather_control = api.gather_control
 
     def gather(group, stage, value):
@@ -831,7 +833,7 @@ def test_pod_a4w4_target_uses_fp4_mte_full_and_tail_plans(backend, monkeypatch, 
 
     monkeypatch.setattr(torch, "empty", shape_only)
     monkeypatch.setattr(torch, "empty_like", lambda tensor, dtype: shape_only(tensor.shape, dtype, tensor.device))
-    b = api.SymmBuffer(backend.group_type(32), 800, 39280, 25, 4096, 1536, ranks_per_node=8,
+    b = api.SymmBuffer(backend.group_type(world), 800, 39280, 25, 4096, 1536, ranks_per_node=8,
                        backend="mte", mma_type="fp4xfp4", activation=activation)
     try:
         assert b.x.shape == (39280, 2048) and b.x.dtype == "uint8"
@@ -841,7 +843,7 @@ def test_pod_a4w4_target_uses_fp4_mte_full_and_tail_plans(backend, monkeypatch, 
         assert b.timer_enabled
         b.prepare(39280)
         for plan, rows in ((b._plan, 256), (b._tail_plan, 112)):
-            assert plan.bs == rows and plan.max_tokens == 256 and plan.local_experts == 25
+            assert plan.bs == rows and plan.max_tokens == 256 and plan.local_experts == 800 // world
             assert plan.mma_type == "fp4xfp4" and plan.backend == "mte"
             assert plan.topk_weights_type == int(activation == "gelu")
     finally:
@@ -857,15 +859,15 @@ def test_pod_a4w4_rejects_noncontiguous_hosts(backend, monkeypatch):
         return gather_control(group, stage, value)
 
     monkeypatch.setattr(api, "gather_control", gather)
-    with pytest.raises(ValueError, match="four contiguous 8-rank hosts"):
+    with pytest.raises(ValueError, match="contiguous 8-rank hosts"):
         api.SymmBuffer(backend.group_type(32), 800, 39280, 25, 4096, 1536, ranks_per_node=8,
                        backend="mte", mma_type="fp4xfp4")
 
 
 @pytest.mark.parametrize("transport,world", [("mte", 16), ("mte_roce", 32)])
-@pytest.mark.parametrize("mma", ["fp8xfp4", "fp8xfp8", "fp4xfp4"])
+@pytest.mark.parametrize(("mma", "shared_experts"), [("fp8xfp4", 0), ("fp8xfp8", 0), ("fp4xfp4", 0), ("fp4xfp4", 1)])
 @pytest.mark.parametrize("activation,weight_mode", [("gelu", 1), ("swiglu", 0)])
-def test_ubx_mx_window_and_tail_forward(backend, monkeypatch, transport, world, mma, activation, weight_mode):
+def test_ubx_mx_window_and_tail_forward(backend, monkeypatch, transport, world, mma, shared_experts, activation, weight_mode):
     ext = backend.ext
     def scratch(_world, _local, _rows, capacity, *args, **kwargs):
         if capacity > 16:
@@ -883,16 +885,23 @@ def test_ubx_mx_window_and_tail_forward(backend, monkeypatch, transport, world, 
     monkeypatch.setattr(ext, "RocePlan", roce_plan, raising=False)
     local, tokens, topk, h, i = 2, 35, 32, 1024, 256
     b = api.SymmBuffer(backend.group_type(world), local * world, tokens, topk, h, i, ranks_per_node=16,
-                       backend=transport, mma_type=mma, activation=activation)
+                       backend=transport, mma_type=mma, activation=activation, num_shared_experts=shared_experts)
     try:
         cols = i if activation == "gelu" else 2 * i
-        def raw(n, k):
+        def raw(n, k, experts=local):
             wtype = "float8_e4m3fn" if mma == "fp8xfp8" else "uint8"
-            w = Tensor(np.zeros((local, n, k if mma == "fp8xfp8" else k // 2)), wtype)
+            w = Tensor(np.zeros((experts, n, k if mma == "fp8xfp8" else k // 2)), wtype)
             w.npu_format = 2
-            return w, Tensor(np.full((local, n, k // 64, 2), 127), "float8_e8m0fnu")
+            return w, Tensor(np.full((experts, n, k // 64, 2), 127), "float8_e8m0fnu")
         wpairs = raw(cols, h), raw(h, i)
         weights = api.transform_weights_for_mega_moe(*wpairs, activation, backend=transport, mma_type=mma)
+        shared_args = {}
+        if shared_experts:
+            sw1, sw2 = api.transform_weights_for_mega_moe(
+                raw(cols, h, shared_experts), raw(h, i, shared_experts), activation,
+                shared=True, backend=transport, mma_type=mma,
+            )
+            shared_args = dict(shared_l1_weights=sw1, shared_l2_weights=sw2)
         assert b.window_tokens == 16 and b.num_forward_windows(tokens) == 3
         assert b.x.shape == (tokens, h // (2 if mma == "fp4xfp4" else 1))
         b.topk_idx.data[:] = np.arange(topk)
@@ -903,7 +912,7 @@ def test_ubx_mx_window_and_tail_forward(backend, monkeypatch, transport, world, 
             assert all(pair[0].npu_format == 51 for pair in weights)
             wrong = api.transform_weights_for_mega_moe(*wpairs, activation, backend=transport)
             with pytest.raises(ValueError, match="A4W4 requires NZ with C0=64 FP4"):
-                api.fp8_fp4_mega_moe(y, *wrong, b, activation=activation)
+                api.fp8_fp4_mega_moe(y, *wrong, b, activation=activation, **shared_args)
             assert not native_launches(backend)
         timer = None
         if transport == "mte_roce":
@@ -914,7 +923,8 @@ def test_ubx_mx_window_and_tail_forward(backend, monkeypatch, transport, world, 
             assert not b.timer_enabled
             monkeypatch.setattr(ext, "mte_a4w4_timer_enabled", True, raising=False)
             timer = b.allocate_timer()
-        api.fp8_fp4_mega_moe(y, *weights, b, activation=activation, cumulative_local_expert_recv_stats=stats, timer=timer)
+        api.fp8_fp4_mega_moe(y, *weights, b, activation=activation,
+                             cumulative_local_expert_recv_stats=stats, timer=timer, **shared_args)
         launches = native_launches(backend)
         assert [(launch[0].shape[0], launch[-1]) for launch in launches] == [(16, 1), (16, 2), (3, 3)]
         assert all(launch[8] is expected for launch, expected in zip(launches, (timer, None, None)))

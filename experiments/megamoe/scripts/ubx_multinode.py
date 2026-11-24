@@ -1,6 +1,6 @@
 # Copyright (c) 2026, Lu Lu
 
-"""Run one UBX stage on the local host and an SSH peer."""
+"""Run one distributed stage on the local host and its SSH peers."""
 
 from contextlib import ExitStack
 import shlex
@@ -84,17 +84,19 @@ def _stop_nodes(processes):
             process.wait()
 
 
-def run_stage(stage, scripts, log_paths, *, ssh_target, ssh_port=22):
-    """Run a stage on ranks 0 and 1, returning only if both succeed."""
+def run_stage(stage, scripts, log_paths, *, ssh_target=None, ssh_targets=None, ssh_port=22):
+    """Keep every node supervised until all workers finish or one fails."""
+    if ssh_targets is None:
+        ssh_targets = {1: ssh_target}
+    if scripts.keys() != {0, *ssh_targets} or scripts.keys() != log_paths.keys():
+        raise ValueError("Each stage node requires a script, a log and a local or SSH target")
     with ExitStack() as stack:
-        # Open both logs before starting any work. Log setup failure is a stage
-        # failure, and child exit status is independent of log collection.
-        logs = {rank: stack.enter_context(log_paths[rank].open("wb")) for rank in (0, 1)}
+        logs = {rank: stack.enter_context(path.open("wb")) for rank, path in log_paths.items()}
         pending = {}
         try:
-            for rank in (0, 1):
-                command = _node_command(rank, scripts[rank], ssh_target, ssh_port)
-                print(f"[UBX] 开始 {stage} node{rank}，日志 {log_paths[rank]}", flush=True)
+            for rank, script in scripts.items():
+                command = _node_command(rank, script, ssh_targets.get(rank), ssh_port)
+                print(f"开始 {stage} node{rank}，日志 {log_paths[rank]}", flush=True)
                 pending[rank] = subprocess.Popen(
                     command, stdin=subprocess.PIPE, stdout=logs[rank], stderr=subprocess.STDOUT,
                 )
@@ -105,13 +107,13 @@ def run_stage(stage, scripts, log_paths, *, ssh_target, ssh_port=22):
                         continue
                     if status:
                         print(
-                            f"[UBX] {stage} node{rank} 退出码 {status}，日志 {log_paths[rank]}",
+                            f"{stage} node{rank} 退出码 {status}，日志 {log_paths[rank]}",
                             file=sys.stderr, flush=True,
                         )
                         raise subprocess.CalledProcessError(status, process.args)
                     process.stdin.close()
                     del pending[rank]
-                    print(f"[UBX] 完成 {stage} node{rank}", flush=True)
+                    print(f"完成 {stage} node{rank}", flush=True)
                 if pending:
                     time.sleep(0.1)
         finally:

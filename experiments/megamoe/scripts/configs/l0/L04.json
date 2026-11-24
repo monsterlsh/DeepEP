@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "suite": "l0",
+  "case": "L04",
+  "machine": "950pod",
+  "mode": "both",
+  "precision": "a8w4",
+  "backend": "mte",
+  "ep_size": 32,
+  "nodes": [
+    "177.22.21.1",
+    "177.22.22.1",
+    "177.22.27.1",
+    "177.22.28.1"
+  ],
+  "master_addr": "177.22.21.1",
+  "python": "/mnt/share/l00911701_megamoe_b05/megamoe-topk32/fixed-wheel-ihXs7t90/runtime/bin/python",
+  "base_python": "/opt/miniconda3/envs/lsx/bin/python",
+  "cann_env": "/home/cann/b112/cann-9.2.0/set_env.sh",
+  "master_port": 29181,
+  "shmem_port": 29180,
+  "routing": "balanced",
+  "check_tokens": 0,
+  "golden_workers": 2,
+  "config": {
+    "schema_version": 1,
+    "model": {
+      "hidden": 4096,
+      "intermediate_hidden": 1536,
+      "num_experts": 800,
+      "num_topk": 25,
+      "num_shared_experts": 0,
+      "activation": "gelu",
+      "mma_type": "fp8xfp4",
+      "topk_weights_type": 1
+    },
+    "bs_values": [
+      39280
+    ],
+    "alignment": {
+      "rows": 1024,
+      "cols": 1024,
+      "repeats": 1
+    },
+    "warmup": 1,
+    "iters": 3,
+    "seed": 1234
+  }
+}

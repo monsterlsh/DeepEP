@@ -163,7 +163,7 @@ private:
      */
     LocalTensor<int32_t> resetTensor_;
     QuantProcessScratch<ActivationType> quantProcessScratch_;
-    SharedExpertPrepareScratch<ActivationType> sharedExpertPrepareScratch_;
+    SharedExpertPrepareScratch<uint8_t> sharedExpertPrepareScratch_;
     SendMaskScratch sendMaskScratch_;
     TokenDispatchScratch<ActivationType> tokenDispatchScratch_;
     WaveCombineScratch waveCombineScratch_;
@@ -456,8 +456,8 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::SendAnd
     sendMaskScratch_.sendCntAccTensor =
         LocalTensor<int32_t>(TPosition::VECCALC, sendCntAccAddr, sendCntAccSize / sizeof(int32_t));
     if (sharedExpertNum_ > 0U) {
-        sharedExpertPrepareScratch_.copyBuffer0 = quantProcessScratch_.xOutTensor0;
-        sharedExpertPrepareScratch_.copyBuffer1 = quantProcessScratch_.xOutTensor1;
+        sharedExpertPrepareScratch_.copyBuffer0 = quantProcessScratch_.xOutTensor0.template ReinterpretCast<uint8_t>();
+        sharedExpertPrepareScratch_.copyBuffer1 = quantProcessScratch_.xOutTensor1.template ReinterpretCast<uint8_t>();
     }
     resetBatchElementCount_ = resetBatchElementCount;
 }
@@ -999,7 +999,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
     ResetSyncStatus<TopkWeightsPrefetch>(aivJob_, params_, resetBatchElementCount_, resetTensor_);
     if (sharedExpertNum_ > 0) {
         // 可选：为共享专家拆分连续布局的输入数据与 scale。
-        PrepareSharedExpertInput<ActivationType, QuantScaleOutType, 1U>(
+        PrepareSharedExpertInput<uint8_t, QuantScaleOutType, PackedElementTraits<ActivationType>::ELEMENTS_PER_BYTE>(
             aivJob_, commonConfig_, params_, quantProcessConfig_, sharedExpertPrepareScratch_);
     } else {
         if constexpr (g_coreType == AIV) {

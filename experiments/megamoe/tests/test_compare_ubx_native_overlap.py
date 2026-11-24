@@ -77,13 +77,18 @@ def roce_raw(arm):
     return raw
 
 
-def job(tmp_path, arm, backend, *, identity=False, fp4=False):
+def job(tmp_path, arm, backend, *, identity=False, precision="w4a8", pod=False):
     world, transport = overlap.TOPOLOGIES[backend]
-    root = tmp_path / arm / ("perf-w4a4" if fp4 else "perf-w4a8")
-    sample = list(range(0, world, 16))
+    local = 16
+    if pod:
+        world, local = 32, 8
+    mma_type, input_kind = {"w4a8": ("fp8xfp4", "fp8"), "w8a8": ("fp8xfp8", "fp8"),
+                            "w4a4": ("fp4xfp4", "fp4")}[precision]
+    root = tmp_path / arm / f"perf-{precision}"
+    sample = list(range(0, world, 2 if pod else local))
     config = dict(bs_values=[80], seed=1234, iters=2, warmup=1, alignment=dict(rows=4, cols=4, repeats=1),
                   model=dict(activation=arm, topk_weights_type=int(arm == "gelu"),
-                             mma_type="fp4xfp4" if fp4 else "fp8xfp4",
+                             mma_type=mma_type,
                              num_shared_experts=0, num_experts=800, num_topk=25, hidden=4096, intermediate_hidden=1536))
     report = dict(windows_per_forward=2, host_e2e=dict(
         scope="public_forward_through_device_synchronize", timer_pass=False, per_rank_rounds_us=[[100, 120]] * world,
@@ -92,14 +97,14 @@ def job(tmp_path, arm, backend, *, identity=False, fp4=False):
     for rank in range(world):
         ranked = root / f"rank_{rank}"
         manifest = dict(
-            config=config, input="fp4" if fp4 else "fp8", backend=backend, ep_size=world, device_communication=transport,
-            rank=rank, local_rank=rank % 16, ranks_per_node=16, mode="perf", perf_scope="all",
+            config=config, input=input_kind, backend=backend, ep_size=world, device_communication=transport,
+            rank=rank, local_rank=rank % local, ranks_per_node=local, mode="perf", perf_scope="all",
             numerical_contract=overlap.CONTRACTS[arm], timer_scope="first_window_only", run_id=f"job-{arm}",
             build=dict(source_sha256="a" * 64, megamoe=dict(enabled=True, timer=True, mte_roce=True)), routing="balanced",
             paired_weights=False, timer_ranks=sample, window_tokens=64, windows_per_forward_by_bs={"80": 2},
         )
         if identity:
-            manifest["device_identity"] = dict(host_boot_id=f"host-{rank // 16}", physical_device=rank % 16)
+            manifest["device_identity"] = dict(host_boot_id=f"host-{rank // local}", physical_device=rank % local)
         write(ranked / "manifest.json", manifest)
         case = ranked / "bs_80"
         write(case / "resources.json", dict(prepared_bs=80, window_tokens=64, windows_per_forward=2,
@@ -111,9 +116,9 @@ def job(tmp_path, arm, backend, *, identity=False, fp4=False):
     return root
 
 
-@pytest.mark.parametrize("fp4", [False, True])
-def test_ep16_legacy_manifests_and_disjoint_phase_envelopes(tmp_path, monkeypatch, capsys, fp4):
-    gelu, swiglu = (job(tmp_path, arm, "mte", fp4=fp4) for arm in ("gelu", "swiglu"))
+@pytest.mark.parametrize(("precision", "input_kind"), [("w4a8", "fp8"), ("w4a4", "fp4")])
+def test_ep16_legacy_manifests_and_disjoint_phase_envelopes(tmp_path, monkeypatch, capsys, precision, input_kind):
+    gelu, swiglu = (job(tmp_path, arm, "mte", precision=precision) for arm in ("gelu", "swiglu"))
 
     def raw(path, words, decode):
         assert path.relative_to(path.parents[2]).as_posix() == "bs_80/timer/rank_0_npu_time.bin"
@@ -128,8 +133,8 @@ def test_ep16_legacy_manifests_and_disjoint_phase_envelopes(tmp_path, monkeypatc
     assert "physical_mapping=unverified" in console
     assert "Full-batch timer-off host E2E  GELU 0.110 ms  SwiGLU 0.110 ms" in console
     assert result["schema"] == "ubx_native_first_window_overlap_v1"
-    assert result["case"]["precision"] == ("w4a4" if fp4 else "w4a8")
-    assert result["case"]["input"] == ("fp4" if fp4 else "fp8")
+    assert result["case"]["precision"] == precision
+    assert result["case"]["input"] == input_kind
     assert result["case"]["timer_token_range_half_open"] == [0, 64]
     assert result["case"]["model"]["num_topk"] == 25
     assert result["arms"]["gelu"]["host_e2e"]["rank_max_mean_us"] == 110
@@ -165,6 +170,25 @@ def test_ep32_exported_trace_uses_only_local_async_lifetime(tmp_path):
         overlap.compare(gelu, swiglu)
 
 
+def test_950pod_first_window_uses_four_nodes_and_all_even_ranks(tmp_path, monkeypatch):
+    a, b = (job(tmp_path, arm, "mte", identity=True, precision="w4a4", pod=True) for arm in ("gelu", "swiglu"))
+    monkeypatch.setattr(overlap, "binary_spans", lambda path, size, decode: decode(mte_raw(path.parents[3].name)))
+    path = tmp_path / "result.json"
+    overlap.main(["--platform", "950pod", "--gelu", str(a), "--swiglu", str(b), "--output", str(path)])
+    result = overlap.read_json(path)
+    assert result["schema"] == "950pod_native_first_window_overlap_v1"
+    assert result["physical_mapping"] == "verified"
+    assert result["case"]["ep_size"] == 32 and result["case"]["ranks_per_node"] == 8
+    assert result["case"]["timer_ranks"] == list(range(0, 32, 2))
+    assert result["gelu_minus_swiglu_pp"]["Total"] == pytest.approx(100 * 30 / 140)
+    manifest = a / "rank_0/manifest.json"
+    data = overlap.read_json(manifest)
+    data["timer_ranks"].remove(30)
+    write(manifest, data)
+    with pytest.raises(ValueError, match="four even-numbered timer ranks"):
+        overlap.compare(a, b, platform="950pod")
+
+
 def test_incomplete_selected_roce_trace_fails(tmp_path):
     gelu, swiglu = (job(tmp_path, arm, "mte_roce") for arm in ("gelu", "swiglu"))
     path = gelu / "rank_16" / "bs_80" / "roce_trace.json"
@@ -178,14 +202,22 @@ def test_incomplete_selected_roce_trace_fails(tmp_path):
         overlap.compare(gelu, swiglu)
 
 
-def test_ep32_reports_fp4_and_rejects_mixed_precision(tmp_path):
-    gelu, swiglu = (job(tmp_path, arm, "mte_roce", fp4=True) for arm in ("gelu", "swiglu"))
+@pytest.mark.parametrize(("precision", "input_kind"), [("w4a4", "fp4"), ("w8a8", "fp8")])
+def test_ep32_reports_native_precision_and_rejects_mixed_precision(tmp_path, precision, input_kind):
+    gelu, swiglu = (job(tmp_path, arm, "mte_roce", precision=precision) for arm in ("gelu", "swiglu"))
     result = overlap.compare(gelu, swiglu)
-    assert result["case"]["precision"] == "w4a4"
-    assert result["case"]["input"] == "fp4"
+    assert result["case"]["precision"] == precision
+    assert result["case"]["input"] == input_kind
+    assert result["case"]["timer_token_range_half_open"] == [0, 64]
     assert result["arms"]["gelu"]["phases"]["Total"]["overlap_rate"] == pytest.approx(95 / 140)
-    with pytest.raises(ValueError, match="A/B manifest mismatch: precision, input"):
+    assert all(row["combine_endpoint"] == "local_mte_retired_row" for row in result["arms"]["swiglu"]["ranks"])
+    with pytest.raises(ValueError, match="A/B manifest mismatch: precision"):
         overlap.compare(gelu, job(tmp_path, "swiglu", "mte_roce"))
+
+
+def test_ep16_rejects_a8w8_without_native_mte_timer(tmp_path):
+    with pytest.raises(ValueError, match="mte native overlap supports"):
+        overlap.read_job(job(tmp_path, "gelu", "mte", precision="w8a8"), "gelu")
 
 
 def test_roce_binary_is_preferred_and_uses_export_counts(tmp_path, monkeypatch):

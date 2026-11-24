@@ -320,8 +320,8 @@ def _validate_cascade_comparison(args, config, kind):
         from .decode_cascade import validate_decode_case
 
         validate_decode_case(config)
-    elif model.get("activation", "swiglu") != "gelu" or model["num_shared_experts"]:
-        raise ValueError("Prefill comparison requires GELU and zero shared experts")
+    elif model.get("activation", "swiglu") not in ("gelu", "swiglu") or model["num_shared_experts"]:
+        raise ValueError("Prefill comparison requires GELU or SwiGLU and zero shared experts")
 
 
 def run(args, config, group):
@@ -548,7 +548,7 @@ def run(args, config, group):
             return data.view(torch.float8_e4m3fn), scale
 
         shared = transform_weights_for_mega_moe(
-            *map(shared_pair, shared_raw), activation=activation_name, shared=True, backend=backend,
+            *map(shared_pair, shared_raw), activation=activation_name, shared=True, backend=backend, mma_type=mma_type,
         )
         shared_kwargs = dict(shared_l1_weights=shared[0], shared_l2_weights=shared[1])
     cascade = None
@@ -569,9 +569,9 @@ def run(args, config, group):
 
             perf_cascade = DecodeCascade(model, raw, host_group=group)
         elif compare_prefill:
-            from .prefill_cascade import GeluPrefillCascade
+            from .prefill_cascade import PrefillCascade
 
-            perf_cascade = GeluPrefillCascade(model, raw, host_group=group)
+            perf_cascade = PrefillCascade(model, raw, host_group=group)
         else:
             guard.prepare_per_call_alignment()
         manifest["alignment"] = guard.describe()

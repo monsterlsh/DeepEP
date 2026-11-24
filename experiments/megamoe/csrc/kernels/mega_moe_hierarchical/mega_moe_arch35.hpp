@@ -588,6 +588,9 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm1
     Get<M_VALUE>(problemShape) = commonConfig_.tokenNum;
     Get<N_VALUE>(problemShape) = commonConfig_.gmm1OutputDim;
     Get<K_VALUE>(problemShape) = commonConfig_.tokenHiddenDim;
+    if constexpr (ENABLE_A4W4) {
+        Get<ACTIVATION_FACTOR_VALUE>(problemShape) = commonConfig_.activationFactor;
+    }
     GMMAddrInfo gmmAddrInfo{};
     uint32_t startBlockIdx = 0U;
     int32_t vecSetSyncCom = 0;
@@ -777,6 +780,9 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm2
     Get<M_VALUE>(problemShape) = commonConfig_.tokenNum;
     Get<N_VALUE>(problemShape) = commonConfig_.gmm1OutputDim;
     Get<K_VALUE>(problemShape) = commonConfig_.tokenHiddenDim;
+    if constexpr (ENABLE_A4W4) {
+        Get<ACTIVATION_FACTOR_VALUE>(problemShape) = commonConfig_.activationFactor;
+    }
     uint32_t startBlockIdx = 0U;
     int32_t vecSetSyncCom = 0;
     GmmRuntimeState runtimeState{startBlockIdx, vecSetSyncCom, gmm2PingPongIdx_};

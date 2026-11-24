@@ -284,8 +284,9 @@ inline HierarchicalMegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t i
                          "MTE+RoCE intermediate_hidden must be divisible by 128 and in [256,4096]");
     CheckTilingCondition(activation == "gelu" || activation == "swiglu", "MTE+RoCE activation must be gelu or swiglu");
     CheckTilingCondition(shared_experts >= 0 && shared_experts <= 8, "MTE+RoCE shared expert count must be in [0,8]");
-    CheckTilingCondition(shared_experts == 0 || (mma_mode == GROUPED_MATMUL_MODE_A8W4 && activation == "swiglu"),
-                         "MTE+RoCE shared experts require SwiGLU W4A8");
+    CheckTilingCondition(shared_experts == 0 || mma_mode == GROUPED_MATMUL_MODE_A4W4_NZ ||
+                             (mma_mode == GROUPED_MATMUL_MODE_A8W4 && activation == "swiglu"),
+                         "MTE+RoCE shared experts require SwiGLU W4A8 or A4W4");
 
     HierarchicalMegaMoeTilingData t{};
     t.moeExpertPerRank = static_cast<uint32_t>(local_experts);

@@ -119,6 +119,20 @@ private:
                                                       uint32_t gmm1TilesPerMGroup);
     __aicore__ inline void DispatchNextExpertSlice(ExpertTokenPosition& position, uint32_t& waveMGroupCount,
                                                    uint64_t waveId, uint64_t waveLogicalStart = 0U);
+    __aicore__ inline void DispatchWaveRange(const ExpertTokenRange& range, const BlockJobContext& dispatchJob,
+                                             WaveRowMapping mapping)
+    {
+        // A wave can split an expert. Both sides of the cut must consume the same source-rank prefixes.
+        if (commonConfig_.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS) {
+            DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch>(
+                tokenDispatchConfig_, commonConfig_, dispatchJob, syncWorkspaceLayout_, params_, g_winRankAddr_,
+                tokenDispatchScratch_, range, mapping);
+        } else {
+            DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch, true>(
+                tokenDispatchConfig_, commonConfig_, dispatchJob, syncWorkspaceLayout_, params_, g_winRankAddr_,
+                tokenDispatchScratch_, range, mapping);
+        }
+    }
     __aicore__ inline void RunGmm2CombineForWaveRange(const ExpertTokenPosition& waveBeginPosition,
                                                       const ExpertTokenPosition& waveEndPosition,
                                                       uint32_t waveLastActiveExpertIdx, ExpertLoopState& gmm2State,
@@ -189,17 +203,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
                                            : dispatchJob.jobIndex + dispatchJob.totalJobs - shift;
             }
         }
-        // 小 batch 每核仅几行，直接二分源 rank，避免空 peer 的配额统计/扫描；索引预取仍保留。
-        // 只改变行排列，token metadata 随行写出；GMM 和 Combine 的 slice/ready 边界不变。
-        if (commonConfig_.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS) {
-            DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch>(
-                tokenDispatchConfig_, commonConfig_, dispatchJob, syncWorkspaceLayout_, params_, g_winRankAddr_,
-                tokenDispatchScratch_, range, WaveStorage(waveId, waveLogicalStart));
-        } else {
-            DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch, true>(
-                tokenDispatchConfig_, commonConfig_, dispatchJob, syncWorkspaceLayout_, params_, g_winRankAddr_,
-                tokenDispatchScratch_, range, WaveStorage(waveId, waveLogicalStart));
-        }
+        DispatchWaveRange(range, dispatchJob, WaveStorage(waveId, waveLogicalStart));
         timer_.EndSpan(AscendTimer::AIV_DISPATCH);
     }
     // 数据和 ready flag 发布后才提交进度；空专家也要推进，避免重复或死循环。
@@ -514,10 +518,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
             // count-table 准备刚完成，UB prefix 仍有效；首 WAVE 无需从 GM 备份重复恢复。
             timer_.SetWave(0);
             timer_.StartSpan(AscendTimer::AIV_DISPATCH);
-            DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch>(
-                tokenDispatchConfig_, commonConfig_, gmmExecutionConfig_.blockJob, syncWorkspaceLayout_, params_,
-                g_winRankAddr_, tokenDispatchScratch_, firstDispatchRange,
-                WaveStorage(0U, 0U));
+            DispatchWaveRange(firstDispatchRange, gmmExecutionConfig_.blockJob, WaveStorage(0U, 0U));
             timer_.EndSpan(AscendTimer::AIV_DISPATCH);
             // 首 WAVE 的全部数据和 ready flag 发布完成后，再提交 Dispatch 进度。
             dispatchPosition = plannedDispatchPosition;

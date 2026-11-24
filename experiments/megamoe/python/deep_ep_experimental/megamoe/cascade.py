@@ -126,8 +126,8 @@ class CascadeReference:
             raise ValueError("mma_type must be fp8xfp4, fp8xfp8 or fp4xfp4")
         if self.activation == "gelu" and "activation_clamp" in model:
             raise ValueError("activation_clamp is only defined for SwiGLU")
-        if self.mma_type != "fp8xfp4" and self.shared_experts:
-            raise ValueError("Shared experts in the cascade require FP8xFP4")
+        if self.mma_type == "fp8xfp8" and self.shared_experts:
+            raise ValueError("Shared experts in the cascade require A8W4 or A4W4")
         self._situ_glu = None
         if self.activation == "situglu":
             # aclnnSituGlu multiplies by FP32 reciprocals internally; reject

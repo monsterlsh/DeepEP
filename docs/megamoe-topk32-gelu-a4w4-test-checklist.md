@@ -1,15 +1,15 @@
 # MegaMoE TopK32 GELU A4W4 转测验收清单
 
-转测目标 · 核对旧路径无回退，验收 TopK32、GELU 加权、A4W4 和 EP32 大用例，并建立融合与小算子级联的性能及显存基线。
+转测目标 · 核对旧路径无回退，验收 TopK32、GELU 加权、A4W4 和 EP32 大用例，并建立融合与小算子级联的时延、通信掩盖率、显存占用及 HBM 读写带宽基线。
 
-共 94 个对照组。一个编号对应一组配置。该组的分支、激活 A/B、融合和级联分别留结果，计时重复轮次与独立采集轮次按同一编号归档。
+共 94 个对照组。一个编号对应一组配置。该组的分支、激活 A/B、融合和级联分别留结果，计时重复轮次与独立采集轮次按同一编号归档。交接时先看[当前验收进度](#当前验收进度)，逐项结果和原始产物在本文登记。
 
 ## 测试验证与复现方法
 
 1. **定位 Case**。先读编号所在小节的固定配置，再用该行补齐拓扑、每卡 BS、TopK、量化精度、激活和加权位置。按该行的测试方法链接确定需运行的分支或对照臂。记录实际模型 JSON、路由和 seed。
 2. **固定运行环境**。按 UBX 或 950POD 方法选机器和入口。保留实际源码提交、构建补丁或源码归档、wheel SHA256、CANN / torch_npu 版本，以及逻辑 rank 和物理卡映射。同一 Case 的各臂用相同机器、配置和采集口径，输出目录按 Case、分支或臂、采集阶段分开。
 3. **先核对执行计划**。对 `run_megamoe.py` 入口先用 `"plan": true` 生成预览。UBX 的模型在 `config`，950POD 在 `spec`。核对 EP、后端、精度、每卡 BS、K、激活、加权和对照类型。950POD 还要逐节点核对 `node_rank`。直接用 `torchrun` 的方法先核对模型 JSON、节点参数、可用 NPU 数和端口。计划通过后，使用新目录执行正式作业。
-4. **独立采集和验收**。先跑 Q 精度，再跑 P 的 timer-off 正式性能和该 Case 要求的级联对照。另跑 C 的 timer 采集和 M 的单臂显存采集。汇总全部节点产物，核对退出码、`manifest.json` 的实际配置和预期 rank 数。Q 逐 rank 检查通过、有限值、专家计数和双参考结果，再按 [采集口径与结果填写](#采集口径与结果填写) 回填各臂结果和原始文件路径。
+4. **独立采集和验收**。先跑 Q 精度，再跑 P 的 timer-off 正式性能和该 Case 要求的级联对照。另跑 C 的通信 timer、M 的单臂显存占用和 H 的显存读写带宽采集。汇总全部节点产物，核对退出码、`manifest.json` 的实际配置和预期 rank 数。Q 逐 rank 检查通过、有限值、专家计数和双参考结果，再按 [采集口径与结果填写](#采集口径与结果填写) 回填各臂结果和原始文件路径。
 5. **保留待测项**。缺少入口、计时口径、设备资源或 `groupsize` 参数定义时，记下 Case、未完成指标和具体原因。该 Case 的其余可运行项继续采集。
 
 ### 可执行复现示例
@@ -95,7 +95,7 @@ if [ "$CASE" = K01 ]; then
 fi
 ```
 
-K37 用 [N 方法](#n-直接启动融合) 另采 timer。两组按 [显存复测方法](#ubx-与-950pod-显存复测) 采 M。归档 `accuracy.json`、`profiling.json`、`prefill_comparison.json`、原始 timer 和设备显存日志。其他 Case 按自己的表行和方法链接复用这套执行顺序。
+K37 用 [N 方法](#n-直接启动融合) 另采 timer。两组按[显存占用方法](#ubx-与-950pod-显存复测)采 M，按[HBM 带宽方法](#hbm-显存带宽采集)采 H。归档 `accuracy.json`、`profiling.json`、`prefill_comparison.json`、原始 timer 和设备显存日志。其他 Case 按自己的表行和方法链接复用这套执行顺序。
 
 | 验证范围 | Case 编号 | 组数 | 完成判据 |
 | --- | --- | --- | --- |
@@ -109,7 +109,96 @@ K37 用 [N 方法](#n-直接启动融合) 另采 timer。两组按 [显存复测
 
 先跑 R01–R07，再做覆盖和大用例。锁定三条分支的实际 commit、构建源码状态、wheel SHA256、CANN、torch_npu、物理卡映射和链路。A4W4 使用包含 88936f1 或对应改动的 wheel。级联比较入口也要包含在测试 wheel 中。
 
-两侧共用模型几何、输入、路由、随机种子和采集范围。同一环境各方法使用独立输出目录。所有表中数值栏初始为待测。已知暂缺的入口或打点按“采集口径与结果填写”标记。
+两侧共用模型几何、输入、路由、随机种子和采集范围。同一环境各方法使用独立输出目录。配置预览仅用于核对参数。各行分别标注已测臂、阻塞原因和待补指标，历史版本数据单列。
+
+## 当前验收进度
+
+更新于 2026-11-24。**94 组中，整组验收完成 0 组。** 本轮 950POD 有 9 组可核对原始报告的融合性能、3 组 balanced 全量双参考、7 组可从正式性能轮提取的设备级 HBM 观察值。三项按指标分别计数，同一 Case 可以同时出现。按编号去重，本轮有可核对实测的共 9 组，另有 C03 仅有性能转录和级联失败日志，R01–R04 仅有历史分支对照。其余 80 组待采。
+
+| 环境与范围 | 组数 | 已有结果 | 待验收事项 |
+| --- | ---: | --- | --- |
+| UBX EP16 · K01–K18 | 18 | 本轮无可绑定到编号的实机报告 | 全矩阵、K32 热点及零接收 rank |
+| UBX EP32 · K19–K36、L01–L03、D01–D24 | 45 | 本轮无可绑定到编号的实机报告 | 跨机融合、级联、大用例 A/B；豆包 24 组先落实生产 groupsize |
+| 950POD EP32 · R01–R07 | 7 | R01–R04 有历史分支对照 | 本轮同版本/同机回归；R05–R07 待 V4.1 真机数据 |
+| 950POD EP32 · K37–K54 | 18 | K37/K39/K46/K48 有融合 P、Torch 显存和 HBM 观察值；K37/K39/K48 的 balanced Q 通过 | K37 修复包 P/C/M/H、K32 压测、Prefill 对照及其余 14 组实测 |
+| 950POD EP32 · L04–L06 | 3 | 三组均有 A 臂融合 P、Torch 显存及 HBM 观察值；历史同窗 A/B 中 L04 达标、L06 未达标 | 本轮同窗 A/B 性能与掩盖率、两臂全量 Q 和 GELU Prefill |
+| 950POD EP8 · C01–C03 | 3 | C01/C02 有融合 P 和 Torch 显存；C03 有用户回传值 | C03 融合原始报告、Decode 对照、三组 Q 和短时 HBM 复采 |
+
+UBX 先前回传的 EP16 Dispatch 39.76%、Combine 81.48% 缺少可核对的完整 profile 与采样配置，单列为观察记录，暂不计入这 94 组的验收结果。
+
+转测优先补三项。先在 K37 修复 wheel 上复采融合 P/C/M/H，保留 W2048 × 2；再用同一构建和相同窗口复测 L04/L06 的 A/B，核对两个验收门槛；随后补齐 K37 Prefill 和 C03 Decode 级联阻塞的性能对照。UBX 以对应 U16/U32 后端单独归档。
+
+### 950POD 本轮融合性能和显存占用
+
+首轮使用 `c44fb5a`、CANN b112、Python 3.11，wheel SHA256 为 `8781423ec17987ecd0a40a9675bcf88aede02e5613d35299e7a25850f02065d3`。EP32 使用 B05 os1/os2/os7/os8，EP8 使用单机。warmup=1，正式 3 轮。kernel 取后 2 轮中每轮最慢 rank 的均值，多窗先累加各窗 kernel 时延；同步 E2E 取全部 3 轮每轮最慢 rank 的均值。吞吐为全组输入 token/s。显存栏是性能进程所有 rank 的最大值，以 GiB 计。各臂常驻显存和设备峰值仍待独立采样。
+
+| Case / 融合臂 | 每卡 BS / 窗口数 | kernel（ms） | 同步 E2E（ms） | 吞吐（token/s） | Torch 峰值 allocated / reserved（GiB） | workspace / 对称区（GiB） |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| K37 · GELU 后 · A8W4 | 4096 / 2 | 37.080 | 45.368 | 2,889,070 | 0.906 / 1.137 | 0.316 / 0.703 |
+| K39 · GELU 后 · A4W4 | 4096 / 16 | 31.466 | 40.549 | 3,232,455 | 2.454 / 2.688 | 1.879 / 0.088 |
+| K46 · GELU 后 · A8W4 | 4096 / 2 | 48.513 | 57.288 | 2,287,934 | 0.907 / 1.137 | 0.316 / 0.895 |
+| K48 · GELU 后 · A4W4 | 4096 / 16 | 35.132 | 42.915 | 3,054,216 | 2.454 / 2.688 | 1.879 / 0.111 |
+| L04 · A · A8W4 | 39280 / 20 | 102.039 | 109.545 | 11,474,394 | 2.139 / 2.346 | 1.276 / 0.406 |
+| L05 · A · A8W8 | 39280 / 20 | 148.136 | 155.924 | 8,061,365 | 1.538 / 1.578 | 0.531 / 0.406 |
+| L06 · A · A4W4 | 39280 / 154 | 177.180 | 184.291 | 6,820,528 | 6.373 / 6.580 | 5.585 / 0.051 |
+| C01 · SwiGLU 后 · A8W4 | 96 / 1 | 0.884 | 1.224 | 627,415 | 0.942 / 1.389 | 0.152 / 0.006 |
+| C02 · SwiGLU 后 · A8W8 | 96 / 1 | 0.754 | 2.393 | 320,987 | 1.014 / 1.027 | 0.135 / 0.006 |
+
+首轮产物根目录为 B05 共享盘 `/mnt/share/l00911701_megamoe_b05/megamoe-topk32`，下文记为 `$BASE`。K、L 行来自 `$BASE/runs/<Case>/perf/perf/rank_*/bs_<BS>/{profiling,resources}.json`。C01/C02 来自 `$BASE/runs/<Case>/perf-n/rank_*/bs_96/`。K37 表中 P/M 均为精度修复前的数据。L04–L06 表中均为 GELU 提前加权融合臂，还需本轮 SwiGLU 和 GELU Prefill 同配置结果。
+
+C03（GELU 后加权 A8W8）首轮交接记录为 kernel 271 µs、E2E 1.167 ms、吞吐约 658,000 token/s。现有 C03 目录只有 Decode 对照失败日志，上述数值保留为转录，待补独立融合原始报告及最慢 rank 口径。C03 的 Decode 在 `aclnnMoeDistributeDispatchV4` 报 561002（`Get WinSize failed`）。K37 的 Prefill 在收发计数 `ReduceSum` 报 507899，日志同时记录驱动内存分配失败。两项级联性能、融合对级联加速比均待补。原日志为 `$BASE/runs/C03/perf/perf-w8a8-node0.log` 和 `$BASE/runs/K37/prefill/perf-w4a8-node0.log`。
+
+### 950POD 精度结果
+
+各行均为 balanced 路由下的全量双参考，融合/NPU 精度级联对 CPU Golden。各有 32/32 rank 通过，输出全为有限值，融合和级联的专家计数均与 Golden 一致。K48 的 K32 热点与零接收 rank 压测另列待补。
+
+| Case | 版本 / 实际窗口 | 每卡 / 全组校验 token | 修复前失败 rank | 融合对 CPU 最大绝对误差 | bad_elements |
+| --- | --- | ---: | --- | ---: | ---: |
+| K37 | 修复 wheel · W2048 × 2 | 4,096 / 131,072 | 21–31（11 卡） | 0.000244140625 | 0 |
+| K37 边界复测 | 修复 wheel · W257 × 1 | 257 / 8,224 | 30–31（2 卡） | 0.00048828125 | 0 |
+| K39 | 首轮 wheel · W256 × 16 | 4,096 / 131,072 | — | 0.000244140625 | 0 |
+| K48 | 首轮 wheel · W256 × 16 | 4,096 / 131,072 | — | 0 | 0 |
+
+K37 修复 wheel 基于 `c44fb5a` 加 A8W4 Dispatch 补丁，SHA256 为 `238551544141378c1169fa19e30da04c12bfa75f37de5a0a5d151ace252208e3`。完整 K37 在 os1/os2/os3/os8 跑，BS257 在 os1/os2/os7/os8 跑。四节点均正常退出。修复包这轮只采 Q，BS257 是 K37 的边界验证，计数沿用 K37 一个编号。两次汇总分别在 `$BASE/fixed-wheel-ihXs7t90/K37-accuracy-_ch2k2vc/verified-summary.json` 和 `K37s-accuracy-ksx7_pdj/verified-summary.json`（同一父目录）。工作区内可查看[完整 K37 核验报告](../benchmark-runs/b05-k37-dispatch-fix-ihXs7t90/K37/verified-summary.json)和[BS257 核验报告](../benchmark-runs/b05-k37-dispatch-fix-ihXs7t90/BS257/verified-summary.json)。K39/K48 原始报告在 `$BASE/runs/<Case>/accuracy/accuracy/rank_0/bs_4096/accuracy.json`。
+
+### 正式性能轮内的 HBM 带宽
+
+下表为首轮融合臂**每卡设备级 HBM 观测带宽**。每个 rank 独立选取正式轮中首窗 kernel 开始到末窗 kernel 结束的设备时间段，仅保留完整落在段内的硬件采样区间。相邻样本约隔 20 ms。按卡汇总 4 个 HBM 分片，先对每张卡按有效时长加权，再对有样本的卡等权。读写合计按表中读、写两列相加。设备侧流量包含同卡并发活动，覆盖情况随用例列出。
+
+| 融合臂 | 读（GB/s） | 写（GB/s） | 读写合计（约 GB/s） | 有样本 rank | 有样本 rank × 正式轮 | 有效 / 剔除异常采样窗 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| K37 · 修复前 | 56.89 | 65.62 | 122.51 | 27/32 | 42/64 | 42 / 1 |
+| K39 | 86.70 | 51.81 | 138.51 | 24/32 | 29/64 | 29 / 0 |
+| K46 | 62.50 | 72.04 | 134.54 | 32/32 | 62/64 | 77 / 1 |
+| K48 | 101.23 | 70.07 | 171.30 | 25/32 | 37/64 | 37 / 1 |
+| L04 · A | 200.00 | 227.43 | 427.43 | 32/32 | 64/64 | 231 / 5 |
+| L05 · A | 137.03 | 165.02 | 302.05 | 32/32 | 64/64 | 369 / 7 |
+| L06 · A | 215.75 | 100.73 | 316.48 | 32/32 | 64/64 | 465 / 6 |
+| C01 / C02（各 EP8） | 待复采 | 待复采 | 待复采 | 各 0/8 | 各 0/16 | 各 0 / 0 |
+
+C01/C02 的单轮 kernel 仅约 0.3–1.1 ms，当前采样周期内没有完整窗。C03 缺少独立融合 profile。K 组的缺样 rank 或缺样轮不补零；复测重点是延长稳定采集段、补齐覆盖。L 组三行覆盖全部卡和正式轮，已剔除的异常窗见表。历史 9 组的 H 均保留为设备级观察值，正式验收待独立采集并补足所需各臂。若额外要求同一 rank 两个正式轮均有完整区间，K39 只有 5/32 卡满足，读/写分别为 64.435/41.691 GB/s。这一诊断子集与表内“至少一轮有样本”的 24/32 卡分开记录。
+
+### 历史分支对照
+
+**仓基准 R01–R04。** 下表为 B07 EP32、balanced 的历史对照，斜线顺序为 main `a012a97d` / 基于 `88936f1a` 的 fix-v2。时延为每轮最慢 rank。掩盖率采用实际打点区间并集；通信带宽取报告的跨 rank 有效 payload 带宽。R02/R03 的 E2E 有上升，R04 的 Dispatch 有效带宽有下降，需用本轮构建重测后判定。B07 全部逐臂指标见 `benchmark-runs/950pod-a8w4-main/report/comparison.csv`，B05 对照在 `/mnt/share/l00911701_megamoe_b05/main-regression.RlQBDIgG/verified-forward-report/comparison.csv`。
+
+| Case | E2E（ms） | kernel（ms） | 总掩盖率（%） | Dispatch 通信带宽（GB/s） | Combine 通信带宽（GB/s） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| R01 | 4.609 / 4.057 | 0.308 / 0.309 | 89.319 / 89.356 | 59.96 / 59.89 | 39.92 / 40.19 |
+| R02 | 3.736 / 4.534 | 0.328 / 0.330 | 99.940 / 99.870 | 62.45 / 60.76 | 38.46 / 38.32 |
+| R03 | 8.496 / 8.985 | 4.681 / 4.678 | 92.905 / 92.862 | 132.95 / 130.32 | 103.02 / 102.04 |
+| R04 | 8.788 / 8.282 | 5.061 / 5.064 | 99.892 / 99.923 | 147.82 / 132.99 | 97.76 / 97.43 |
+
+B07 的 `feat/roce-support`（`8a2e4736`）另有 R01、R03 数据。按 E2E / kernel / 总掩盖率，R01 为 3.602 ms / 0.309 ms / 89.217%，R03 为 8.807 ms / 4.673 ms / 93.068%。原始目录为 `/mnt/share/l00911701_megamoe_b05/roce-regression.i6dM3Uw9/{b07-s0,b07-s0-4096}`。R05–R07 的 V4.1 参数已确定，待实测。
+
+**950POD 大用例 A/B。** 两次历史对照均为 B05 四机、每卡 BS39280、K25，A 与 B 在各自对照内同窗。下表取全部窗口、每台 4 个偶数 rank 的实际打点区间并集。时延列是同步 E2E 的均值，比值列是 8 对正式样本的 A/B 时延比中位数。
+
+| Case / 历史版本 | 每臂窗口 | A / B E2E（ms） | A/B 比 | A / B Dispatch（%） | A / B Combine（%） | A / B 总掩盖率（%） | 当时的判定 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| L04 · A8W4 · `4e68b947` | 19 × 2048 + 368 | 107.349 / 127.269 | 0.8444 | 87.937 / 97.068 | 87.201 / 17.572 | 84.462 / 50.893 | 两项达标，总掩盖率 +33.569 pp |
+| L06 · A4W4 · `c73def73` 加补丁 | 153 × 256 + 112 | 183.078 / 138.364 | 1.3252 | 32.216 / 44.247 | 28.795 / 42.361 | 29.801 / 43.767 | 两项未达标，总掩盖率 −13.965 pp |
+
+L04 历史 Q 为 A 臂 32/32、每卡抽 64 token，最大绝对误差 0.000244140625。L06 历史 Q 为两臂各 32/32、每卡抽 64 token 的 CPU Golden 校验，最大绝对误差 A/B 为 0.000244140625 / 0.000030517578125。两组当前版本的全量双参考与同窗 A/B 均待补。L04 的依据为 `benchmark-runs/b05-ep32-a8w4-bs39280-fix/release/{acceptance,strict-result}.json`。L06 的依据为 `/mnt/share/l00911701_megamoe_b05/a4w4-ab-bs39280.ycIZ3qiE/jobs/b05-v2/summary.json` 和同一共享盘 `a4w4-b39280.E7PfwCMs/accuracy-b05-v2/{gelu,swiglu}/rank_0/bs_39280/accuracy.json`。
 
 ## UBX 测试方法
 
@@ -212,20 +301,99 @@ while true; do date -Iseconds; npu-smi info; sleep 1; done > "$HBM_LOG"
 
 结束后停止采样，归档每节点原始日志。短 Decode 用例用重复批次采样，标明定频采样峰值。PyTorch allocated/reserved 与设备显存分列。
 
+### HBM 显存带宽采集
+
+UBX U16/U32、950POD P8/P32 均按 Case、构建和臂单独采集，保留每个 rank 的 profiler 数据、设备 ID、时钟域、采样周期、正式轮及 kernel 名。HBM 读写以十进制 GB/s 表示。M 的显存峰值以 GiB 表示，C 的有效带宽按通信 payload/通信时长计算。
+
+1. 在独立输出目录运行同参数的正式性能配置，timer 关闭。核对正式轮数、每轮窗口数及 `profiling.json`。对融合臂取同一设备同一轮的首末融合 kernel；对级联取该臂一次 forward 的完整设备跨度。EP16、EP32 和 EP8 分别核对 16、32 和 8 个 rank。
+2. 检查各 rank 的 `ASCEND_PROFILER_OUTPUT/ascend_pytorch_profiler_*.db` 是否有 `HBM` 及同设备时钟的任务时间。用相邻采样区间积分，先汇总该设备各 HBM 分片，再对有效卡汇总，并登记分母、样本数和异常处理。缺少时间戳或轮次对应关系时，全程 `hbm_*.csv` 的 Average 仅能作为整段 profile 的观察记录。[CANN 显存读写速率字段](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/devaids/Profiling/atlasprofiling_16_0084.html)
+3. 重采时先检查本机 `msprof --help` 支持的设备级 `--sys-hardware-mem` 和 `--sys-hardware-mem-freq`；B05 b112 的 HBM 采样最高 100 Hz。短 Decode 可在同一臂安排连续稳定的重复批次，记录起止和迭代次数，以批次报告设备带宽。需要单个 kernel 的主存访问数据时，另开 PMU profiling，B05 可选 `AiCMetrics.Memory` 并检查实际导出的主存读写字段，按 AI Core 边界单列。UBX 以该机 CANN 版本的实采字段和分片数为准。[CANN 系统硬件采样参数](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910beta2/devaids/Profiling/atlasprofiling_16_0012.html)
+
+B05 b112 重采示例。每台节点设置独立的 `HBM_OUT`，在空闲且已分配的卡上运行设备采样，使采样段覆盖同机同臂的连续正式 forward。UBX 每台按实际设备号填写，不能沿用 B05 的 8 卡列表。
+
+```bash
+msprof --sys-devices=0,1,2,3,4,5,6,7 --sys-period=60 \
+  --sys-hardware-mem=on --sys-hardware-mem-freq=100 --output="$HBM_OUT"
+```
+
+<details>
+<summary>复算 B05 的 HBM 结果（离线，只读已归档的 profiler DB）</summary>
+
+在共享盘上执行以下示例。K/L 用例替换 Case 名，C01/C02 将 `PERF_ROOT` 指到对应的 `perf-n`。此批导出数据的 `bandwidth` 为 B/s，时间戳为 ns，四个分片编号为 0–3。对这次 b112 数据，按每计数 32 B 还原的单分片增量有两簇，正常样本最大约 5.17×10⁷，异常样本最小约 1.37×10¹¹。示例以两簇间的 2³⁶ 标记并剔除异常采样窗，表中保留剔除数；更换板型或计数器时需重新核对。
+
+```bash
+PERF_ROOT=/mnt/share/l00911701_megamoe_b05/megamoe-topk32/runs/K37/perf/perf
+python3 - "$PERF_ROOT" <<'PY'
+import json
+import sqlite3
+import statistics
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+root = Path(sys.argv[1])
+world = json.loads((root / "rank_0/manifest.json").read_text())["ep_size"]
+rates, rounds_hit, kept, rejected = [], 0, 0, 0
+for rank in range(world):
+    case, = (root / f"rank_{rank}").glob("bs_*")
+    perf = json.loads((case / "profiling.json").read_text())
+    width = json.loads((case / "resources.json").read_text())["windows_per_forward"]
+    rounds, first = perf["recorded_rounds"], perf["first_selected_iteration"]
+    dbfile, = case.glob("profiler/*/ASCEND_PROFILER_OUTPUT/ascend_pytorch_profiler_*.db")
+    with sqlite3.connect(dbfile.resolve().as_uri() + "?mode=ro", uri=True) as db:
+        kernels = db.execute("""SELECT t.startNs, t.endNs FROM TASK t
+            JOIN COMPUTE_TASK_INFO c USING(globalTaskId) JOIN STRING_IDS s ON s.id=c.name
+            WHERE instr(s.value,'_Z15mega_moe_kernel')>0 ORDER BY t.startNs""").fetchall()
+        assert len(kernels) == width * rounds
+        samples = defaultdict(dict)
+        for ts, direction, part, bw in db.execute("""SELECT h.timestampNs,s.value,h.hbmId,h.bandwidth
+            FROM HBM h JOIN STRING_IDS s ON s.id=h.type ORDER BY h.timestampNs"""):
+            samples[ts][direction, part] = bw
+    times = sorted(samples)
+    elapsed, sums = 0, [0, 0]
+    for j in range(first, rounds):
+        lo, hi = kernels[j*width][0], kernels[(j+1)*width-1][1]
+        hits = 0
+        for a, b in zip(times, times[1:]):
+            if not lo <= a < b <= hi:
+                continue
+            v = samples[b]
+            dt = b - a
+            assert set(v) == {(d, i) for d in ("read", "write") for i in range(4)}
+            if max(v.values()) * dt / 32e9 >= 2**36:
+                rejected += 1
+                continue
+            elapsed += dt
+            for k, d in enumerate(("read", "write")):
+                sums[k] += sum(v[d, i] for i in range(4)) * dt
+            hits += 1
+        kept += hits
+        rounds_hit += int(hits > 0)
+    if elapsed:
+        rates.append([s / elapsed / 1e9 for s in sums])
+gbps = [round(statistics.mean(col), 2) for col in zip(*rates)] if rates else None
+print(root, "read/write GB/s", gbps, "ranks", len(rates), "/", world,
+      "rank-rounds", rounds_hit, "/", world*(rounds-first), "samples", kept, "excluded", rejected)
+PY
+```
+
+</details>
+
 ### 留档字段
 
-按 Case 编号、分支或 A/B、融合或级联、perf/accuracy/timer/memory 归档。保留运行 JSON、commit 与补丁、wheel SHA256、采集范围、rank 和原始文件。
+按 Case 编号、分支或 A/B、融合或级联以及 perf/accuracy/timer/memory/hbm-bw 分开归档。保留运行 JSON、commit 与补丁、wheel SHA256、采集范围、rank 和原始文件。
 
 ## 采集口径与结果填写
 
-Case 表的 **P / C / Q / M** 分别对应性能、通信、精度、显存。在一个 Case 下按分支、A/B 或融合/级联逐臂填值并附原始报告。
+Case 表的 **P / C / Q / M / H** 分别对应性能、通信、精度、显存占用、HBM 显存读写带宽。在一个 Case 下按分支、A/B 或融合/级联逐臂填值并附原始报告。
 
 | 栏位 | 每个 Case 按臂填写 | 验收和记录方法 |
 | --- | --- | --- |
-| P 性能 | kernel 总时延、设备跨度、同步 E2E（µs），输入吞吐（token/s）。级联另记加速比。 | 关闭 timer 做正式计时。以每轮最慢 rank 汇总，固定正式轮次。加速比按级联耗时 / 融合耗时。 |
+| P 性能 | kernel 总时延、设备跨度、同步 E2E（µs），输入吞吐（token/s）。级联另记加速比。 | 关闭 timer 做正式计时。kernel 取 `profiling.json.rank_max_mean_us`，同步 E2E 取 `host_e2e.rank_max_mean_us`，吞吐取 `host_e2e.global_input_tokens_per_second`。分别记录各自的正式轮数。加速比按级联耗时 / 融合耗时。 |
 | C 通信 | Dispatch、Combine、总掩盖率（%），有效带宽（GB/s）及字节和时间口径。 | 独立打点。仅比较相同后端、事件范围和采样 rank 的结果。分子为通信与计算交集，分母为通信时长。总通信先合并两段区间，再计算占比。级联有可比独立 trace 时另记。 |
 | M 显存 | 每卡常驻和设备峰值（GiB），汇总峰值 rank。另记 PyTorch allocated/reserved 峰值、workspace、对称缓冲区。 | 融合、级联、A/B 和各分支分别起独立进程。当前原生 benchmark 可追加 --perf-scope host，关闭 profiler 和 timer。结束剩余量填作结束快照。 |
-| Q 精度 | 通过 rank 数、校验 token 数、最大误差、专家计数及最终结论。 | 独立运行 accuracy。当前融合与 CPU Golden、独立 NPU 精度级联按 --dual-reference 误差预算比较。所有 rank 的 passed、finite、counts_equal 通过。保存三方指标。 |
+| H 显存带宽 | 记录单卡 HBM 读、写及同一时段读写合计（GB/s），注明有效 rank 数、正式轮次及采样范围。 | 从设备 HBM 计数器取数。分臂汇总有效卡均值，附单卡值；容量、通信 payload 带宽另填 M、C。[采集方法](#hbm-显存带宽采集) |
+| Q 精度 | 通过 rank 数、校验 token 数、最大误差、专家计数及最终结论。 | 独立运行 accuracy。当前融合与 CPU Golden、独立 NPU 精度级联按 --dual-reference 误差预算比较。所有 rank 的 `passed`、`finite`、`counts_equal` 和 `cascade_counts_equal` 均通过，另记 `checked_tokens`、`bad_elements` 和融合对 CPU 的 `max_abs_error`。保存三方指标。 |
 
 ### 950POD 设备数据采集
 
@@ -240,33 +408,33 @@ Q 先按以下命令预生成 Golden。RANKS 是本节点的全局 rank 范围�
 
 ### 未齐备指标
 
-K 组有 18 个 SwiGLU Prefill 用例待补同激活的级联性能入口。D 组需确认 groupsize 256/512 在生产路径中的真实参数。级联单臂显存采集需独立入口，当前双臂对照报告的共驻进程显存标为待采。旧分支缺同口径的计时、带宽或占比时保留原 report，明示缺测。
+K 组有 18 个 SwiGLU Prefill 用例待同激活实测。首轮 wheel 的 Prefill 入口仅支持 GELU；含 SwiGLU 入口的新版本须另记 wheel 和对照报告。D 组需确认 groupsize 256/512 在生产路径中的真实参数。级联单臂显存采集需独立入口，当前双臂对照报告的共驻进程显存标为待采。旧分支缺同口径的计时、带宽或占比时保留原 report，明示缺测。
 
-各表的 P、C、Q、M 按本节字段逐臂填写。P 附 profiling.json、performance.json 或级联对照 JSON，Q 附 accuracy.json，M 附 resources.json 和设备采样日志，C 附汇总和原始 timer。相同口径的值并列，暂缺的数据填待测或对应原因。
+各表的 P、C、Q、M、H 按本节字段逐臂填写。P 附 profiling.json、performance.json 或级联对照 JSON，Q 附 accuracy.json，M 附 resources.json 和设备采样日志，C 附汇总和原始 timer，H 附带 rank 与采样时间的原始 profiler 数据。相同口径的值并列，暂缺的数据填待测或对应原因。
 
 **逐臂结果登记模板**
 
-| Case / 分支或臂 | Kernel / 设备跨度 / E2E（µs） | 吞吐（token/s） | 带宽（GB/s） / Dispatch、Combine、总掩盖率 | 精度和计数 | 常驻 / 设备峰值（GiB）及峰值 rank | 原始产物 |
-| --- | --- | --- | --- | --- | --- | --- |
-| 待填 | 待测 | 待测 | 待测 | 待测 | 待测 | 待填 |
+| Case / 分支或臂 | Kernel / 设备跨度 / E2E（µs） | 吞吐（token/s） | 通信有效带宽（GB/s） / Dispatch、Combine、总掩盖率 | 精度和计数 | 常驻 / 设备峰值（GiB）及峰值 rank | HBM 读 / 写 / 合计（GB/s）及覆盖 | 构建与原始产物 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 待填 | 待测 | 待测 | 待测 | 待测 | 待测 | 待采 | 待填 |
 
 ## 仓基准与 Decode 用例
 
-R 组全部使用 P32 和 N 方法。C 组使用 P8 和 W 方法。BS 均为每卡 token 数。
+R 组全部使用 P32 和 N 方法。C 组使用 P8，Decode 对照用 W 方法，首轮 C01/C02 的独立融合数据用 N 方法。BS 均为每卡 token 数。
 
 ### 仓基准回归
 
 V4 Pro 取 H7168、I3072、E384、K6。V4.1 取 H5120、I2304、E384、K6。全部按分支原配执行 SwiGLU A8W4。S 是每卡共享专家数。R 组精度栏记当前分支结果。
 
-| Case | 模型或 BS | 变量和精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 |
-| --- | --- | --- | --- | --- | --- |
-| `R01` | V4 Pro · BS96 | S0 · A8W4 | [N](#n-直接启动融合) · main / roce / 当前 | P 待测 · C 待测 | Q 待测 · M 待测 |
-| `R02` | V4 Pro · BS96 | S1 · A8W4 | [N](#n-直接启动融合) · main / roce / 当前 | P 待测 · C 待测 | Q 待测 · M 待测 |
-| `R03` | V4 Pro · BS4096 | S0 · A8W4 | [N](#n-直接启动融合) · main / roce / 当前 | P 待测 · C 待测 | Q 待测 · M 待测 |
-| `R04` | V4 Pro · BS4096 | S1 · A8W4 | [N](#n-直接启动融合) · main / roce / 当前 | P 待测 · C 待测 | Q 待测 · M 待测 |
-| `R05` | V4.1 · BS8192 | S1 · A8W4 | [N](#n-直接启动融合) · roce / 当前 | P 待测 · C 待测 | Q 待测 · M 待测 |
-| `R06` | V4.1 · BS12288 | S1 · A8W4 | [N](#n-直接启动融合) · roce / 当前 | P 待测 · C 待测 | Q 待测 · M 待测 |
-| `R07` | V4.1 · BS16384 | S1 · A8W4 | [N](#n-直接启动融合) · roce / 当前 · 核对分窗 | P 待测 · C 待测 | Q 待测 · M 待测 |
+| Case | 模型或 BS | 变量和精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 | H 显存带宽 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `R01` | V4 Pro · BS96 | S0 · A8W4 | [N](#n-直接启动融合) · main / roce / 当前 | [历史对照](#历史分支对照)有 P/C · 本轮待测 | Q 待测 · M 待测 | 待采 |
+| `R02` | V4 Pro · BS96 | S1 · A8W4 | [N](#n-直接启动融合) · main / roce / 当前 | [历史对照](#历史分支对照)有 P/C · 本轮待测 | Q 待测 · M 待测 | 待采 |
+| `R03` | V4 Pro · BS4096 | S0 · A8W4 | [N](#n-直接启动融合) · main / roce / 当前 | [历史对照](#历史分支对照)有 P/C · 本轮待测 | Q 待测 · M 待测 | 待采 |
+| `R04` | V4 Pro · BS4096 | S1 · A8W4 | [N](#n-直接启动融合) · main / roce / 当前 | [历史对照](#历史分支对照)有 P/C · 本轮待测 | Q 待测 · M 待测 | 待采 |
+| `R05` | V4.1 · BS8192 | S1 · A8W4 | [N](#n-直接启动融合) · roce / 当前 | P 待测 · C 待测 | Q 待测 · M 待测 | 待采 |
+| `R06` | V4.1 · BS12288 | S1 · A8W4 | [N](#n-直接启动融合) · roce / 当前 | P 待测 · C 待测 | Q 待测 · M 待测 | 待采 |
+| `R07` | V4.1 · BS16384 | S1 · A8W4 | [N](#n-直接启动融合) · roce / 当前 · 核对分窗 | P 待测 · C 待测 | Q 待测 · M 待测 | 待采 |
 
 roce 表示 feat/roce-support。两个旧分支的运行包和日志分别归档。R07 先核实旧分支 BS16384 的原生容量和可比分窗。旧分支缺同步 E2E 时，用同口径独立调用计时补齐。
 
@@ -274,11 +442,11 @@ roce 表示 feat/roce-support。两个旧分支的运行包和日志分别归档
 
 固定 BS96、H3584、I1280、E384、K8、S0、后加权。用 P8 的 W 方法加 --compare-decode-cascade。Q 仍按当前分支双参考流程另测。
 
-| Case | 模型或 BS | 变量和精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 |
-| --- | --- | --- | --- | --- | --- |
-| `C01` | BS96 · P8 | SwiGLU · A8W4 | [W](#w-配置文件入口) · 融合 / Decode 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `C02` | BS96 · P8 | SwiGLU · A8W8 | [W](#w-配置文件入口) · 融合 / Decode 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
-| `C03` | BS96 · P8 | GELU · A8W8 | [W](#w-配置文件入口) · 融合 / Decode 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
+| Case | 模型或 BS | 变量和精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 | H 显存带宽 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `C01` | BS96 · P8 | SwiGLU · A8W4 | [W](#w-配置文件入口) · 融合 / Decode 级联 | N 方法[融合实测](#950pod-本轮融合性能和显存占用) · Decode/C 待测 | Q 待测 · M 有 Torch 峰值，设备峰值待采 | 0/8 卡有完整窗，待复采 |
+| `C02` | BS96 · P8 | SwiGLU · A8W8 | [W](#w-配置文件入口) · 融合 / Decode 级联 | N 方法[融合实测](#950pod-本轮融合性能和显存占用) · Decode 待测 · C 待 timer | Q 待测 · M 有 Torch 峰值，设备峰值待采 | 0/8 卡有完整窗，待复采 |
+| `C03` | BS96 · P8 | GELU · A8W8 | [W](#w-配置文件入口) · 融合 / Decode 级联 | 融合[转录待核](#950pod-本轮融合性能和显存占用) · Decode 561002 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |
 
 C03 的级联 GMM1 使用 CANN GroupedMatmulActivationQuant 与 GELU tanh。融合 MegaMoE 使用 GELU erf。性能和精度记录注明实际近似及舍入口径。
 
@@ -286,26 +454,26 @@ C03 的级联 GMM1 使用 CANN GroupedMatmulActivationQuant 与 GELU tanh。融�
 
 统一 BS4096、H7168、I3072、E384、S0。balanced 为性能主跑。精度另查 K32 的热点路由与零接收 rank，记录在同一 Case。
 
-| Case | TopK | 激活和加权 | 精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `K01` | 25 | GELU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K02` | 25 | GELU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
-| `K03` | 25 | GELU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K04` | 25 | GELU 提前加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K05` | 25 | GELU 提前加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
-| `K06` | 25 | GELU 提前加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K07` | 25 | SwiGLU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，级联待入口 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K08` | 25 | SwiGLU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，级联待入口 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
-| `K09` | 25 | SwiGLU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，级联待入口 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K10` | 32 | GELU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K11` | 32 | GELU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
-| `K12` | 32 | GELU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K13` | 32 | GELU 提前加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K14` | 32 | GELU 提前加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
-| `K15` | 32 | GELU 提前加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K16` | 32 | SwiGLU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，级联待入口 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K17` | 32 | SwiGLU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，级联待入口 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
-| `K18` | 32 | SwiGLU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，级联待入口 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
+| Case | TopK | 激活和加权 | 精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 | H 显存带宽 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `K01` | 25 | GELU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K02` | 25 | GELU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |
+| `K03` | 25 | GELU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K04` | 25 | GELU 提前加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K05` | 25 | GELU 提前加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |
+| `K06` | 25 | GELU 提前加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K07` | 25 | SwiGLU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，SwiGLU 级联待实测 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K08` | 25 | SwiGLU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，SwiGLU 级联待实测 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |
+| `K09` | 25 | SwiGLU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，SwiGLU 级联待实测 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K10` | 32 | GELU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K11` | 32 | GELU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |
+| `K12` | 32 | GELU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K13` | 32 | GELU 提前加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K14` | 32 | GELU 提前加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |
+| `K15` | 32 | GELU 提前加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K16` | 32 | SwiGLU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，SwiGLU 级联待实测 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K17` | 32 | SwiGLU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，SwiGLU 级联待实测 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |
+| `K18` | 32 | SwiGLU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，SwiGLU 级联待实测 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
 
 加权模式 GELU 提前=1、GELU 后=0、SwiGLU 后=0。GELU 的 GMM1 N 为 3072，SwiGLU 为 6144。
 
@@ -313,26 +481,26 @@ C03 的级联 GMM1 使用 CANN GroupedMatmulActivationQuant 与 GELU tanh。融�
 
 统一 BS4096、H7168、I3072、E384、S0。balanced 为性能主跑。精度另查 K32 的热点路由与零接收 rank，记录在同一 Case。
 
-| Case | TopK | 激活和加权 | 精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `K19` | 25 | GELU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K20` | 25 | GELU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K21` | 25 | GELU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K22` | 25 | GELU 提前加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K23` | 25 | GELU 提前加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K24` | 25 | GELU 提前加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K25` | 25 | SwiGLU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，级联待入口 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K26` | 25 | SwiGLU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，级联待入口 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K27` | 25 | SwiGLU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，级联待入口 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K28` | 32 | GELU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K29` | 32 | GELU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K30` | 32 | GELU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K31` | 32 | GELU 提前加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K32` | 32 | GELU 提前加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K33` | 32 | GELU 提前加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K34` | 32 | SwiGLU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，级联待入口 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K35` | 32 | SwiGLU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，级联待入口 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K36` | 32 | SwiGLU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，级联待入口 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
+| Case | TopK | 激活和加权 | 精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 | H 显存带宽 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `K19` | 25 | GELU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K20` | 25 | GELU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K21` | 25 | GELU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K22` | 25 | GELU 提前加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K23` | 25 | GELU 提前加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K24` | 25 | GELU 提前加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K25` | 25 | SwiGLU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，SwiGLU 级联待实测 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K26` | 25 | SwiGLU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，SwiGLU 级联待实测 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K27` | 25 | SwiGLU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，SwiGLU 级联待实测 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K28` | 32 | GELU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K29` | 32 | GELU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K30` | 32 | GELU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K31` | 32 | GELU 提前加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K32` | 32 | GELU 提前加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K33` | 32 | GELU 提前加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K34` | 32 | SwiGLU 后加权 | A8W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，SwiGLU 级联待实测 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K35` | 32 | SwiGLU 后加权 | A8W8 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，SwiGLU 级联待实测 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K36` | 32 | SwiGLU 后加权 | A4W4 | [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 融合，SwiGLU 级联待实测 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
 
 加权模式 GELU 提前=1、GELU 后=0、SwiGLU 后=0。GELU 的 GMM1 N 为 3072，SwiGLU 为 6144。
 
@@ -340,26 +508,26 @@ C03 的级联 GMM1 使用 CANN GroupedMatmulActivationQuant 与 GELU tanh。融�
 
 统一 BS4096、H7168、I3072、E384、S0。balanced 为性能主跑。精度另查 K32 的热点路由与零接收 rank，记录在同一 Case。
 
-| Case | TopK | 激活和加权 | 精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `K37` | 25 | GELU 后加权 | A8W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K38` | 25 | GELU 后加权 | A8W8 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
-| `K39` | 25 | GELU 后加权 | A4W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K40` | 25 | GELU 提前加权 | A8W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K41` | 25 | GELU 提前加权 | A8W8 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
-| `K42` | 25 | GELU 提前加权 | A4W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K43` | 25 | SwiGLU 后加权 | A8W4 | [G](#g-950pod-a8w4-配对分窗) · 融合同窗 · 级联待入口 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K44` | 25 | SwiGLU 后加权 | A8W8 | [N](#n-直接启动融合) · 融合待同窗 · 级联待入口 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
-| `K45` | 25 | SwiGLU 后加权 | A4W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合，级联待入口 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K46` | 32 | GELU 后加权 | A8W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K47` | 32 | GELU 后加权 | A8W8 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
-| `K48` | 32 | GELU 后加权 | A4W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K49` | 32 | GELU 提前加权 | A8W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K50` | 32 | GELU 提前加权 | A8W8 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
-| `K51` | 32 | GELU 提前加权 | A4W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K52` | 32 | SwiGLU 后加权 | A8W4 | [G](#g-950pod-a8w4-配对分窗) · 融合同窗 · 级联待入口 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `K53` | 32 | SwiGLU 后加权 | A8W8 | [N](#n-直接启动融合) · 融合待同窗 · 级联待入口 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
-| `K54` | 32 | SwiGLU 后加权 | A4W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合，级联待入口 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
+| Case | TopK | 激活和加权 | 精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 | H 显存带宽 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `K37` | 25 | GELU 后加权 | A8W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | 修复前 [融合实测](#950pod-本轮融合性能和显存占用)，修复包 P/C 待测 · Prefill 阻塞 | [全量 Q](#950pod-精度结果) 32/32 · M 有旧包 Torch 峰值，修复包待采 | [HBM 观察](#正式性能轮内的-hbm-带宽)（旧包 27/32 卡） |
+| `K38` | 25 | GELU 后加权 | A8W8 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |
+| `K39` | 25 | GELU 后加权 | A4W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | [融合实测](#950pod-本轮融合性能和显存占用) · 级联/C 待测 | [全量 Q](#950pod-精度结果) 32/32 · M 有 Torch 峰值，设备峰值待采 | [HBM 观察](#正式性能轮内的-hbm-带宽)（24/32 卡） |
+| `K40` | 25 | GELU 提前加权 | A8W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K41` | 25 | GELU 提前加权 | A8W8 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |
+| `K42` | 25 | GELU 提前加权 | A4W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K43` | 25 | SwiGLU 后加权 | A8W4 | [G](#g-950pod-a8w4-配对分窗) · 融合同窗 · SwiGLU 级联待实测 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K44` | 25 | SwiGLU 后加权 | A8W8 | [N](#n-直接启动融合) · 融合待同窗 · SwiGLU 级联待实测 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |
+| `K45` | 25 | SwiGLU 后加权 | A4W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合，SwiGLU 级联待实测 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K46` | 32 | GELU 后加权 | A8W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | [融合实测](#950pod-本轮融合性能和显存占用) · 级联/C 待测 | Q 待测 · M 有 Torch 峰值，设备峰值待采 | [HBM 观察](#正式性能轮内的-hbm-带宽)（62/64 卡轮） |
+| `K47` | 32 | GELU 后加权 | A8W8 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |
+| `K48` | 32 | GELU 后加权 | A4W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | [融合实测](#950pod-本轮融合性能和显存占用) · 级联/C 待测 | [全量 Q](#950pod-精度结果) balanced 32/32，热点/零接收待补 · M 有 Torch 峰值 | [HBM 观察](#正式性能轮内的-hbm-带宽)（25/32 卡） |
+| `K49` | 32 | GELU 提前加权 | A8W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K50` | 32 | GELU 提前加权 | A8W8 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |
+| `K51` | 32 | GELU 提前加权 | A4W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K52` | 32 | SwiGLU 后加权 | A8W4 | [G](#g-950pod-a8w4-配对分窗) · 融合同窗 · SwiGLU 级联待实测 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `K53` | 32 | SwiGLU 后加权 | A8W8 | [N](#n-直接启动融合) · 融合待同窗 · SwiGLU 级联待实测 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |
+| `K54` | 32 | SwiGLU 后加权 | A4W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合，SwiGLU 级联待实测 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
 
 加权模式 GELU 提前=1、GELU 后=0、SwiGLU 后=0。GELU 的 GMM1 N 为 3072，SwiGLU 为 6144。
 
@@ -369,16 +537,22 @@ SwiGLU 的 A8W4/A8W8 在 BS4096 的整批对称区超限。A8W4 可用 G 方法�
 
 所有用例均为 BS39280、H4096、I1536、E800、K25、S0，balanced。UBX 与 950POD 各做三种精度。
 
+L01–L06 的运行 JSON 见下表。在对应平台从仓库根目录使用[统一入口](../experiments/megamoe/scripts/run_megamoe.py)执行，例如 UBX 节点 0 上运行 `python3 experiments/megamoe/scripts/run_megamoe.py --run-config experiments/megamoe/scripts/configs/l0/L01.json`。追加 `--plan` 查看计划，使用 `--only perf` 或 `--only accuracy` 可分别运行性能或精度。L04–L06 在 950POD 环境运行。
+
+UBX 从 `90.90.93.84` 启动。B05 从 `177.22.21.1` 启动，默认使用 os1/os2/os7/os8 和预设内的共享 Python 环境。各节点需能访问相同路径的代码、wheel 环境和输出，并允许主节点通过 SSH 拉起。预设指向已归档的 K37 修复环境，测试新构建时应将同一 wheel 安装到选用的共享环境。每次调用自动创建 `benchmark-runs/L0x-*/`（可用 `RUN_BASE` 指定共享目录）。按 `run-summary.json` 回填各阶段结果，UBX 首窗对照见 `native-overlap.json`。只跑 GELU 融合与 Prefill 级联可用 `--only prefill`。
+
+L04 的融合性能使用同窗 A/B 配对，另存 `paired/paired.json`。L04、L05 的 SwiGLU 全量双参考和 L05 的 SwiGLU 融合性能受整批对称区容量限制。950POD 的全窗掩盖率仍需两臂逐窗补采。预设会执行可运行的阶段，完成后如仍有上述缺项，清单运行状态为 `partial`，退出码为 3。其他运行故障会在具体阶段记录 `failed`。独立设备显存采样和 HBM 计数器采集仍按下方验收口径回填。
+
 A 为 GELU 提前加权，B 为 SwiGLU 后加权。A 的 GMM1 K/N 为 4096/1536，B 为 4096/3072，两者 GMM2 都是 1536/4096。各 case 运行原生融合 A/B，另以 A 的模型运行 GELU Prefill 性能对照。
 
-| Case | 模型或 BS | 变量和精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 |
-| --- | --- | --- | --- | --- | --- |
-| `L01` | U32 | A8W4 | [U](#u-原生融合) / [T](#t-通信打点) / [P](#p-prefill-性能级联) · 融合 A/B + A 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `L02` | U32 | A8W8 | [U](#u-原生融合) / [T](#t-通信打点) / [P](#p-prefill-性能级联) · 融合 A/B + A 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `L03` | U32 | A4W4 | [U](#u-原生融合) / [T](#t-通信打点) / [P](#p-prefill-性能级联) · 融合 A/B + A 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `L04` | P32 | A8W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) / [G](#g-950pod-a8w4-配对分窗) · 融合 A/B + A 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `L05` | P32 | A8W8 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 A/B + A 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 |
-| `L06` | P32 | A4W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 A/B + A 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
+| Case | 模型或 BS | 变量和精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 | H 显存带宽 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `L01` | U32 | A8W4 | [L01.json](../experiments/megamoe/scripts/configs/l0/L01.json) · [U](#u-原生融合) / [T](#t-通信打点) / [P](#p-prefill-性能级联) · 融合 A/B + A 级联 · [完整命令](../experiments/megamoe/scripts/ubx_overlap_quickstart.md#l01-完整验收) | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `L02` | U32 | A8W8 | [L02.json](../experiments/megamoe/scripts/configs/l0/L02.json) · [U](#u-原生融合) / [T](#t-通信打点) / [P](#p-prefill-性能级联) · 融合 A/B + A 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `L03` | U32 | A4W4 | [L03.json](../experiments/megamoe/scripts/configs/l0/L03.json) · [U](#u-原生融合) / [T](#t-通信打点) / [P](#p-prefill-性能级联) · 融合 A/B + A 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `L04` | P32 | A8W4 | [L04.json](../experiments/megamoe/scripts/configs/l0/L04.json) · [N](#n-直接启动融合) / [W](#w-配置文件入口) / [G](#g-950pod-a8w4-配对分窗) · 融合 A/B + A 级联 | A [融合实测](#950pod-本轮融合性能和显存占用)，本轮 B/级联/C 待测 · [历史对照](#历史分支对照) | 历史 A 抽样通过 · 本轮 A/B 全量 Q 待测，A 有 Torch 峰值 | A [HBM 观察](#正式性能轮内的-hbm-带宽)，B/级联待采 |
+| `L05` | P32 | A8W8 | [L05.json](../experiments/megamoe/scripts/configs/l0/L05.json) · [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 A/B + A 级联 | A [融合实测](#950pod-本轮融合性能和显存占用) · B/级联待测 · C 待 timer | 本轮 Q 待测 · A 有 Torch 峰值 | A [HBM 观察](#正式性能轮内的-hbm-带宽)，B/级联待采 |
+| `L06` | P32 | A4W4 | [L06.json](../experiments/megamoe/scripts/configs/l0/L06.json) · [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 A/B + A 级联 | A [融合实测](#950pod-本轮融合性能和显存占用)，本轮 B/级联/C 待测 · [历史对照](#历史分支对照)未达标 | 历史 A/B 抽样通过 · 本轮 A/B 全量 Q 待测，A 有 Torch 峰值 | A [HBM 观察](#正式性能轮内的-hbm-带宽)，B/级联待采 |
 
 ### 大用例验收
 
@@ -386,7 +560,7 @@ A、B 的正式性能轮均处理每卡全部 39280 token。精度分别生成�
 
 验收比较同一后端、同一窗口和同一采样 rank 的总掩盖率。目标 A ≥ B，同时报告 A/B 的端到端耗时比及 Dispatch、Combine 各自百分点差。端到端按 A/B ≤ 1 检查。950POD A8W4 优先给出结论。
 
-950POD 的 A8W4 使用 G 方法做同窗 A/B。A8W8 的 SwiGLU 整批超限，B 臂待 A8W8 同窗入口。GELU 可先跑。首窗百分比单列，E2E 与吞吐按整轮 token 数。
+950POD 的 A8W4 使用 G 方法做同窗 A/B。A8W8 的 SwiGLU 在历史整批路径超限，新构建须复核 B 臂实际窗口与 A 相同。首窗百分比单列，E2E 与吞吐按整轮 token 数。
 
 ## 豆包用例 groupsize 256
 
@@ -394,20 +568,20 @@ A、B 的正式性能轮均处理每卡全部 39280 token。精度分别生成�
 
 使用 U / P / T 方法。先确认 groupsize 的生产配置键和生效路径，保存参数及实际值证据，然后只变更表内 BS、精度和 groupsize。固定两种实现的统计范围。
 
-| Case | 每卡 BS | groupsize | 精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `D01` | 1024 | 256 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D02` | 1024 | 256 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D03` | 1024 | 256 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D04` | 2048 | 256 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D05` | 2048 | 256 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D06` | 2048 | 256 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D07` | 4096 | 256 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D08` | 4096 | 256 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D09` | 4096 | 256 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D10` | 8192 | 256 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D11` | 8192 | 256 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D12` | 8192 | 256 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
+| Case | 每卡 BS | groupsize | 精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 | H 显存带宽 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `D01` | 1024 | 256 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D02` | 1024 | 256 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D03` | 1024 | 256 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D04` | 2048 | 256 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D05` | 2048 | 256 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D06` | 2048 | 256 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D07` | 4096 | 256 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D08` | 4096 | 256 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D09` | 4096 | 256 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D10` | 8192 | 256 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D11` | 8192 | 256 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D12` | 8192 | 256 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
 
 ### 需归档的分组证据
 
@@ -419,20 +593,20 @@ A、B 的正式性能轮均处理每卡全部 39280 token。精度分别生成�
 
 使用 U / P / T 方法。先确认 groupsize 的生产配置键和生效路径，保存参数及实际值证据，然后只变更表内 BS、精度和 groupsize。固定两种实现的统计范围。
 
-| Case | 每卡 BS | groupsize | 精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `D13` | 1024 | 512 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D14` | 1024 | 512 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D15` | 1024 | 512 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D16` | 2048 | 512 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D17` | 2048 | 512 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D18` | 2048 | 512 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D19` | 4096 | 512 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D20` | 4096 | 512 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D21` | 4096 | 512 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D22` | 8192 | 512 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D23` | 8192 | 512 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
-| `D24` | 8192 | 512 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 |
+| Case | 每卡 BS | groupsize | 精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 | H 显存带宽 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `D13` | 1024 | 512 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D14` | 1024 | 512 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D15` | 1024 | 512 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D16` | 2048 | 512 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D17` | 2048 | 512 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D18` | 2048 | 512 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D19` | 4096 | 512 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D20` | 4096 | 512 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D21` | 4096 | 512 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D22` | 8192 | 512 | A8W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D23` | 8192 | 512 | A8W8 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
+| `D24` | 8192 | 512 | A4W4 | U32 · [U](#u-原生融合) / [P](#p-prefill-性能级联) / [T](#t-通信打点) · 先确认 GS | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
 
 ### 需归档的分组证据
 
