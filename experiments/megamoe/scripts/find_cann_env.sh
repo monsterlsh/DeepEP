@@ -27,7 +27,7 @@ if (( ${#roots[@]} == 0 )); then
     exit 2
 fi
 
-ubx_entry=/usr/local/Ascend/cann-9.2.T101/set_env.sh
+ubx_entry=${UBX_CANN_SETUP:-/usr/local/Ascend/cann/set_env.sh}
 if [[ -f $ubx_entry && -r $ubx_entry ]]; then
     printf 'UBX 配置路径可读取 %q\n' "$ubx_entry" >&2
 else

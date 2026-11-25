@@ -11,7 +11,7 @@
 
 ## 1. 离线编译并安装
 
-将同一版 DeepEP checkout 拷到两台。提前准备匹配的 CANN、`py311_tpr` Conda 环境和构建依赖，以及 [依赖锁文件](../../../dependencies.lock.json) 指定的 CATLASS 和 HNS_1825 SHMEM SDK。`SHMEM_ROOT` 指向包含 `deepep-sdk.json` 的 SDK 安装目录。UBX 默认加载 `/usr/local/Ascend/cann-9.2.T101/set_env.sh`，路径不同时先设置 `UBX_CANN_SETUP`。
+将同一版 DeepEP checkout 拷到两台。提前准备匹配的 CANN、`py311_tpr` Conda 环境和构建依赖，以及 [依赖锁文件](../../../dependencies.lock.json) 指定的 CATLASS 和 HNS_1825 SHMEM SDK。`SHMEM_ROOT` 指向包含 `deepep-sdk.json` 的 SDK 安装目录。UBX 默认加载 `/usr/local/Ascend/cann/set_env.sh`，路径不同时先设置 `UBX_CANN_SETUP`。
 
 在 **90.90.93.84** 编译一次。把下面两个路径换成本机已经准备好的离线依赖。
 

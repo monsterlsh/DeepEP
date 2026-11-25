@@ -43,7 +43,7 @@ else
     fi
 fi
 
-export CANN_ENV="${UBX_CANN_SETUP:-/usr/local/Ascend/cann-9.2.T101/set_env.sh}"
+export CANN_ENV="${UBX_CANN_SETUP:-/usr/local/Ascend/cann/set_env.sh}"
 if [[ ! -r "$CANN_ENV" ]]; then
     printf 'Cannot read UBX CANN environment: %s\n' "$CANN_ENV" >&2
     return 1
