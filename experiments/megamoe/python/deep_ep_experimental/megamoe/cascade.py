@@ -312,6 +312,19 @@ class CascadeReference:
         activated, activated_scale = self._activation_quantize(first, route_weights)
         return self._gmm(activated, activated_scale, counts, weights[1])
 
+    def _finalize_output(self, routed, data, scale):
+        torch, bs = self.torch, data.shape[0]
+        if self.shared_weights is not None:
+            if self.shared_output_rounding == "route_bf16_then_add":
+                routed = routed.to(torch.bfloat16).to(torch.float32)
+            shared_data = self._repeat_codes(data, self.shared_experts, 1)
+            shared_scale = self._repeat_codes(scale, self.shared_experts, 1, 1)
+            shared_counts = torch.full((self.shared_experts,), bs, device=data.device, dtype=torch.int64)
+            shared = self._ffn(shared_data, shared_scale, shared_counts, self.shared_weights)
+            shared = shared.to(torch.float32).reshape(self.shared_experts, bs, self.hidden)
+            routed = routed + shared.sum(dim=0)
+        return routed.to(torch.bfloat16)
+
     def _expanded_route_weights(self, ids, weights, counts, rows):
         # Route bit patterns with the same official operator used for X. This
         # avoids assumptions about source-to-destination index flattening order.
@@ -415,13 +428,4 @@ class CascadeReference:
                 self.dist.reduce_scatter_tensor(output, routed.contiguous())
             else:
                 output = routed
-            if self.shared_weights is not None:
-                if self.shared_output_rounding == "route_bf16_then_add":
-                    output = output.to(torch.bfloat16).to(torch.float32)
-                shared_data = self._repeat_codes(data, self.shared_experts, 1)
-                shared_scale = self._repeat_codes(scale, self.shared_experts, 1, 1)
-                shared_counts = torch.full((self.shared_experts,), bs, device=data.device, dtype=torch.int64)
-                shared = self._ffn(shared_data, shared_scale, shared_counts, self.shared_weights)
-                shared = shared.to(torch.float32).reshape(self.shared_experts, bs, self.hidden)
-                output = output + shared.sum(dim=0)
-            return output.to(torch.bfloat16), counts
+            return self._finalize_output(output, data, scale), counts

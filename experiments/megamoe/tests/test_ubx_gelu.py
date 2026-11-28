@@ -10,6 +10,7 @@ import pytest
 
 from deep_ep_experimental.megamoe.benchmark import default_timer_ranks
 from experiments.megamoe.scripts import run_megamoe as launcher
+from experiments.megamoe.tests.accuracy_reports import direct_accuracy_row
 
 
 @pytest.fixture(autouse=True)
@@ -95,7 +96,9 @@ def test_perf_uses_selected_precision_and_fixed_timer_ranks(
         assert env["DEEPEP_SHMEM_ENDPOINT"] == f"tcp://{master_addr}:29180"
         if ep_size == 32:
             assert f"--master-addr={master_addr}" in command
+            assert f"--rdzv-conf=timeout={launcher.DEFAULT_NODE_WAIT_TIMEOUT}" in command
         else:
+            assert not any(arg.startswith("--rdzv-conf") for arg in command)
             assert f"--rdzv-endpoint={master_addr}:0" in command and f"--local-addr={master_addr}" in command
         launched_config = Path(command[command.index("--config") + 1])
         launched_spec = json.loads(launched_config.read_text(encoding="utf-8"))
@@ -125,6 +128,7 @@ def test_perf_uses_selected_precision_and_fixed_timer_ranks(
 def test_ep32_auto_waits_for_both_golden_preparations(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GOLDEN_DIR", "relative golden")
+    monkeypatch.setenv("DEEPEP_LL_INIT_TRACE", "1")
     config = tmp_path / "relative model.json"
     config.write_bytes((launcher.CONFIG_DIR / "target_gelu_k25.json").read_bytes())
     output = tmp_path / "relative output"
@@ -144,11 +148,12 @@ def test_ep32_auto_waits_for_both_golden_preparations(tmp_path, monkeypatch):
         assert args.timer
         events.append((mode, precision, args.node_rank))
 
-    def run_stage(label, scripts, logs, *, ssh_target, ssh_port):
+    def run_stage(label, scripts, logs, *, ssh_target, ssh_port, ssh_connect_timeout):
         assert ssh_target == "tester@192.0.2.2"
         assert ssh_port == 2222
         assert logs == {rank: output / f"launch-{label}-node{rank}.log" for rank in (0, 1)}
         for rank, script in scripts.items():
+            assert "export DEEPEP_LL_INIT_TRACE=1" in script.splitlines()
             argv = shlex.split(script.splitlines()[-1])[2:]
             assert argv[argv.index("--node-rank") + 1] == str(rank)
             assert argv[argv.index("--config") + 1] == str(config)
@@ -180,6 +185,7 @@ def test_ep32_auto_waits_for_both_golden_preparations(tmp_path, monkeypatch):
 @pytest.mark.parametrize(("argv", "message"), [
     (["perf", "--ep-size", "16"], "需要 --ep-size 32"),
     (["perf", "--bs", "65537"], "--bs 必须在 1..65536"),
+    (["perf", "--node-wait-timeout", "0"], "必须为正整数"),
     (["compare", "--plan"], "A/B 参数适用于 URMA"),
 ])
 def test_mte_roce_rejects_unsuitable_cases(argv, message, capsys):
@@ -196,9 +202,12 @@ def test_mte_roce_forwards_explicit_backend_and_reads_mte_reports(tmp_path, monk
 
     def run_stage(label, scripts, logs, **ssh):
         stages.append(label)
+        assert ssh["ssh_connect_timeout"] == 1234
         for script in scripts.values():
             argv = shlex.split(script.splitlines()[-1])[3:]
             assert argv[argv.index("--backend") + 1] == "mte_roce"
+            if "-accuracy-" in label:
+                assert argv[argv.index("--accuracy-cascade") + 1] == "decode"
             assert argv[0] == "--worker"
             assert launcher.cli(argv[1:]) == 0
 
@@ -222,6 +231,8 @@ def test_mte_roce_forwards_explicit_backend_and_reads_mte_reports(tmp_path, monk
             Path(option("--summary")).write_text("{}", encoding="utf-8")
             return
         assert option("--backend") == "mte_roce"
+        assert "--rdzv-backend=static" in command[:command.index("--module")]
+        assert "--rdzv-conf=timeout=1234" in command[:command.index("--module")]
         assert ("--timer" in command) == timer
         if timer:
             assert option("--timer-ranks") == "0,4,8,12,16,20,24,28"
@@ -237,12 +248,23 @@ def test_mte_roce_forwards_explicit_backend_and_reads_mte_reports(tmp_path, monk
             host_e2e = dict(rank_max_mean_us=3000, global_input_tokens_per_second=341333)
             perf = dict(host_e2e=host_e2e, windows_per_forward=1, rank_max_mean_us=2000)
             (batch_dir / "profiling.json").write_text(json.dumps(perf), encoding="utf-8")
+        else:
+            assert "--dual-reference" in command and option("--accuracy-cascade") == "decode"
+            rows = [direct_accuracy_row(r, "decode", 32, 32, model["hidden"]) for r in range(32)]
+            for local_rank in range(rank, rank + 16):
+                local_dir = rank_dir.parent / f"rank_{local_rank}"
+                (local_dir / "bs_32").mkdir(parents=True, exist_ok=True)
+                local_manifest = dict(manifest, rank=local_rank, mode="accuracy", dual_reference=True,
+                                      accuracy_cascade="decode")
+                (local_dir / "manifest.json").write_text(json.dumps(local_manifest), encoding="utf-8")
+                (local_dir / "bs_32/accuracy.json").write_text(json.dumps(rows), encoding="utf-8")
 
+    monkeypatch.setenv("DUAL_REFERENCE", "1")
     monkeypatch.setattr(launcher, "run_stage", run_stage)
     monkeypatch.setattr(launcher.subprocess, "run", check_device)
     monkeypatch.setattr(launcher, "run_logged", run_logged)
     args = ["both", precision, "--backend", "mte_roce", "--ep-size", "32", "--output-dir", str(tmp_path),
-            "--node-ip", "192.0.2.1", "192.0.2.2"]
+            "--node-ip", "192.0.2.1", "192.0.2.2", "--node-wait-timeout", "1234", "--accuracy-cascade", "decode"]
     if timer:
         args.append("--timer")
     assert launcher.cli(args) == 0
@@ -336,7 +358,7 @@ def test_run_json_forwards_resolved_settings_and_accepts_cli_overrides(tmp_path,
     )), encoding="utf-8")
     stages = []
 
-    def run_stage(label, scripts, log_paths, *, ssh_target, ssh_port):
+    def run_stage(label, scripts, log_paths, *, ssh_target, ssh_port, ssh_connect_timeout):
         stages.append(label)
         assert ssh_target.endswith("@192.0.2.2")
         for node, script in scripts.items():
@@ -371,7 +393,7 @@ def test_inline_model_reaches_both_ubx_nodes_and_950pod(tmp_path, monkeypatch):
     source.write_text(json.dumps(run), encoding="utf-8")
     workers = []
 
-    def run_stage(label, scripts, logs, *, ssh_target, ssh_port):
+    def run_stage(label, scripts, logs, *, ssh_target, ssh_port, ssh_connect_timeout):
         assert label == "run-perf-w4a8" and ssh_target.endswith("@192.0.2.12")
         for script in scripts.values():
             argv = shlex.split(script.splitlines()[-1])[3:]
@@ -813,8 +835,8 @@ def test_run_json_sources_requested_cann_before_selected_python(tmp_path, monkey
         launcher.main(["--run-config", str(source)])
 
 
-@pytest.mark.parametrize("selected_python", [None, sys.executable])
-def test_ep32_controller_loads_ubx_environment_before_launch(tmp_path, monkeypatch, selected_python):
+@pytest.mark.parametrize(("selected_python", "options"), [(None, []), (sys.executable, ["--node-wait-timeout", "1200"])])
+def test_ep32_controller_loads_ubx_environment_before_launch(tmp_path, monkeypatch, selected_python, options):
     source = tmp_path / "run.json"
     preset = launcher.SCRIPT.parent / "configs/ubx_ep32_target.json"
     data = json.loads(preset.read_text(encoding="utf-8"))
@@ -829,14 +851,14 @@ def test_ep32_controller_loads_ubx_environment_before_launch(tmp_path, monkeypat
 
     def execute(executable, command, env):
         assert executable == "bash"
-        assert command[4:] == [str(launcher.ENV_SCRIPT), str(launcher.SCRIPT), "--run-config", str(source)]
+        assert command[4:] == [str(launcher.ENV_SCRIPT), str(launcher.SCRIPT), "--run-config", str(source), *options]
         assert env.get("PYTHON") == selected_python
         raise ExecAttempt
 
     monkeypatch.setattr(launcher.os, "execvpe", execute)
     monkeypatch.setattr(launcher, "orchestrate", lambda *_: pytest.fail("launched before environment bootstrap"))
     with pytest.raises(ExecAttempt):
-        launcher.entrypoint(["--run-config", str(source)])
+        launcher.entrypoint(["--run-config", str(source), *options])
     assert not (tmp_path / "run").exists()
 
 

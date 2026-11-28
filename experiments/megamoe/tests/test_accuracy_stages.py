@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from experiments.megamoe.scripts import run_megamoe as runner
-from deep_ep_experimental.megamoe import api, benchmark, cascade, golden, validation
+from deep_ep_experimental.megamoe import api, benchmark, cascade, golden, prefill_cascade, validation
 
 
 @pytest.mark.parametrize("case", ["L01", "L04"])
@@ -58,6 +58,8 @@ def test_ubx_launches_only_requested_stage_on_both_nodes(tmp_path, monkeypatch, 
     def logged(command, env, log):
         actions.append(("cascade" if "--cascade-only" in command else "megamoe", len(actions)))
         assert "--dual-reference" not in command
+        if "--cascade-only" in command:
+            assert command[command.index("--accuracy-cascade") + 1] == "prefill"
         assert Path(command[command.index("--golden-dir") + 1]) == golden_dir
 
     monkeypatch.setattr(runner, "run_stage", run_stage)
@@ -89,6 +91,8 @@ def test_pod_stage_does_not_launch_other_implementations(tmp_path, monkeypatch, 
             return
         calls.append("cascade" if "--cascade-only" in command else "megamoe")
         assert "--dual-reference" not in command
+        if "--cascade-only" in command:
+            assert command[command.index("--accuracy-cascade") + 1] == "prefill"
         rank = Path(command[command.index("--output-dir") + 1]) / "rank_0"
         (rank / "bs_39280").mkdir(parents=True)
         (rank / "manifest.json").write_text(json.dumps(dict(backend="mte", ep_size=8)))
@@ -137,8 +141,8 @@ def test_cascade_only_reads_existing_golden_and_never_calls_fused(tmp_path, monk
     (tmp_path / "_build_info.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(api, "SymmBuffer", lambda *a, **kw: pytest.fail("fused path reached"))
     monkeypatch.setattr(cascade, "init_process_group", lambda group: False if status != "missing" else pytest.fail("HCCL reached"))
-    monkeypatch.setattr(cascade, "CascadeReference", lambda *a, **kw: SimpleNamespace(
-        forward=lambda *a, **kw: (Tensor(expected if status == "pass" else expected + 10), Tensor(counts))))
+    monkeypatch.setattr(prefill_cascade, "PrefillCascade", lambda *a, **kw: SimpleNamespace(
+        forward_with_counts=lambda *a, **kw: (Tensor(expected if status == "pass" else expected + 10), Tensor(counts))))
     if status == "missing":
         with pytest.raises(ValueError, match="Golden"):
             benchmark.run(args, config, group)

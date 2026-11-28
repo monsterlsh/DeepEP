@@ -4,7 +4,9 @@
 
 from contextlib import ExitStack
 from io import SEEK_END
+import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -49,7 +51,12 @@ wait "$child"
 
 def node_script(work_dir, env, environment_script, argv, *, peer_default=False):
     """Load the runtime on the current node before executing its worker."""
-    lines = ["set -e", f"cd -- {shlex.quote(str(work_dir))}"]
+    lines = [
+        "set -e",
+        "ubx_env_start=$SECONDS",
+        r"""printf '[UBX startup] %s host=%s shell ready\n' "$(date -u +%FT%TZ)" "$HOSTNAME" >&2""",
+        f"cd -- {shlex.quote(str(work_dir))}",
+    ]
     lines.extend(f"export {shlex.quote(f'{name}={value}')}" for name, value in env.items()
                  if name != "PYTHON" or not peer_default)
     source = f"source {shlex.quote(str(environment_script))}"
@@ -62,16 +69,20 @@ def node_script(work_dir, env, environment_script, argv, *, peer_default=False):
             f"    {source} --preserve-python",
             "fi",
         ])
+    lines.append(
+        r"""printf '[UBX startup] %s environment ready after %ss\n' "$(date -u +%FT%TZ)" "$((SECONDS-ubx_env_start))" >&2"""
+    )
     lines.append('exec "$PYTHON" ' + shlex.join(map(str, argv)))
     return "\n".join(lines)
 
 
-def _node_command(rank, script, ssh_target, ssh_port):
+def _node_command(rank, script, ssh_target, ssh_port, ssh_connect_timeout):
     command = ["bash", "-c", _SUPERVISOR, "ubx-stage", script]
     if rank == 0:
         return command
     return [
-        "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+        shutil.which("ssh", path=os.defpath) or "ssh",
+        "-T", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={ssh_connect_timeout}",
         "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
         "-p", str(ssh_port), "--", ssh_target, shlex.join(command),
     ]
@@ -103,7 +114,7 @@ def _log_tail(path):
     return "\n".join(data.decode("utf-8", errors="replace").splitlines()[-40:])
 
 
-def run_stage(stage, scripts, log_paths, *, ssh_target=None, ssh_targets=None, ssh_port=22):
+def run_stage(stage, scripts, log_paths, *, ssh_target=None, ssh_targets=None, ssh_port=22, ssh_connect_timeout=15):
     """Keep every node supervised until all workers finish or one fails."""
     if ssh_targets is None:
         ssh_targets = {1: ssh_target}
@@ -112,12 +123,18 @@ def run_stage(stage, scripts, log_paths, *, ssh_target=None, ssh_targets=None, s
     with ExitStack() as stack:
         logs = {rank: stack.enter_context(path.open("wb")) for rank, path in log_paths.items()}
         pending = {}
+        # The local SSH client uses system libcrypto. NPU workers load their own runtime on each node.
+        ssh_env = os.environ.copy()
+        ssh_env.pop("LD_LIBRARY_PATH", None)
+        ssh_env.pop("LD_PRELOAD", None)
         try:
             for rank, script in scripts.items():
-                command = _node_command(rank, script, ssh_targets.get(rank), ssh_port)
-                print(f"开始 {stage} node{rank}，日志 {log_paths[rank]}", flush=True)
+                command = _node_command(rank, script, ssh_targets.get(rank), ssh_port, ssh_connect_timeout)
+                timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                print(f"[{timestamp}] 开始 {stage} node{rank}，日志 {log_paths[rank]}", flush=True)
                 pending[rank] = subprocess.Popen(
                     command, stdin=subprocess.PIPE, stdout=logs[rank], stderr=subprocess.STDOUT,
+                    env=ssh_env if rank else None,
                 )
             while pending:
                 for rank, process in list(pending.items()):

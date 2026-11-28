@@ -13,6 +13,9 @@ import numpy as np
 
 from .golden import compare
 
+# Limit temporary float32 arrays per rank while comparing long Prefill outputs.
+_DIRECT_CHUNK_ELEMENTS = 1 << 20
+
 TRIANGLE_RATIOS = dict(
     max_relative=5.0,
     mean_relative=1.5,
@@ -80,27 +83,28 @@ def compare_triangle(actual, cascade, expected, **tolerances):
     return result, rows
 
 
+def _matching_counts(value, expected):
+    return bool(
+        value.ndim == expected.ndim == 1
+        and np.issubdtype(value.dtype, np.integer)
+        and np.issubdtype(expected.dtype, np.integer)
+        and np.all(value >= 0)
+        and np.all(expected >= 0)
+        and np.array_equal(value, expected)
+    )
+
+
 def compare_outputs(actual, cascade, expected, actual_counts, cascade_counts, expected_counts, selected=None):
     """Check full-output finiteness and counts even when Golden rows are sampled."""
     actual, cascade, expected = map(np.asarray, (actual, cascade, expected))
     actual_counts, cascade_counts, expected_counts = map(np.asarray, (actual_counts, cascade_counts, expected_counts))
 
-    def matching_counts(value):
-        return bool(
-            value.ndim == expected_counts.ndim == 1
-            and np.issubdtype(value.dtype, np.integer)
-            and np.issubdtype(expected_counts.dtype, np.integer)
-            and np.all(value >= 0)
-            and np.all(expected_counts >= 0)
-            and np.array_equal(value, expected_counts)
-        )
-
     report = dict(
         passed=False,
         policy="cascade_error_budget",
         finite=bool(all(np.isfinite(value).all() for value in (actual, cascade, expected))),
-        counts_equal=matching_counts(actual_counts),
-        cascade_counts_equal=matching_counts(cascade_counts),
+        counts_equal=_matching_counts(actual_counts, expected_counts),
+        cascade_counts_equal=_matching_counts(cascade_counts, expected_counts),
         triangle={},
         triangle_metrics=[],
         reason="",
@@ -127,3 +131,88 @@ def compare_outputs(actual, cascade, expected, actual_counts, cascade_counts, ex
         failures.append(triangle["reason"])
     report.update(passed=not failures, reason="; ".join(failures) if failures else "within cascade error budget")
     return report
+
+
+def _host_array(value, *, output=False):
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+        if output:
+            value = value.float()  # NumPy cannot expose torch.bfloat16 directly.
+        return value.numpy()
+    return np.asarray(value)
+
+
+def _add_direct_block(total, actual, expected):
+    """Accumulate golden.compare statistics; apply its percentage to the whole pair."""
+    block = compare(actual, expected)
+    total["elements"] += block["elements"]
+    if block["reason"]:
+        total.update(reason=block["reason"], max_abs_error=None, max_mixed_error=None, bad_elements=0)
+    if not total["reason"]:
+        total["bad_elements"] += block["bad_elements"]
+        for key in ("max_abs_error", "max_mixed_error"):
+            total[key] = max(total[key], block[key])
+
+
+def compare_direct_outputs(actual, cascade, expected, actual_counts, cascade_counts, expected_counts,
+                           selected=None, *, reference_kind):
+    """Compare both fused-output pairs directly. CPU Golden rows follow selected order."""
+    actual, cascade, expected = (
+        value if hasattr(value, "shape") else np.asarray(value) for value in (actual, cascade, expected)
+    )
+    actual_counts, cascade_counts, expected_counts = map(_host_array, (actual_counts, cascade_counts, expected_counts))
+    # Start with the metric schema and thresholds from the canonical comparator.
+    empty = np.empty(0, dtype=np.float32)
+    template = dict(compare(empty, empty), passed=False)
+    pairs = {key: template.copy() for key in ("fused_vs_cpu", "fused_vs_cascade", "cascade_vs_cpu")}
+    report = dict(policy="direct_dual_reference", reference_kind=reference_kind, passed=False, finite=False,
+                  checked_tokens=0, total_tokens=int(actual.shape[0]) if actual.ndim else 0,
+                  counts_equal=bool(expected_counts.size and _matching_counts(actual_counts, expected_counts)),
+                  cascade_counts_equal=bool(expected_counts.size and _matching_counts(cascade_counts, expected_counts)),
+                  counts_source="public MegaMoE local expert receive counts", **pairs)
+    reason = ""
+    if actual.ndim != 2 or actual.shape != cascade.shape or min(actual.shape) == 0:
+        reason = f"invalid full output shapes: MegaMoE={tuple(actual.shape)}, cascade={tuple(cascade.shape)}"
+    else:
+        tokens, hidden = actual.shape
+        if selected is not None:
+            selected = _host_array(selected)
+            if (selected.ndim != 1 or not selected.size or not np.issubdtype(selected.dtype, np.integer)
+                    or np.any(selected < 0) or np.any(selected >= tokens) or np.unique(selected).size != selected.size):
+                reason = "invalid or empty selected token indices"
+            elif selected.size == tokens and np.array_equal(selected, np.arange(tokens)):
+                selected = None  # Full Golden is consecutive; use views instead of advanced indexing.
+        if not reason:
+            checked = tokens if selected is None else selected.size
+            if expected.shape != (checked, hidden):
+                reason = f"CPU Golden shape {tuple(expected.shape)} != {(checked, hidden)}"
+    if reason:
+        for pair in pairs.values():
+            pair.update(reason=reason, max_abs_error=None, max_mixed_error=None)
+        return dict(report, reason=reason)
+
+    report["checked_tokens"] = int(checked)
+    rows_per_chunk = max(1, _DIRECT_CHUNK_ELEMENTS // hidden)
+    for start in range(0, tokens, rows_per_chunk):
+        stop = min(start + rows_per_chunk, tokens)
+        fused_rows, cascade_rows = (_host_array(value[start:stop], output=True) for value in (actual, cascade))
+        _add_direct_block(pairs["fused_vs_cascade"], fused_rows, cascade_rows)
+        if selected is None:
+            cpu_rows = _host_array(expected[start:stop], output=True)
+        else:
+            positions = np.flatnonzero((selected >= start) & (selected < stop))
+            if not positions.size:
+                continue
+            offsets = selected[positions] - start
+            fused_rows, cascade_rows = fused_rows[offsets], cascade_rows[offsets]
+            cpu_rows = _host_array(expected[positions], output=True)
+        _add_direct_block(pairs["fused_vs_cpu"], fused_rows, cpu_rows)
+        _add_direct_block(pairs["cascade_vs_cpu"], cascade_rows, cpu_rows)
+
+    for pair in pairs.values():
+        pair["passed"] = (not pair["reason"] and pair["bad_elements"] <= pair["pct_thd"] * pair["elements"]
+                          and pair["max_mixed_error"] <= pair["max_diff"])
+    report["finite"] = all(pair["max_abs_error"] is not None for pair in pairs.values())
+    failures = [key for key in ("finite", "counts_equal", "cascade_counts_equal") if not report[key]]
+    failures.extend(key for key in ("fused_vs_cpu", "fused_vs_cascade") if not pairs[key]["passed"])
+    return dict(report, passed=not failures, reason=", ".join(failures) if failures else "both direct comparisons passed")

@@ -61,7 +61,8 @@ bash experiments/megamoe/scripts/build_ubx.sh
 `config` 还包含 `warmup`、`iters`、`seed` 和 `alignment`。外层 `routing` 选择路由数据分布。复用同一份 GELU 预设时，可在复制的 JSON 外层设 `"activation": "swiglu"` 切换到 SwiGLU Finalize 加权。外层 `topk` 和 `bs` 可覆盖内嵌值。EP32 自动拉起时脚本向两台节点传递同一份内嵌模型。
 
 - 四份 UBX JSON 默认 `mode=both`、`precision=all`，先测精度，再测性能。单测时将 `mode` 设为 `accuracy` 或 `perf`，将 `precision` 设为 `a8w4` 或 `a8w8`。也接受别名 `w4a8`、`w8a8`。
-- JSON 中的 `topk` 可设为 1–32，`routing` 可选 `balanced`、`skewed`、`random` 或 `random-balanced`。`check_tokens=0` 全量比对，正数按每卡抽查。`dual_reference=true` 加做 NPU 级联比对。`weighting=early|late` 选择量化前或 Finalize 加权。
+- JSON 中的 `topk` 可设为 1–32，`routing` 可选 `balanced`、`skewed`、`random` 或 `random-balanced`。`weighting=early|late` 选择量化前或 Finalize 加权。
+- 正式 Q 设 `dual_reference=true`、`check_tokens=0`。C01–C03 使用 `accuracy_cascade=decode`，其余用例使用 `prefill`。逐 rank 检查融合对 CPU 和融合对相应小算子均直接通过，同时核对有限值与专家计数。正数 `check_tokens` 仅缩小 CPU Golden 的覆盖范围。EP4、EP8、EP16 的每组性能另登记当前融合与 `feat/roce-support` 同配置融合的结果或不可比原因。[取数方法](../../docs/megamoe-topk32-gelu-test-checklist.md#小-ep-分支性能对照)
 - 运行 JSON 可指定 `golden_dir`、`run_base`、`output_dir`、`python`、`cann_env`。相对路径以运行 JSON 所在目录为起点。
 - 省略 `output_dir` 时，单项作业按实际平台、EP、后端、精度、任务、激活与加权、TopK、每卡 BS、路由和启动时间命名，例如 `ubx-ep16-mte-a8w4-perf-gelu-early-k25-bs4096-balanced-20261124-143005/`。L0 清单使用较短的 Case 目录名，例如 `L01-ubx-ep32-a8w4-memory-20261124-143005/`。实际路径见启动日志。
 - EP16 的 JSON 用 `master_addr` 设置本机地址，预设为 `127.0.0.1`。EP32 的 JSON 在 `node_ip` 填两台机器的 IPv4，预设为 `["90.90.93.84", "90.90.93.188"]`。从第一台启动，脚本会通过 SSH 拉起第二台。默认取第一项作为 torchrun 和 SHMEM 的主地址，也可以在 JSON 显式设置 `master_addr`。

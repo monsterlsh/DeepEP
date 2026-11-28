@@ -43,6 +43,10 @@ class Case:
         return max(1, self.ep_size // local)
 
     @property
+    def accuracy_cascade(self):
+        return "decode" if self.case.startswith("C") else "prefill"
+
+    @property
     def limitation(self):
         if self.groupsize:
             return f"groupsize={self.groupsize} 缺少生产配置键和实际生效证据"
@@ -157,7 +161,7 @@ def run_config(row, phase, *, node_rank=None, results=None, master_addr=None):
                 job["golden_only"] = True
         elif row.nodes == 1 and accuracy:
             job["force_npu"] = True
-    job.update(ep_size=row.ep_size, backend=row.backend)
+    job.update(ep_size=row.ep_size, backend=row.backend, accuracy_cascade=row.accuracy_cascade)
     if master_addr:
         job["master_addr"] = master_addr
         if suite and row.machine == "950pod":
@@ -190,7 +194,9 @@ def main(argv=None):
     if not selected:
         parser.error("没有匹配的配置。UBX 的 K01–17 对应 EP4/8/16，K19–35 对应 EP32；950POD 使用 K37–53。K 组均跳过 3 的倍数。")
     if args.command == "list":
-        print(json.dumps([dict(asdict(r), backend=r.backend, nodes=r.nodes, phases=r.phases(), limitation=r.limitation)
+        print(json.dumps([dict(asdict(r), backend=r.backend, nodes=r.nodes, phases=r.phases(), limitation=r.limitation,
+                               accuracy_cascade=r.accuracy_cascade,
+                               performance_baseline="feat/roce-support" if r.ep_size < 32 else None)
                           for r in selected], indent=2, ensure_ascii=False))
         return
     try:

@@ -108,7 +108,7 @@ python run_megamoe.py --run-config "$CASE" --accuracy-arm gelu --accuracy-stage 
 
 `golden` 在 CPU 生成或复用校验过的 rank 文件。`megamoe` 只运行融合，`cascade` 只运行 HCCL 小算子级联。后两项独立读取已有 Golden，按相同的 CPU 误差阈值、有限值、专家计数给出通过或失败。缺失、损坏或参数不匹配的 Golden 会直接报错。每次可附加 `--plan` 查看启动计划。改为 `--accuracy-arm swiglu` 可验证 B 臂；该臂须先生成自己的 Golden，参数指纹会将两臂分开保存。省略 `--accuracy-arm` 则两臂都跑所选阶段。
 
-每次测试打印本轮输出目录。用 `jq -r '.jobs[] | [.name,.status,.accuracy_report] | @tsv' "$OUT/run-summary.json"` 找两臂各自的报告。每份 `accuracy.json` 记录全组 rank 的 `passed`、`max_abs_error`、`counts_equal`、`golden_path`。任一 rank 超限即返回失败。完整双参考所用的级联误差预算可用原命令 `--only accuracy` 核验。
+每次测试打印本轮输出目录。用 `jq -r '.jobs[] | [.name,.status,.accuracy_report] | @tsv' "$OUT/run-summary.json"` 找两臂各自的报告。分阶段的 `accuracy.json` 记录该实现相对 CPU 的结果。正式 Q 执行 `python run_megamoe.py --run-config "$CASE" --only accuracy`。L01 两臂均以 Prefill 为小算子参考，每个 rank 的融合对 CPU 和融合对 Prefill 两项均须通过，并满足全量检查与专家计数要求。[逐项判据](../../../docs/megamoe-topk32-gelu-test-checklist.md#测试验证与复现方法)
 
 ## L01 完整验收
 

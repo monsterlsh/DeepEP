@@ -9,6 +9,7 @@ import sys
 import pytest
 
 from experiments.megamoe.scripts import run_megamoe as launcher
+from experiments.megamoe.tests.accuracy_reports import direct_accuracy_row
 
 
 @pytest.mark.parametrize("machine,ep,local,node", [
@@ -25,6 +26,11 @@ def test_local_devices_workers_golden_and_trace_use_requested_ep(
     job = dict(schema_version=1, machine=machine, mode=mode, precision="a8w4", ep_size=ep, backend="mte",
                config=model, output_dir=str(tmp_path / "out"), golden_dir=str(tmp_path / "golden"),
                master_addr="192.0.2.1", timer=mode == "perf", profile_memory_peak=False, check_tokens=1)
+    if mode == "accuracy":
+        job["dual_reference"] = True
+        if ep != 4:
+            job["accuracy_cascade"] = "decode"
+            model["model"].update(activation="swiglu", num_topk=8, topk_weights_type=0)
     if machine == "950pod":
         job["node_rank"] = node
     path = tmp_path / "job.json"
@@ -54,6 +60,7 @@ def test_local_devices_workers_golden_and_trace_use_requested_ep(
             return command[command.index(name) + 1]
 
         if "--module" not in command:
+            assert "--accuracy-cascade" not in command
             assert option("--ep-size") == str(ep)
             golden.append(option("--ranks"))
             if "--summary" in command:
@@ -69,6 +76,10 @@ def test_local_devices_workers_golden_and_trace_use_requested_ep(
             assert f"--node-rank={node}" in command
         if mode == "perf":
             assert option("--timer-ranks") == ",".join(map(str, samples))
+            assert "--accuracy-cascade" not in command
+        else:
+            reference = job.get("accuracy_cascade", "prefill")
+            assert "--dual-reference" in command and option("--accuracy-cascade") == reference
         spec = json.loads(Path(option("--config")).read_text(encoding="utf-8"))
         for rank in range(first, first + local):
             directory = Path(option("--output-dir")) / f"rank_{rank}"
@@ -76,12 +87,15 @@ def test_local_devices_workers_golden_and_trace_use_requested_ep(
             case.mkdir(parents=True)
             manifest = dict(mode=mode, ep_size=ep, ranks_per_node=local, rank=rank, config=spec, backend="mte",
                             input="fp8", routing="balanced")
+            if mode == "accuracy":
+                manifest.update(dual_reference=True, accuracy_cascade=reference)
             (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             if mode == "perf":
                 timing = dict(rank_max_mean_us=2, global_input_tokens_per_second=1)
                 (case / "profiling.json").write_text(json.dumps(dict(timing, host_e2e=timing, windows_per_forward=1)))
             else:
-                (case / "accuracy.json").write_text("[]")
+                rows = [direct_accuracy_row(r, reference, 96, 1, spec["model"]["hidden"]) for r in range(ep)]
+                (case / "accuracy.json").write_text(json.dumps(rows))
         launched.append(mode)
 
     monkeypatch.setattr(launcher.subprocess, "run", check_device)

@@ -93,6 +93,11 @@ class DecodeCascade(CascadeReference):
 
     def forward(self, x, ids, weights, *, input_kind, quantized=None):
         """Run one Decode forward and return the local BF16 output."""
+        output, _ = self.forward_with_counts(x, ids, weights, input_kind=input_kind, quantized=quantized)
+        return output
+
+    def forward_with_counts(self, x, ids, weights, *, input_kind, quantized=None):
+        """Return BF16 outputs and the int64 per-expert counts from Dispatch V2."""
         if input_kind == "bf16":
             data, scale = self._quantize(x)
         elif input_kind == "fp8":
@@ -108,6 +113,7 @@ class DecodeCascade(CascadeReference):
             scales_dtype=_E8M0,
             expert_ids=ids,
             x_active_mask=None,
+            expert_token_nums_type=1,
             quant_mode=0,
             global_bs=global_bs,
             y_dtype=_FP8_E4M3,
@@ -120,7 +126,7 @@ class DecodeCascade(CascadeReference):
             **self.gmm1_options,
         )
         output = self._gmm(intermediate, intermediate_scale, counts, self.weights[1])
-        return npu.npu_moe_distribute_combine_v2(
+        combined = npu.npu_moe_distribute_combine_v2(
             expand_x=output,
             expert_ids=ids,
             assist_info_for_combine=assist,
@@ -133,3 +139,4 @@ class DecodeCascade(CascadeReference):
             comm_quant_mode=0,
             **self.communication,
         )
+        return combined, counts

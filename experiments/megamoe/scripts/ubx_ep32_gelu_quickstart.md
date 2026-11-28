@@ -64,6 +64,8 @@ PY
 
 启动器会在各自节点加载本机的 CANN 和 Python 运行库环境。默认的 CANN 路径不同于预设时，可在 JSON 外层填写两台都可读的 `cann_env`。
 
+UBX EP32 默认允许 SSH 建连和双机 torchrun 集合各等待 900 秒。node1 加载环境、检查设备较慢时，可在启动命令后加 `--node-wait-timeout 1800`，或在运行 JSON 顶层设置 `"node_wait_timeout": 1800`。手动启动时两台使用同一设置。两台 torchrun 到齐后立即运行；若 SSH 或节点进程提前报错，启动器会输出失败节点的日志并结束本轮。
+
 以下命令只在 **90.90.93.84** 执行。脚本会通过 SSH 拉起第二台。JSON 使用 `node_ip` 按顺序指定主、从节点，默认取第一项为 `master_addr`。如果沿用手动启动的 JSON，改用自动启动前删除其中的 `node_rank` 和 `stage`。
 
 ```bash

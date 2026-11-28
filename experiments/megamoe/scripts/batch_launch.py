@@ -325,7 +325,7 @@ def summarize(run_dir, batches, world):
 def summarize_accuracy(run_dir, batches, world, *, launch_ok=True):
     """Summarize collected CPU checks; missing reports never count as PASS."""
     lines = [
-        f"[ACCURACY SUMMARY] EP={world} launch={'OK' if launch_ok else 'FAILED'}",
+        f"[CPU-ONLY ACCURACY SUMMARY] EP={world} launch={'OK' if launch_ok else 'FAILED'}",
         "  CPU mixed-error limits: bad elements <=5% per rank (error>0.01), max error <=0.1",
     ]
     if not launch_ok:
@@ -410,7 +410,7 @@ def summarize_accuracy(run_dir, batches, world, *, launch_ok=True):
             lines.append(f"  rank={rank} FAIL: {reason}")
         lines.append(f"  report={path}")
     # 数值通过不代表作业正常退出；timer/清理失败也必须在总状态中体现。
-    lines.append(f"[ACCURACY OVERALL] {'PASS' if all_passed else 'NOT PASSED'}")
+    lines.append(f"[CPU-ONLY ACCURACY OVERALL] {'PASS' if all_passed else 'NOT PASSED'}")
     text = "\n".join(lines) + "\n"
     (run_dir / "summary.txt").write_text(text, encoding="utf-8")
     print(text, end="", flush=True)

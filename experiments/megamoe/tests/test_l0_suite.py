@@ -331,12 +331,13 @@ def test_l01_passes_explicit_python_only_to_ssh_peer(tmp_path, monkeypatch):
     monkeypatch.setenv("UBX_CANN_LOADED", "test-cann")
     remote_python = "/remote only/py311_tpr/bin/python"
     config = launcher.read_run_config(PRESETS / "L01.json")
-    config.update(python=sys.executable, peer_python=remote_python)
+    config.update(python=sys.executable, peer_python=remote_python, node_wait_timeout=1200)
     path = tmp_path / "case.json"
     path.write_text(json.dumps(config), encoding="utf-8")
     remote_targets = []
 
-    def capture(stage, scripts, logs, *, ssh_target, ssh_port):
+    def capture(stage, scripts, logs, *, ssh_target, ssh_port, ssh_connect_timeout):
+        assert ssh_connect_timeout == 1800
         assert remote_python not in scripts[0]
         assert "export " + shlex.quote("PYTHON=" + remote_python) in scripts[1]
         assert "--peer-default" not in scripts[1]
@@ -350,5 +351,5 @@ def test_l01_passes_explicit_python_only_to_ssh_peer(tmp_path, monkeypatch):
 
     monkeypatch.setattr(launcher, "run_stage", capture)
     monkeypatch.setattr(subprocess, "run", run_child)
-    assert launcher.entrypoint(["--run-config", str(path), "--only", "prefill"]) == 0
+    assert launcher.entrypoint(["--run-config", str(path), "--only", "prefill", "--node-wait-timeout", "1800"]) == 0
     assert len(remote_targets) == 1 and remote_targets[0].endswith("@" + config["node_ip"][1])

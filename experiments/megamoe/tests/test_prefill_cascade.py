@@ -57,6 +57,7 @@ def test_prefill_routes_payload_and_weight_through_uneven_two_rank_splits(monkey
         )
         cascade.world, cascade.topk, cascade.experts, cascade.local_experts, cascade.hidden = 2, 2, 4, 2, 4
         cascade.topk_weights_type, cascade.weights = early, None
+        cascade.shared_weights = None
 
         def ffn(rows, scales, counts, _weights, routing_weights):
             assert rows.shape[0] <= 2
@@ -76,8 +77,13 @@ def test_prefill_routes_payload_and_weight_through_uneven_two_rank_splits(monkey
             ids = ids.remainder(2) + 2
         weights = torch.tensor(weights, dtype=torch.float32)
         actual = cascade.forward(None, ids, weights, input_kind="fp8", quantized=(data, scale))
+        accuracy, counts = cascade.forward_with_counts(None, ids, weights, input_kind="fp8", quantized=(data, scale))
         expected = ((data[:, 0, None].float() + scale[:, 0, :] + ids * 2) * weights).sum(dim=1)
         assert torch.equal(actual, expected[:, None].expand(-1, 4).to(torch.bfloat16))
+        assert torch.equal(accuracy, actual)
+        expected_counts = [0, 0, 7, 5] if empty_owner else [3, 3, 4, 2]
+        assert counts.dtype == torch.int64
+        assert counts.tolist() == expected_counts[rank * 2:rank * 2 + 2]
 
     with ThreadPoolExecutor(2) as pool:
         rank0 = pool.submit(
@@ -88,3 +94,38 @@ def test_prefill_routes_payload_and_weight_through_uneven_two_rank_splits(monkey
         )
         rank0.result()
         rank1.result()
+
+
+@pytest.mark.parametrize("rounding, expected", [("single_cast", 1.0078125), ("route_bf16_then_add", 1.0)])
+def test_prefill_adds_shared_experts_with_configured_rounding(rounding, expected):
+    torch = pytest.importorskip("torch")
+    cascade = object.__new__(prefill_cascade.PrefillCascade)
+    cascade.torch, cascade.fp8 = torch, torch.float8_e4m3fn
+    cascade.world, cascade.experts, cascade.local_experts, cascade.hidden = 1, 1, 1, 4
+    cascade.topk_weights_type = 0
+    cascade.shared_weights = object()
+    cascade.weights = object()
+    cascade.shared_experts, cascade.shared_output_rounding = 2, rounding
+    data = torch.full((3, 4), 1.0).to(cascade.fp8)
+    scale = torch.tensor([[110, 114], [121, 117], [128, 135]], dtype=torch.uint8).reshape(3, 1, 2)
+    ids = torch.zeros((3, 1), dtype=torch.int32)
+    weights = torch.full((3, 1), 1.00390625)
+    cascade.npu = SimpleNamespace(
+        npu_moe_init_routing_v2=lambda x, ids, **kw: (x, torch.arange(3), torch.tensor([3]), None),
+        npu_moe_finalize_routing=lambda x, *, scales, **kw: x * scales,
+    )
+    cascade._quantize = lambda x: (data, scale)
+
+    def ffn(rows, scales, counts, ffn_weights, routing_weights=None):
+        if ffn_weights is cascade.shared_weights:
+            assert routing_weights is None and counts.tolist() == [3, 3]
+            assert torch.equal(rows.view(torch.uint8), data.view(torch.uint8).repeat(2, 1))
+            assert torch.equal(scales, scale.repeat(2, 1, 1))
+            return torch.full((6, 4), 0.001953125, dtype=torch.bfloat16)
+        assert ffn_weights is cascade.weights and counts.tolist() == [3]
+        return torch.ones((3, 4), dtype=torch.bfloat16)
+
+    cascade._ffn = ffn
+    output, counts = cascade.forward_with_counts(data.to(torch.bfloat16), ids, weights, input_kind="bf16")
+    assert torch.equal(output, torch.full((3, 4), expected, dtype=torch.bfloat16))
+    assert counts.tolist() == [3]

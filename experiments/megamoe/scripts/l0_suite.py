@@ -30,6 +30,8 @@ def case_jobs(data, selection):
 
     def add(name, kind, arm=None, reason=None):
         job = dict(name=name, kind=kind, status="unsupported" if reason else "planned")
+        if kind == "accuracy":
+            job["accuracy_cascade"] = data.get("accuracy_cascade", "prefill")
         if memory_only:
             job.update(name=f"{name}-memory", kind="memory", workload=kind)
         if kind != "overlap":
@@ -82,6 +84,8 @@ def job_config(base, job, root):
                   profile_memory_peak=job["profile_memory_peak"])
     if job["kind"] == "memory":
         config["perf_scope"] = "memory"
+    if accuracy:
+        config["accuracy_cascade"] = job["accuracy_cascade"]
     if accuracy and not base.get("accuracy_stage") and base["machine"] == "ubx" and base["ep_size"] <= runner.LOCAL_RANKS:
         # This acceptance run must own the per-rank accuracy and memory reports it archives.
         config["force_npu"] = True
@@ -224,6 +228,8 @@ def run_l0(path, data, *, only=None, plan=False, accuracy_arm=None):
     summary = dict(case=case, machine=base["machine"], backend=base.get("backend"), precision=precision,
                    ep_size=ep, nodes=nodes,
                    tokens_per_rank=spec["bs_values"][0], selection=selection, jobs=jobs)
+    if not pod and ep == 32:
+        summary["node_wait_timeout"] = base.get("node_wait_timeout", runner.DEFAULT_NODE_WAIT_TIMEOUT)
     if accuracy_stage:
         summary.update(accuracy_stage=accuracy_stage, golden_dir=base["golden_dir"])
     if base.get("peer_python"):

@@ -54,11 +54,27 @@ def test_cpu_golden_remains_available_for_current_full_batch_limit():
         matrix.run_config(row, "golden")
 
 
+def test_full_matrix_selects_reference_and_baseline_for_all_cases(capsys):
+    matrix.main(["list"])
+    listing = {(r["case"], r["machine"], r["ep_size"]): r for r in json.loads(capsys.readouterr().out)}
+    for row in ROWS.values():
+        entry = listing[row.case, row.machine, row.ep_size]
+        assert entry["performance_baseline"] == ("feat/roce-support" if row.ep_size < 32 else None)
+        assert entry["accuracy_cascade"] == ("decode" if row.case in ("C01", "C02", "C03") else "prefill")
+        for phase in set(row.phases()) & {"accuracy", "accuracy-skewed"}:
+            cfg = matrix.run_config(row, phase, results="/shared/accuracy")
+            assert cfg["accuracy_cascade"] == entry["accuracy_cascade"]
+            if not row.case.startswith("L"):
+                assert cfg["dual_reference"] and cfg["check_tokens"] == 0
+
+
 @pytest.mark.parametrize("name,machine,ep,phase", [
     ("R02", "ubx", 4, "perf"),
     ("R06", "950pod", 16, "memory"),
     ("R07", "950pod", 8, "perf"),
     ("C01", "ubx", 8, "decode"),
+    ("C02", "950pod", 8, "accuracy"),
+    ("C03", "ubx", 16, "accuracy"),
     ("C03", "950pod", 4, "decode"),
     ("K17", "ubx", 4, "accuracy-skewed"),
     ("K53", "950pod", 8, "golden-skewed"),
@@ -87,6 +103,9 @@ def test_generated_config_through_public_plan(tmp_path, capsys, name, machine, e
     if phase == "accuracy-skewed":
         assert cfg["dual_reference"] and cfg["check_tokens"] == 0 and cfg["routing"] == "skewed"
     assert run_megamoe.entrypoint(["--run-config", str(path), "--plan"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    if phase.startswith("accuracy"):
+        assert plan["dual_reference"] and plan["accuracy_cascade"] == cfg["accuracy_cascade"]
     assert not (tmp_path / "job").exists()
 
 

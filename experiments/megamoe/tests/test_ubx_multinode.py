@@ -1,10 +1,12 @@
 # Copyright (c) 2026, Lu Lu
 
+import os
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
 import sys
+from unittest.mock import Mock
 
 import pytest
 
@@ -31,6 +33,43 @@ def test_stage_log_open_failure_starts_no_children(tmp_path, monkeypatch):
         ubx_multinode.run_stage("golden", {0: "true", 1: "true"}, logs, ssh_target="unused")
 
 
+def test_stage_starts_local_and_ssh_with_their_own_environments(tmp_path, monkeypatch):
+    logs = {rank: tmp_path / f"node{rank}.log" for rank in (0, 1)}
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/npu/lib")
+    monkeypatch.setenv("LD_PRELOAD", "/npu/lib/preload.so")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/agent.sock")
+    system_ssh = str(tmp_path / "system-ssh")
+    which = Mock(return_value=system_ssh)
+    monkeypatch.setattr(ubx_multinode.shutil, "which", which)
+    launches = {}
+    launch_counts_at_poll = []
+
+    def poll():
+        launch_counts_at_poll.append(len(launches))
+        return 0
+
+    def spawn(command, *, stdout, env=None, **kwargs):
+        launches[Path(stdout.name)] = (command, dict(os.environ if env is None else env))
+        return Mock(poll=poll)
+
+    monkeypatch.setattr(ubx_multinode.subprocess, "Popen", spawn)
+    ubx_multinode.run_stage("benchmark", {0: "local-work", 1: "peer-work"}, logs, ssh_target="worker",
+                            ssh_connect_timeout=1234)
+
+    assert launch_counts_at_poll == [2, 2]
+    local, local_env = launches[logs[0]]
+    remote, ssh_env = launches[logs[1]]
+    assert local[0] == "bash" and local[-1] == "local-work"
+    which.assert_called_once_with("ssh", path=os.defpath)
+    assert remote[0] == system_ssh and remote[-2] == "worker"
+    assert "ConnectTimeout=1234" in remote
+    assert shlex.split(remote[-1])[-1] == "peer-work"
+    assert local_env["LD_LIBRARY_PATH"] == "/npu/lib"
+    assert local_env["LD_PRELOAD"] == "/npu/lib/preload.so"
+    assert "LD_LIBRARY_PATH" not in ssh_env and "LD_PRELOAD" not in ssh_env
+    assert ssh_env["SSH_AUTH_SOCK"] == "/agent.sock"
+
+
 def test_stage_failure_cancels_peer(tmp_path, monkeypatch, bash):
     logs = {rank: tmp_path / f"node{rank}.log" for rank in (0, 1)}
     ready = shlex.quote((tmp_path / "ready").as_posix())
@@ -39,7 +78,7 @@ def test_stage_failure_cancels_peer(tmp_path, monkeypatch, bash):
         1: f"trap 'echo cancelled; exit 143' TERM; touch {ready}; sleep 15; echo unexpected",
     }
 
-    def local_command(rank, script, target, port):
+    def local_command(rank, script, target, port, timeout):
         return [bash, "-c", ubx_multinode._SUPERVISOR, "test-stage", script]
 
     monkeypatch.setattr(ubx_multinode, "_node_command", local_command)
@@ -58,7 +97,7 @@ def test_failed_node_traceback_is_visible_without_printing_full_log(tmp_path, mo
         1: "print('early-output')\nprint('x' * 65536)\nraise RuntimeError('node1 native core missing')",
     }
     monkeypatch.setattr(
-        ubx_multinode, "_node_command", lambda rank, script, target, port: [sys.executable, "-u", "-c", script],
+        ubx_multinode, "_node_command", lambda rank, script, target, port, timeout: [sys.executable, "-u", "-c", script],
     )
     with pytest.raises(subprocess.CalledProcessError) as error:
         ubx_multinode.run_stage("prepare", scripts, logs, ssh_target="unused")

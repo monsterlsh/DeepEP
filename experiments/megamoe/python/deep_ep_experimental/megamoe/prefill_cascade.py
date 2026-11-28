@@ -91,8 +91,11 @@ class PrefillCascade(CascadeReference):
 
         if owner_data.shape[0] == 0:
             owner_output = owner_data.new_empty((0, self.hidden), dtype=torch.bfloat16)
+            # Every source sent zero rows for every local expert.
+            local_counts = owner_counts[0]
         elif self.world == 1:
-            owner_output = self._run_expert_tiles(owner_data, owner_scales, counts, owner_weights)
+            local_counts = counts
+            owner_output = self._run_expert_tiles(owner_data, owner_scales, local_counts, owner_weights)
         else:
             # ReRouting only permutes rows. A BF16 view preserves the FP8 codes.
             ordered, _, owner_order, local_counts = npu.npu_moe_re_routing(
@@ -104,8 +107,9 @@ class PrefillCascade(CascadeReference):
             del owner_scales
             if owner_weights is not None:
                 owner_weights = owner_weights.index_select(0, owner_order)
+            local_counts = local_counts.to(torch.int64)
             ordered_output = self._run_expert_tiles(
-                ordered.view(data.dtype), ordered_scales, local_counts.to(torch.int64), owner_weights,
+                ordered.view(data.dtype), ordered_scales, local_counts, owner_weights,
             )
             del ordered, ordered_scales
             owner_output = ordered_output.index_select(0, owner_order.float().argsort())
@@ -113,7 +117,7 @@ class PrefillCascade(CascadeReference):
 
         source_output = self._exchange(owner_output, recv_sizes, send_sizes)
         del owner_output
-        return npu.npu_moe_finalize_routing(
+        routed = npu.npu_moe_finalize_routing(
             source_output.float(),
             skip1=None,
             skip2=None,
@@ -122,10 +126,18 @@ class PrefillCascade(CascadeReference):
             expanded_src_to_dst_row=row_idx,
             export_for_source_row=None,
             drop_pad_mode=2,
-        ).reshape(data.shape[0], self.hidden).to(torch.bfloat16)
+        ).reshape(data.shape[0], self.hidden)
+        return self._finalize_output(routed, data, scale), local_counts
 
     def forward(self, x, ids, weights, *, input_kind, quantized=None):
         """Return one rank's BF16 outputs for a large prefill forward."""
+        return self._forward(x, ids, weights, input_kind, quantized, with_counts=False)
+
+    def forward_with_counts(self, x, ids, weights, *, input_kind, quantized=None):
+        """Return BF16 outputs and int64 receive counts for this rank's routed experts."""
+        return self._forward(x, ids, weights, input_kind, quantized, with_counts=True)
+
+    def _forward(self, x, ids, weights, input_kind, quantized, *, with_counts):
         if input_kind == "bf16":
             data, scale = self._quantize(x)
         elif input_kind == "fp8":
@@ -135,9 +147,18 @@ class PrefillCascade(CascadeReference):
             raise ValueError("Prefill input_kind must be bf16 or fp8")
         bs = data.shape[0]
         if bs <= PREFILL_TOKEN_WINDOW:
-            return self._forward_window(data, scale, ids, weights)
+            output, counts = self._forward_window(data, scale, ids, weights)
+            return (output, counts) if with_counts else output
         output = data.new_empty((bs, self.hidden), dtype=self.torch.bfloat16)
+        counts = None
         for start in range(0, bs, PREFILL_TOKEN_WINDOW):
             rows = slice(start, start + PREFILL_TOKEN_WINDOW)
-            output[rows].copy_(self._forward_window(data[rows], scale[rows], ids[rows], weights[rows]))
-        return output
+            window_output, window_counts = self._forward_window(data[rows], scale[rows], ids[rows], weights[rows])
+            output[rows].copy_(window_output)
+            del window_output
+            if with_counts:
+                if counts is None:
+                    counts = window_counts
+                else:
+                    counts.add_(window_counts)
+        return (output, counts) if with_counts else output

@@ -5,6 +5,7 @@
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -55,7 +56,22 @@ def file_lock(path):
         yield
 
 
-def _check_report(reports, identity, path):
+def valid_direct_pair(pair, elements, *, gate):
+    """Verify a finite golden.compare result and optionally require its verdict to pass."""
+    if (not isinstance(pair, dict) or type(pair.get("elements")) is not int or pair["elements"] != elements
+            or type(pair.get("bad_elements")) is not int or not 0 <= pair["bad_elements"] <= elements
+            or type(pair.get("passed")) is not bool
+            or (pair.get("diff_thd"), pair.get("pct_thd"), pair.get("max_diff")) != (0.01, 0.05, 0.1)):
+        return False
+    for name in ("max_abs_error", "max_mixed_error"):
+        value = pair.get(name)
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            return False
+    passed = pair["bad_elements"] <= elements * pair["pct_thd"] and pair["max_mixed_error"] <= pair["max_diff"]
+    return pair["passed"] == passed and (not gate or passed)
+
+
+def check_accuracy_report(reports, identity, path):
     world, bs, sample = (identity[name] for name in ("ep_size", "bs", "check_tokens"))
     dual = identity["dual_reference"]
     checked = min(sample or bs, bs)
@@ -65,12 +81,22 @@ def _check_report(reports, identity, path):
         if not isinstance(row, dict) or any(row.get(key) is not True for key in ("passed", "counts_equal", "finite")):
             raise ValueError(f"Missing or failed accuracy result for rank {rank}: {path}")
         if dual:
+            hidden = identity["config"]["model"]["hidden"]
             valid = (
-                row.get("policy") == "cascade_error_budget"
+                row.get("policy") == "direct_dual_reference"
+                and identity["accuracy_cascade"] in ("prefill", "decode")
+                and row.get("reference_kind") == identity["accuracy_cascade"]
+                and type(row.get("rank")) is int
+                and row.get("rank") == rank
+                and type(row.get("checked_tokens")) is int
                 and row.get("checked_tokens") == checked
+                and row.get("total_tokens") == bs
                 and row.get("cascade_counts_equal") is True
-                and isinstance(row.get("triangle"), dict)
-                and row["triangle"].get("passed") is True
+                and row.get("cumulative_counts_equal") is True
+                and type(hidden) is int and hidden > 0
+                and valid_direct_pair(row.get("fused_vs_cpu"), checked * hidden, gate=True)
+                and valid_direct_pair(row.get("fused_vs_cascade"), bs * hidden, gate=True)
+                and valid_direct_pair(row.get("cascade_vs_cpu"), checked * hidden, gate=False)
             )
         else:
             valid = (
@@ -107,6 +133,8 @@ class AccuracyCache:
     def _reports_digest(self, output):
         expected = {name: self.identity[name] for name in ("ep_size", "routing", "config", "dual_reference")}
         expected.update(mode="accuracy", backend=self.identity.get("backend", "urma"), input=self.identity.get("input", "fp8"))
+        if self.identity["dual_reference"]:
+            expected["accuracy_cascade"] = self.identity["accuracy_cascade"]
         if "build" in self.identity:
             expected["build"] = self.identity["build"]
         sampled = self.identity.get("profile_memory_peak") is True
@@ -126,7 +154,7 @@ class AccuracyCache:
             report_path = directory / f"bs_{self.identity['bs']}" / "accuracy.json"
             report_data = report_path.read_bytes()
             if rank == 0:
-                _check_report(json.loads(report_data), self.identity, report_path)
+                check_accuracy_report(json.loads(report_data), self.identity, report_path)
                 group_report = report_data
             elif report_data != group_report:
                 raise ValueError(f"Ranks disagree on the group accuracy report: {report_path}")

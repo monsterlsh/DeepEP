@@ -91,7 +91,8 @@ def test_gelu_decode_uses_a_single_cann_fusion_with_nz_weight(monkeypatch):
 
 
 @pytest.mark.parametrize(("mma_type", "input_kind"), [("fp8xfp4", "bf16"), ("fp8xfp4", "fp8"), ("fp8xfp8", "fp8")])
-def test_decode_cascade_routes_prequantized_input_and_combine_metadata(mma_type, input_kind):
+@pytest.mark.parametrize("with_counts", [False, True])
+def test_decode_cascade_routes_prequantized_input_and_combine_metadata(mma_type, input_kind, with_counts):
     calls = []
 
     def record(name, result):
@@ -125,13 +126,17 @@ def test_decode_cascade_routes_prequantized_input_and_combine_metadata(mma_type,
     ids = SimpleNamespace(shape=(32, 8))
     route_weights = object()
     quantized = (data, scale) if input_kind != "bf16" else None
-    assert cascade.forward("bf16", ids, route_weights, input_kind=input_kind, quantized=quantized) == "local_output"
+    forward = cascade.forward_with_counts if with_counts else cascade.forward
+    result = forward("bf16" if input_kind == "bf16" else None, ids, route_weights,
+                     input_kind=input_kind, quantized=quantized)
+    assert result == (("local_output", "counts") if with_counts else "local_output")
     path = [name for name, _, _ in calls]
     assert path == (["quantize"] if input_kind == "bf16" else []) + ["dispatch", "gmm1", "gmm2", "combine"]
     dispatch, gmm1, gmm2, combine = calls[-4:]
     assert dispatch[2]["x"] is data
     assert dispatch[2]["scales"] == ("input_scale", 1)
     assert dispatch[2]["quant_mode"] == 0
+    assert dispatch[2]["expert_token_nums_type"] == 1
     assert dispatch[2]["x_dtype"] == dispatch[2]["y_dtype"] == 24
     assert dispatch[2]["global_bs"] == combine[2]["global_bs"] == 1024
     assert gmm1[2]["x_scale"] == (64, 56, 2)

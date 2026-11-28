@@ -3,25 +3,29 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 
 from experiments.megamoe.scripts.ubx_accuracy_cache import AccuracyCache, atomic_write_json, file_lock
+from experiments.megamoe.scripts.run_megamoe import accuracy_report_line
+from experiments.megamoe.tests.accuracy_reports import direct_accuracy_row
 
 
 def case(tmp_path, dual=False, sample=0):
     identity = dict(
         ep_size=2, bs=16, check_tokens=sample, dual_reference=dual, routing="balanced",
-        config={"model": {"mma_type": "fp8xfp8"}}, build={"revision": "a"}, golden="digest",
+        config={"model": {"mma_type": "fp8xfp8", "hidden": 32}}, build={"revision": "a"}, golden="digest",
     )
     output = tmp_path / "run" / "accuracy-w8a8"
+    if dual:
+        identity["accuracy_cascade"] = "prefill"
     rows = []
     checked = min(sample or 16, 16)
     for rank in range(2):
         row = dict(finite=True, counts_equal=True, passed=True)
         if dual:
-            row.update(policy="cascade_error_budget", checked_tokens=checked, cascade_counts_equal=True,
-                       triangle={"passed": True})
+            row = direct_accuracy_row(rank, "prefill", 16, checked, 32)
         else:
             row.update(policy="cpu_mixed_error", rank=rank, checked_token_count=checked, check_tokens=sample,
                        total_tokens=16, cumulative_counts_equal=True)
@@ -30,6 +34,8 @@ def case(tmp_path, dual=False, sample=0):
         directory = output / f"rank_{rank}"
         manifest = {key: identity[key] for key in ("config", "routing", "dual_reference", "ep_size", "build")}
         manifest.update(rank=rank, backend="urma", mode="accuracy", input="fp8")
+        if dual:
+            manifest["accuracy_cascade"] = identity["accuracy_cascade"]
         atomic_write_json(directory / "manifest.json", manifest)
         atomic_write_json(directory / "bs_16/accuracy.json", rows)
     return AccuracyCache(tmp_path, identity), output
@@ -105,6 +111,67 @@ def test_only_complete_json_replaces_a_published_record(tmp_path):
         atomic_write_json(path, {"invalid": object()})
     assert json.loads(path.read_bytes()) == {"valid": True}
     assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize("damage", ["old_policy", "missing_kind", "wrong_kind", "manifest", "rank", "checked_tokens",
+                                     "total_tokens", "passed", "counts_equal", "cascade_counts_equal", "finite",
+                                     "cumulative_counts_equal", "fused_vs_cpu", "fused_vs_cascade", "sampled_pair",
+                                     "cpu_coverage", "missing_diagnostic", "missing_metrics", "threshold", "bad_verdict"])
+def test_dual_cache_and_launcher_require_matching_direct_checks(tmp_path, damage):
+    cache, output = case(tmp_path, dual=True, sample=3)
+    args = SimpleNamespace(**cache.identity, backend="urma", node_rank=0, ranks_per_node=2)
+    assert "prefill" in accuracy_report_line(output, args, "w8a8")
+    cache.publish(output)
+    other = AccuracyCache(tmp_path, dict(cache.identity, accuracy_cascade="decode"))
+    assert cache.index != other.index and other.lookup() is None
+    with pytest.raises(ValueError):
+        other.publish(output)
+    if damage == "manifest":
+        manifest_path = output / "rank_1/manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest.pop("accuracy_cascade")
+        atomic_write_json(manifest_path, manifest)
+    else:
+        for report_path in output.glob("rank_*/bs_16/accuracy.json"):
+            rows = json.loads(report_path.read_bytes())
+            if damage == "old_policy":
+                rows[1].update(policy="cascade_error_budget", triangle={"passed": True})
+            elif damage == "missing_kind":
+                rows[1].pop("reference_kind")
+            elif damage == "wrong_kind":
+                rows[1]["reference_kind"] = "decode"
+            elif damage in ("fused_vs_cpu", "fused_vs_cascade"):
+                rows[1][damage]["passed"] = False
+            elif damage == "sampled_pair":
+                rows[1]["fused_vs_cascade"]["elements"] = 3 * 32
+            elif damage == "cpu_coverage":
+                rows[1]["fused_vs_cpu"]["elements"] = 16 * 32
+            elif damage == "missing_diagnostic":
+                del rows[1]["cascade_vs_cpu"]
+            elif damage == "missing_metrics":
+                rows[1]["fused_vs_cpu"] = {"passed": True}
+            elif damage == "threshold":
+                rows[1]["fused_vs_cascade"]["max_diff"] = 0.5
+            elif damage == "bad_verdict":
+                rows[1]["fused_vs_cascade"]["max_mixed_error"] = 0.11
+            else:
+                rows[1][damage] = False
+            atomic_write_json(report_path, rows)
+    assert cache.lookup() is None
+    with pytest.raises(ValueError):
+        cache.publish(output)
+    with pytest.raises(ValueError):
+        accuracy_report_line(output, args, "w8a8")
+
+
+def test_cascade_vs_cpu_failed_diagnostic_can_be_cached(tmp_path):
+    cache, output = case(tmp_path, dual=True)
+    for report_path in output.glob("rank_*/bs_16/accuracy.json"):
+        rows = json.loads(report_path.read_bytes())
+        rows[0]["cascade_vs_cpu"].update(passed=False, max_mixed_error=0.15, bad_elements=1)
+        atomic_write_json(report_path, rows)
+    cache.publish(output)
+    assert cache.lookup() == output
 
 
 @pytest.mark.parametrize("dual", [False, True])

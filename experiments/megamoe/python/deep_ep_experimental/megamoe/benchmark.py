@@ -288,7 +288,9 @@ def main():
         "--golden-dir", type=Path, default=Path("benchmark-golden"), help="Precomputed CPU Golden cache"
     )
     parser.add_argument("--relative-rmse", type=float, default=0.02, help="Timer on/off output tolerance only")
-    parser.add_argument("--dual-reference", action="store_true", help="Compare CPU Golden and NPU cascade")
+    parser.add_argument("--dual-reference", action="store_true", help="Require fused vs CPU and fused vs NPU cascade to pass")
+    parser.add_argument("--accuracy-cascade", choices=("prefill", "decode"),
+                        help="NPU operator cascade for accuracy (default: prefill)")
     parser.add_argument("--cascade-only", action="store_true", help="Check only the NPU cascade against an existing CPU Golden")
     comparison = parser.add_mutually_exclusive_group()
     comparison.add_argument("--compare-decode-cascade", action="store_true",
@@ -297,6 +299,8 @@ def main():
                             help="Compare fused MegaMoE with the GELU AllToAll Prefill cascade")
     args = parser.parse_args()
     config = load_config(args.config, args.bs_values)
+    if args.accuracy_cascade and not (args.dual_reference or args.cascade_only):
+        parser.error("--accuracy-cascade requires --dual-reference or --cascade-only")
     if args.cascade_only and (args.mode != "accuracy" or args.dual_reference or args.timer):
         parser.error("--cascade-only requires standalone accuracy without dual-reference or timer")
     if args.check_tokens < 0 or not 0 < args.relative_rmse < 1:
@@ -371,8 +375,12 @@ def _run(args, config, group, monitors):
     model = config["model"]
     compare_decode = bool(getattr(args, "compare_decode_cascade", False))
     compare_prefill = bool(getattr(args, "compare_prefill_cascade", False))
-    decode_gelu = compare_decode and model.get("activation") == "gelu"
     cascade_kind = "decode" if compare_decode else ("prefill" if compare_prefill else None)
+    accuracy_kind = None
+    if getattr(args, "dual_reference", False) or getattr(args, "cascade_only", False):
+        accuracy_kind = getattr(args, "accuracy_cascade", None) or "prefill"
+    operator_kind = accuracy_kind or cascade_kind
+    decode_gelu = operator_kind == "decode" and model.get("activation") == "gelu"
     urma_window_tokens = getattr(args, "urma_window_tokens", None)
     collective_check(
         group,
@@ -390,6 +398,7 @@ def _run(args, config, group, monitors):
             args.relative_rmse,
             bool(getattr(args, "dual_reference", False)),
             bool(getattr(args, "cascade_only", False)),
+            accuracy_kind,
             sample_peak,
             perf_scope,
             paired_weights,
@@ -407,10 +416,14 @@ def _run(args, config, group, monitors):
         if compare_decode and compare_prefill:
             raise ValueError("Select a single cascade comparison")
         _validate_cascade_comparison(args, config, cascade_kind)
+    if accuracy_kind == "decode":
+        from .decode_cascade import validate_decode_case
+        validate_decode_case(config)
+    if cascade_kind or (accuracy_kind and not getattr(args, "cascade_only", False)):
         import torch_npu
 
         required_ops = ["npu_dynamic_mx_quant", "npu_grouped_matmul"]
-        if compare_decode:
+        if operator_kind == "decode":
             required_ops += ["npu_moe_distribute_dispatch_v2", "npu_moe_distribute_combine_v2"]
             required_ops.append("npu_format_cast" if decode_gelu else "npu_grouped_matmul_swiglu_quant_v2")
         else:
@@ -503,10 +516,12 @@ def _run(args, config, group, monitors):
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
     )
+    if accuracy_kind:
+        manifest["accuracy_cascade"] = accuracy_kind
     if getattr(args, "cascade_only", False):
         from .cascade_accuracy import run_cascade_accuracy
 
-        manifest.update(api="CascadeReference", device_communication="hccl", accuracy_stage="cascade")
+        manifest.update(api=f"{accuracy_kind.capitalize()}Cascade", device_communication="hccl", accuracy_stage="cascade")
         (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         run_cascade_accuracy(args, config, group, rank_dir, sample_peak)
         group.close()
@@ -601,10 +616,11 @@ def _run(args, config, group, monitors):
     cascade = None
     cascade_owned = False
     if getattr(args, "dual_reference", False):
-        from .cascade import CascadeReference, init_process_group
+        from .cascade import init_process_group
+        from .cascade_accuracy import make_accuracy_cascade
 
         cascade_owned = init_process_group(group)
-        cascade = CascadeReference(model, raw, shared_raw, host_group=group)
+        cascade = make_accuracy_cascade(accuracy_kind, model, raw, shared_raw, group)
     guard = perf_cascade = None
     if cascade_kind or (urma and args.mode == "perf" and perf_scope == "all"):
         from .performance import UrmaLaunchGuard
@@ -718,44 +734,36 @@ def _run(args, config, group, monitors):
             counts = stats - 7
             call(stats=stats)  # 非零初值和重复累加，验证公开接口而非内部 forward。
             torch.npu.synchronize()
-            reports = accuracy(
-                config,
-                rank,
-                world,
-                bs,
-                result,
-                counts,
-                args.check_tokens,
-                args.routing,
-                stats,
-                group=group,
-                golden_dir=args.golden_dir,
-                input_kind=args.input,
-            )
-            if cascade is not None:
-                from .golden import contract, load
-                from .accuracy import compare_outputs
+            if cascade is None:
+                reports = accuracy(config, rank, world, bs, result, counts, args.check_tokens, args.routing, stats,
+                                   group=group, golden_dir=args.golden_dir, input_kind=args.input)
+            else:
+                from .golden import cache_path, contract, load
+                from .accuracy import compare_direct_outputs
 
-                expected, expected_counts, selected = load(
-                    args.golden_dir, contract(config, world, bs, args.input, args.routing, args.check_tokens), rank
-                )
-                other, other_counts = cascade.forward(
+                spec = contract(config, world, bs, args.input, args.routing, args.check_tokens)
+                expected, expected_counts, selected = load(args.golden_dir, spec, rank)
+                other, other_counts = cascade.forward_with_counts(
                     activation,
                     buffer.topk_idx[:bs],
                     buffer.topk_weights[:bs],
                     input_kind=args.input,
                     quantized=(buffer.x[:bs], buffer.x_sf[:bs]) if activation is None else None,
                 )
-                dual = compare_outputs(
-                    result.float().cpu().numpy(),
-                    other.float().cpu().numpy(),
+                dual = compare_direct_outputs(
+                    result, other,
                     expected,
                     counts.cpu().numpy(),
                     other_counts.cpu().numpy(),
                     expected_counts,
                     selected,
+                    reference_kind=accuracy_kind,
                 )
-                dual["passed"] &= bool((stats == 7 + 2 * counts).all().item())
+                cumulative_ok = bool((stats == 7 + 2 * counts).all().item())
+                dual.update(rank=rank, total_tokens=bs, golden_path=str(cache_path(args.golden_dir, spec, rank)),
+                            cumulative_counts_equal=cumulative_ok)
+                if not cumulative_ok:
+                    dual.update(passed=False, reason=dual["reason"] + "; cumulative expert count mismatch")
                 reports = group.all_gather(dual, f"dual reference BS={bs}")
             (case / "accuracy.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
             if not all(item["passed"] for item in reports):

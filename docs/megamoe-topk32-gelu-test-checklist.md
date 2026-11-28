@@ -8,6 +8,10 @@
 
 使用本分支源码为目标平台重编 wheel，在参与的节点安装同一份构建。CPU Golden 的缓存键包含参考实现源码指纹。分支切换后，分阶段测精度时先用本分支生成 Golden，然后用相同的 EP、模型和路由分别运行融合与级联。L 组可按 [L01 分阶段精度命令](../experiments/megamoe/scripts/ubx_overlap_quickstart.md#l01-单独生成-golden-和验证精度)执行。
 
+**Q 在每个 rank 做两次直接比对。** C01、C02、C03 使用 Decode 小算子（Dispatch/Combine V2），其余 R、K、L、D 用例均使用 Prefill 小算子（AllToAll）。L 的 GELU、SwiGLU 两臂各用自己的 Golden 和 Prefill。矩阵生成的精度配置会选择相应实现；手写 JSON 用 `dual_reference=true` 和 `accuracy_cascade=decode|prefill`，直接启动 benchmark 用 `--dual-reference --accuracy-cascade decode|prefill`。每行均比较同一融合输出与 CPU Golden、同一融合输出与所选小算子，小算子收到相同输入、路由 ID、路由权重和模型权重。
+
+正式 Q 取 `check_tokens=0`。在 `rank_0/bs_<BS>/accuracy.json` 的全组报告中核对 rank 集合、`policy=direct_dual_reference`、`reference_kind` 及逐 rank 的 `checked_tokens=total_tokens=BS`。只有 `fused_vs_cpu.passed` 和 `fused_vs_cascade.passed` 都为真，全量输出有限，融合及小算子的每专家接收计数等于 Golden，融合重复调用的累计计数正确，才记该 rank 通过。两对分别用同一混合误差阈值（超 0.01 的元素占比 ≤5%，最大混合误差 ≤0.1）。`cascade_vs_cpu` 仅作诊断。抽查时 CPU 仅覆盖所选 token，融合对小算子仍比较所有 token；正式 Q 需全 rank 全量通过。分阶段的两个独立 CPU 检查仅用于定位，最终以同一作业的直接比对验收。
+
 1. **定位 Case**。先读编号所在小节的固定配置，再用该行补齐拓扑、每卡 BS、TopK、量化精度、激活和加权位置。按该行的测试方法链接确定需运行的分支或对照臂。记录实际模型 JSON、路由和 seed。
 2. **固定运行环境**。按 UBX 或 950POD 方法选机器和入口。保留实际源码提交、构建补丁或源码归档、wheel SHA256、CANN / torch_npu 版本，以及逻辑 rank 和物理卡映射。同一 Case 的各臂用相同机器、配置和采集口径，输出目录按 Case、分支或臂、采集阶段分开。
 3. **先核对执行计划**。对 `run_megamoe.py` 入口先用 `"plan": true` 生成预览。UBX 的模型在 `config`，950POD 在 `spec`。核对 EP、后端、精度、每卡 BS、K、激活、加权和对照类型。950POD 还要逐节点核对 `node_rank`。直接用 `torchrun` 的方法先核对模型 JSON、节点参数、可用 NPU 数和端口。计划通过后，使用新目录执行正式作业。
@@ -57,6 +61,8 @@ for phase in phases:
     accuracy = phase in ("golden", "accuracy")
     args = dict(job, mode="accuracy" if accuracy else "perf",
                 dual_reference=accuracy, output_dir=str(root / phase))
+    if accuracy:
+        args["accuracy_cascade"] = "prefill"
     if case == "K37" and accuracy:
         args.update(golden_dir=str(root / "golden-cache"),
                     golden_only=phase == "golden", skip_golden=phase == "accuracy")
@@ -102,6 +108,8 @@ K37 用 [N 方法](#n-直接启动融合) 另采 timer。两组按[显存占用�
 ### 分平台 EP 验收矩阵
 
 UBX 和 950POD 各有 40 个模型配置，每个配置分别登记 EP4、EP8、EP16，共 240 组。另有 51 个 EP32 对照组。下表 K、D 的编号范围只含逐组表中列出的 A8W4、A8W8 用例。相同编号换平台或 EP 后单独归档，比较时固定每卡 BS、全局专家数、路由、精度和加权阶段。
+
+EP4、EP8、EP16 的全部 240 组均须登记当前分支融合与 `feat/roce-support` 同配置融合的性能对照状态，含两平台的 R、C、K、L、D。L 的两个激活臂分别登记。用例受限时逐项记录“不可比”或“待测”及依据。EP32 的 51 组保留本组既定验收项目，本轮新增的分支基线要求只覆盖小 EP。取数方法见[小 EP 分支性能对照](#小-ep-分支性能对照)。
 
 | 场景 | EP4 / EP8 / EP16 每平台每种 EP 的用例 | 每种 EP 两平台合计 | 原 EP32 | 合计 | 验收重点 |
 | --- | --- | ---: | ---: | ---: | --- |
@@ -156,6 +164,60 @@ python3 "$RUN" --run-config "$CFG"
 
 **已知边界。** 240 个小 EP 组合中有 140 组可生成实机阶段计划。L 组在 EP4 时每卡有 200 个专家，超过 native 上限 128，两平台四组保留为阻塞。EP8、EP16 分别是每卡 100、50 个专家。96 组小 EP 豆包用例在落实生产 `groupsize` 配置键和实际生效证据前保留为待接入。普通 MTE 的 A8W8 可以跑时延和精度，设备掩盖率待 timer 支持。950POD 小 EP 上的 SwiGLU 整批超过对称区容量时使用分窗。L04 的同窗性能见 `paired/paired.json`，独立两臂的实际窗口不同时，首窗掩盖率标为不可比。
 
+### 小 EP 分支性能对照
+
+以同一平台的 R01 EP8 为例，比较两个提交各自构建的融合算子。先在目标节点加载相同的 CANN、Torch 和 torch_npu 环境。下例在 950POD 的单机八卡运行，`OUT` 指本轮新的绝对目录。`FRAMEWORK_PY` 指已加载框架的 Python。基线 SHA 以本轮实际解析值为准。
+
+```bash
+set -euo pipefail
+CURRENT=$(pwd -P)
+OUT=$(mktemp -d /tmp/megamoe-R01-ep8-XXXXXX)
+FRAMEWORK_PY=$(command -v python3)
+git fetch origin feat/roce-support
+BASE_SHA=$(git rev-parse FETCH_HEAD)
+git worktree add --detach "$OUT/roce-src" "$BASE_SHA"
+for arm in current roce; do
+    src="$CURRENT"; if [ "$arm" = roce ]; then src="$OUT/roce-src"; fi
+    git -C "$src" rev-parse HEAD > "$OUT/$arm.commit"
+    git -C "$src" status --short > "$OUT/$arm.status"
+    "$FRAMEWORK_PY" -m venv --system-site-packages "$OUT/$arm-env"
+    py="$OUT/$arm-env/bin/python"
+    (cd "$src" && PYTHON="$py" bash experiments/megamoe/scripts/build.sh) 2>&1 | tee "$OUT/$arm.build.log"
+    wheel=$(sed -n 's/^\[BUILD\] Installed: //p' "$OUT/$arm.build.log")
+    sha256sum "$wheel" > "$OUT/$arm.wheel.sha256"
+done
+
+python3 "$CURRENT/experiments/megamoe/scripts/acceptance_cases.py" generate \
+    --machine 950pod --ep-size 8 --case R01 --phase perf --output "$OUT/job.json"
+jq '.config' "$OUT/job.json" > "$OUT/current.model.json"
+# 仅 R01 的这两个字段等于旧实现的固定语义，旧 schema 不接受字段名。
+jq -e 'select(.model.activation=="swiglu" and .model.mma_type=="fp8xfp4")
+       | del(.model.activation, .model.mma_type)' "$OUT/current.model.json" > "$OUT/roce.model.json"
+export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:29180
+cd "$OUT"
+for arm in current roce; do
+    # 默认使用各源码树的锁定 SDK，采用外部 SDK 时按该侧构建日志设置 SHMEM_ROOT。
+    src="$CURRENT"; if [ "$arm" = roce ]; then src="$OUT/roce-src"; fi
+    ( unset PYTHONPATH
+      export LD_LIBRARY_PATH="${SHMEM_ROOT:-$src/third-party/shmem/install/shmem}/lib:${LD_LIBRARY_PATH:-}"
+      py="$OUT/$arm-env/bin/python"
+      "$py" -I -c 'import sys,torch,torch_npu,deep_ep_experimental.megamoe._C as c; from pathlib import Path; print(c.__file__); assert Path(c.__file__).resolve().is_relative_to(sys.prefix)'
+      "$py" -m torch.distributed.run --nnodes=1 --nproc-per-node=8 --master-port=29181 \
+          --module deep_ep_experimental.megamoe.benchmark --config "$OUT/$arm.model.json" \
+          --input fp8 --routing balanced --mode perf --output-dir "$OUT/$arm-run"
+    )
+    p="$OUT/$arm-run/rank_0/bs_96/profiling.json"
+    jq '{kernel_us:.rank_max_mean_us, e2e_us:.host_e2e.rank_max_mean_us,
+         token_s:.host_e2e.global_input_tokens_per_second, rounds, recorded_rounds}' "$p"
+done
+```
+
+UBX 用相应提交的 UBX 构建环境；各侧分别安装由该提交生成的 wheel，包括多机的每一个节点。保留构建日志、wheel SHA256、各 rank 的实际包路径、`manifest.json` 及 `profiling.json` 或 `performance.json`。同一物理拓扑按顺序运行，固定每卡 BS、H/I/E/K、共享专家、激活、权重位置、量化、输入、路由与 seed，核对实际权重及路由生成方式。两边保持相同 warmup、iters、L2 刷新、生产参数和采样范围。L 组逐臂核对，D 组还要核对实际生效的 groupsize。
+
+按指标填两侧原值、单位、原始路径和加速比。时延加速比为基线时延 / 当前时延，吞吐比为当前吞吐 / 基线吞吐。同步 E2E 从公共 forward 开始到设备同步完成，每轮取最慢 rank，再对正式轮求平均。两分支默认通信后端不同也可在相同完整 forward 和同步口径下填写产品侧 E2E 与吞吐，同时列出两边实际 backend 和窗数。kernel、timer、掩盖率等仅在覆盖的设备工作、时间区间及 rank 聚合方式一致时计算比值。上例的旧版 MTE `profiling.json` 只有 kernel 统计的情况会显示空 E2E；独立按上述同步方法补采前，E2E 填“待测”。
+
+基线 `8a2e4736` 的旧入口默认 SwiGLU A8W4，UBX 产品自动选择 URMA（TopK 上限 8），950POD 走 MTE。每个用例依据实际基线 SHA 的能力核对。无法执行相同 GELU、TopK32、精度、容量或 groupsize 时，在该行填“不可比”、基线 SHA、配置与代码或失败日志，保留当前分支实测值。跨配置的运行、当前分支 wheel 的重复测量或单独的小算子计时均无法产生该行的分支融合基线。
+
 #### 小 EP 逐组结果登记
 
 每格对应一个独立用例。实测后将“待测”替换为本轮报告路径及已有的 Q/P/C/M/H 数值或缺项。标“原表”的格沿用下方原编号行的进度。L 按两臂记录，C 另记 Decode 对照，K 另记 Prefill 对照。
@@ -205,20 +267,20 @@ python3 "$RUN" --run-config "$CFG"
 
 ### 开测前确认
 
-先跑 R01–R07，再做覆盖和大用例。锁定三条分支的实际 commit、构建源码状态、wheel SHA256、CANN、torch_npu、物理卡映射和链路。级联比较入口也要包含在测试 wheel 中。
+先跑 R01–R07，再做覆盖和大用例。锁定各参与分支的实际 commit、构建源码状态、wheel SHA256、CANN、torch_npu、物理卡映射和链路。级联比较入口也要包含在测试 wheel 中。
 
 两侧共用模型几何、输入、路由、随机种子和采集范围。同一环境各方法使用独立输出目录。配置预览仅用于核对参数。各行分别标注已测臂、阻塞原因和待补指标，历史版本数据单列。
 
 ## 当前验收进度
 
-本分支共 291 组，均待本分支 wheel 的实机验收。下表保留已有构建的实测记录供对照。950POD 有 6 组可核对的融合性能（K37、K46、L04、L05、C01、C02），其中 K37 有 balanced 全量双参考，K37、K46、L04、L05 有正式性能轮的设备级 HBM 观察值。另有 C03 的性能转录和级联失败日志，以及 R01–R04 的历史分支对照。
+本分支共 291 组，均待本分支 wheel 的实机验收。下表保留已有构建的实测记录供对照。950POD 有 6 组可核对的融合性能（K37、K46、L04、L05、C01、C02），其中 K37 有旧口径 balanced 全量双参考，K37、K46、L04、L05 有正式性能轮的设备级 HBM 观察值。另有 C03 的性能转录和级联失败日志，以及 R01–R04 的历史分支对照。
 
 | 环境与范围 | 组数 | 已有结果 | 待验收事项 |
 | --- | ---: | --- | --- |
 | UBX EP16 · K01–K17 | 12 | 本轮无可绑定到编号的实机报告 | 全矩阵、K32 热点及零接收 rank |
 | UBX EP32 · K19–K35、L01/L02、D01–D23 | 30 | 本轮无可绑定到编号的实机报告 | 跨机融合、级联、大用例 A/B；豆包 16 组先落实生产 groupsize |
 | 950POD EP32 · R01–R07 | 7 | R01–R04 有历史分支对照 | 本轮同版本/同机回归；R05–R07 待 V4.1 真机数据 |
-| 950POD EP32 · K37–K53 | 12 | K37/K46 有融合 P、Torch 显存和 HBM 观察值，K37 的 balanced Q 通过 | K37 修复包 P/C/M/H、K32 压测、Prefill 对照及其余 10 组实测 |
+| 950POD EP32 · K37–K53 | 12 | K37/K46 有融合 P、Torch 显存和 HBM 观察值，K37 的旧口径 balanced Q 通过 | K37 新口径全量 Q、修复包 P/C/M/H、K32 压测、Prefill 对照及其余 10 组实测 |
 | 950POD EP32 · L04、L05 | 2 | 两组均有 A 臂融合 P、Torch 显存及 HBM 观察值，L04 历史同窗 A/B 达标 | 本轮同窗 A/B 性能与掩盖率、两臂全量 Q 和 GELU Prefill |
 | 950POD EP8 · C01–C03 | 3 | C01/C02 有融合 P 和 Torch 显存；C03 有用户回传值 | C03 融合原始报告、Decode 对照、三组 Q 和短时 HBM 复采 |
 | 两平台扩展拓扑 · 去重后新增 | 225 | 尚无新增拓扑的实机报告 | 按矩阵逐组执行，记录 P/C/Q/M/H 或对应阻塞 |
@@ -246,7 +308,7 @@ C03（GELU 后加权 A8W8）首轮交接记录为 kernel 271 µs、E2E 1.167 ms�
 
 ### 950POD 精度结果
 
-各行均为 balanced 路由下的全量双参考，融合/NPU 精度级联对 CPU Golden。各有 32/32 rank 通过，输出全为有限值，融合和级联的专家计数均与 Golden 一致。
+各行均为历史 Q，使用 balanced 路由及当时的级联误差预算。此前 32/32 rank 通过，输出全为有限值，融合和旧精度级联的专家计数均与 Golden 一致。K37 的新口径 Q 仍待以相同配置重跑融合对 CPU 和融合对 Prefill 两项直接比较。
 
 | Case | 版本 / 实际窗口 | 每卡 / 全组校验 token | 修复前失败 rank | 融合对 CPU 最大绝对误差 | bad_elements |
 | --- | --- | ---: | --- | ---: | ---: |
@@ -308,7 +370,7 @@ python3 "$RUN" --run-config "$RUN_JSON"
 
 ### U 原生融合
 
-从 case 填写运行 JSON 的 precision、output_dir、routing 和内嵌 config。将 H、I、E、K、S 依次填入 config.model 的 hidden、intermediate_hidden、num_experts、num_topk、num_shared_experts。实际 BS 写入 config.bs_values，并设置 activation 和 topk_weights_type。去掉会覆盖这些值的旧字段。plan=true 可先核对预览，正式执行时设为 false。性能设 mode=perf、timer=false。精度另用 mode=accuracy、dual_reference=true，正式精度 check_tokens=0。
+从 case 填写运行 JSON 的 precision、output_dir、routing 和内嵌 config。将 H、I、E、K、S 依次填入 config.model 的 hidden、intermediate_hidden、num_experts、num_topk、num_shared_experts。实际 BS 写入 config.bs_values，并设置 activation 和 topk_weights_type。去掉会覆盖这些值的旧字段。plan=true 可先核对预览，正式执行时设为 false。性能设 mode=perf、timer=false。精度另用 mode=accuracy、dual_reference=true，正式精度 check_tokens=0，C01–C03 的 accuracy_cascade=decode，其他用例为 prefill。
 
 ### T 通信打点
 
@@ -346,7 +408,7 @@ RUN=experiments/megamoe/scripts/run_megamoe.py
 
 ### W 配置文件入口
 
-复制 950pod_target.json，按 case 填 model、BS、EP、precision、node_rank 和 output_dir。用 mode=perf 或 mode=accuracy 分开启动，后者设 dual_reference=true。对 GELU Prefill 另开 perf 作业并加 --compare-prefill-cascade。P8 Decode 另开 perf 作业并加 --compare-decode-cascade。
+复制 950pod_target.json，按 case 填 model、BS、EP、precision、node_rank 和 output_dir。用 mode=perf 或 mode=accuracy 分开启动，后者设 dual_reference=true，C01–C03 另设 accuracy_cascade=decode，其余设 prefill。对 GELU Prefill 另开 perf 作业并加 --compare-prefill-cascade。P8 Decode 另开 perf 作业并加 --compare-decode-cascade。
 
 ```bash
 python3 "$RUN" --run-config "$RUN_JSON"
@@ -501,11 +563,11 @@ Case 表的 **P / C / Q / M / H** 分别对应性能、通信、精度、显存�
 | C 通信 | Dispatch、Combine、总掩盖率（%），有效带宽（GB/s）及字节和时间口径。 | 独立打点。仅比较相同后端、事件范围和采样 rank 的结果。分子为通信与计算交集，分母为通信时长。总通信先合并两段区间，再计算占比。级联有可比独立 trace 时另记。 |
 | M 显存 | 每卡常驻量、整卡采样峰值（GiB、%）、峰值 rank、最小余量和有效卡数。另记 PyTorch allocated/reserved 峰值、workspace、对称缓冲区。 | 按[显存复测](#ubx-与-950pod-显存复测)读取各 Case 的 resources.json。分臂比较使用独立作业，级联对照的共驻值单列。 |
 | H 显存带宽 | 记录单卡 HBM 读、写及同一时段读写合计（GB/s），注明有效 rank 数、正式轮次及采样范围。 | 从设备 HBM 计数器取数。分臂汇总有效卡均值，附单卡值；容量、通信 payload 带宽另填 M、C。[采集方法](#hbm-显存带宽采集) |
-| Q 精度 | 通过 rank 数、校验 token 数、最大误差、专家计数及最终结论。 | 独立运行 accuracy。当前融合与 CPU Golden、独立 NPU 精度级联按 --dual-reference 误差预算比较。所有 rank 的 `passed`、`finite`、`counts_equal` 和 `cascade_counts_equal` 均通过，另记 `checked_tokens`、`bad_elements` 和融合对 CPU 的 `max_abs_error`。保存三方指标。 |
+| Q 精度 | 参考路径、通过 rank 数、实查 token 数、两项直接比对、专家计数及结论。 | 在直接双参考作业中分别登记 `fused_vs_cpu` 和 `fused_vs_cascade` 的 `passed`、`bad_elements`、`max_abs_error`、`max_mixed_error`。检查每个 rank 的 `passed`、`finite`、`counts_equal`、`cascade_counts_equal`、`cumulative_counts_equal` 和 `checked_tokens`。另存 `cascade_vs_cpu` 的诊断值。 |
 
 ### 950POD 设备数据采集
 
-Q 先按以下命令预生成 Golden。RANKS 是本节点的全局 rank 范围，EP 是总 rank 数。将 N 命令改为 --mode accuracy，追加 --dual-reference --golden-dir "$GOLDEN" --check-tokens 0。旧分支按自身已提供的参数执行。
+Q 先按以下命令预生成 Golden。RANKS 是本节点的全局 rank 范围，EP 是总 rank 数。将 N 命令改为 `--mode accuracy`，追加 `--dual-reference --accuracy-cascade "$KIND" --golden-dir "$GOLDEN" --check-tokens 0`。C01–C03 取 `KIND=decode`，其他用例取 `KIND=prefill`。
 
 ```bash
 "$PY" -m "$MOD.golden" --config "$CFG" --ep-size "$EP" --ranks "$RANKS" \
@@ -536,19 +598,19 @@ V4 Pro 取 H7168、I3072、E384、K6。V4.1 取 H5120、I2304、E384、K6。全�
 
 | Case | 模型或 BS | 变量和精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 | H 显存带宽 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `R01` | V4 Pro · BS96 | S0 · A8W4 | [N](#n-直接启动融合) · main / roce / 当前 | [历史对照](#历史分支对照)有 P/C · 本轮待测 | Q 待测 · M 待测 | 待采 |
-| `R02` | V4 Pro · BS96 | S1 · A8W4 | [N](#n-直接启动融合) · main / roce / 当前 | [历史对照](#历史分支对照)有 P/C · 本轮待测 | Q 待测 · M 待测 | 待采 |
-| `R03` | V4 Pro · BS4096 | S0 · A8W4 | [N](#n-直接启动融合) · main / roce / 当前 | [历史对照](#历史分支对照)有 P/C · 本轮待测 | Q 待测 · M 待测 | 待采 |
-| `R04` | V4 Pro · BS4096 | S1 · A8W4 | [N](#n-直接启动融合) · main / roce / 当前 | [历史对照](#历史分支对照)有 P/C · 本轮待测 | Q 待测 · M 待测 | 待采 |
-| `R05` | V4.1 · BS8192 | S1 · A8W4 | [N](#n-直接启动融合) · roce / 当前 | P 待测 · C 待测 | Q 待测 · M 待测 | 待采 |
-| `R06` | V4.1 · BS12288 | S1 · A8W4 | [N](#n-直接启动融合) · roce / 当前 | P 待测 · C 待测 | Q 待测 · M 待测 | 待采 |
-| `R07` | V4.1 · BS16384 | S1 · A8W4 | [N](#n-直接启动融合) · roce / 当前 · 核对分窗 | P 待测 · C 待测 | Q 待测 · M 待测 | 待采 |
+| `R01` | V4 Pro · BS96 | S0 · A8W4 | [N](#n-直接启动融合) · 当前融合，另附历史分支结果 | [历史对照](#历史分支对照)有 P/C · 本轮待测 | Q 待测 · M 待测 | 待采 |
+| `R02` | V4 Pro · BS96 | S1 · A8W4 | [N](#n-直接启动融合) · 当前融合，另附历史分支结果 | [历史对照](#历史分支对照)有 P/C · 本轮待测 | Q 待测 · M 待测 | 待采 |
+| `R03` | V4 Pro · BS4096 | S0 · A8W4 | [N](#n-直接启动融合) · 当前融合，另附历史分支结果 | [历史对照](#历史分支对照)有 P/C · 本轮待测 | Q 待测 · M 待测 | 待采 |
+| `R04` | V4 Pro · BS4096 | S1 · A8W4 | [N](#n-直接启动融合) · 当前融合，另附历史分支结果 | [历史对照](#历史分支对照)有 P/C · 本轮待测 | Q 待测 · M 待测 | 待采 |
+| `R05` | V4.1 · BS8192 | S1 · A8W4 | [N](#n-直接启动融合) · 当前融合 | P 待测 · C 待测 | Q 待测 · M 待测 | 待采 |
+| `R06` | V4.1 · BS12288 | S1 · A8W4 | [N](#n-直接启动融合) · 当前融合 | P 待测 · C 待测 | Q 待测 · M 待测 | 待采 |
+| `R07` | V4.1 · BS16384 | S1 · A8W4 | [N](#n-直接启动融合) · 当前融合 · 核对分窗 | P 待测 · C 待测 | Q 待测 · M 待测 | 待采 |
 
-roce 表示 feat/roce-support。两个旧分支的运行包和日志分别归档。R07 先核实旧分支 BS16384 的原生容量和可比分窗。旧分支缺同步 E2E 时，用同口径独立调用计时补齐。
+EP32 的 R 组保留 main、feat/roce-support 的历史结果供追溯。EP4/8/16 的 R 组按本轮基线另测；R07 先核实旧分支 BS16384 的原生容量和分窗。
 
 ### Decode 级联
 
-固定 BS96、H3584、I1280、E384、K8、S0、后加权。用 P8 的 W 方法加 --compare-decode-cascade。Q 仍按当前分支双参考流程另测。
+固定 BS96、H3584、I1280、E384、K8、S0、后加权。用 P8 的 W 方法加 --compare-decode-cascade。Q 单独运行 mode=accuracy、dual_reference=true、accuracy_cascade=decode，并登记融合对 CPU、融合对 Decode 的两项结果。
 
 | Case | 模型或 BS | 变量和精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 | H 显存带宽 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -606,7 +668,7 @@ C03 的级联 GMM1 使用 CANN GroupedMatmulActivationQuant 与 GELU tanh。融�
 
 | Case | TopK | 激活和加权 | 精度 | 执行方法和对照 | P 性能与 C 通信 | Q 精度与 M 显存 | H 显存带宽 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `K37` | 25 | GELU 后加权 | A8W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | 修复前 [融合实测](#950pod-本轮融合性能和显存占用)，修复包 P/C 待测 · Prefill 阻塞 | [全量 Q](#950pod-精度结果) 32/32 · M 有旧包 Torch 峰值，修复包待采 | [HBM 观察](#正式性能轮内的-hbm-带宽)（旧包 27/32 卡） |
+| `K37` | 25 | GELU 后加权 | A8W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | 修复前 [融合实测](#950pod-本轮融合性能和显存占用)，修复包 P/C 待测 · Prefill 阻塞 | [旧口径全量 Q](#950pod-精度结果) 32/32，新 Q 待测 · M 有旧包 Torch 峰值，修复包待采 | [HBM 观察](#正式性能轮内的-hbm-带宽)（旧包 27/32 卡） |
 | `K38` | 25 | GELU 后加权 | A8W8 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |
 | `K40` | 25 | GELU 提前加权 | A8W4 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待测 | Q 待测 · M 待分臂采 | 待采 |
 | `K41` | 25 | GELU 提前加权 | A8W8 | [N](#n-直接启动融合) / [W](#w-配置文件入口) · 融合 / Prefill 级联 | P 待测 · C 待 timer | Q 待测 · M 待分臂采 | 待采 |

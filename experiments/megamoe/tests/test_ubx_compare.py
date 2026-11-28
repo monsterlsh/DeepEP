@@ -173,7 +173,7 @@ def test_ep32_compare_forwards_arm_scope_and_topk_to_both_nodes(tmp_path, monkey
         assert args.window_tokens == 128
         events.append((args.perf_scope, model["activation"], args.node_rank))
 
-    def run_stage(label, scripts, logs, *, ssh_target, ssh_port):
+    def run_stage(label, scripts, logs, *, ssh_target, ssh_port, ssh_connect_timeout):
         assert ssh_target == "tester@192.0.2.2"
         assert set(scripts) == set(logs) == {0, 1}
         for script in scripts.values():

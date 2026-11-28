@@ -73,12 +73,12 @@ for cfg in "$RUN"/smoke-k*.json; do
     args=(--config "$cfg" --input fp8 --routing "$route" --golden-dir "$RUN/golden")
     python -m "$MOD.golden" "${args[@]}" --ep-size "$LOCAL_RANKS" --ranks "0-$((LOCAL_RANKS-1))" --workers 2
     python -m torch.distributed.run --nnodes=1 --nproc-per-node="$LOCAL_RANKS" --master-port=29181 \
-      -m "$MOD.benchmark" "${args[@]}" --mode accuracy --dual-reference --output-dir "$RUN/$(basename "$cfg" .json)-$route"
+      -m "$MOD.benchmark" "${args[@]}" --mode accuracy --dual-reference --accuracy-cascade prefill --output-dir "$RUN/$(basename "$cfg" .json)-$route"
   done
 done
 ```
 
-每个 `rank_<r>/bs_<B>/accuracy.json` 都包含全组报告。`--dual-reference` 将融合算子、独立 NPU 级联和 CPU Golden 的结果按仓库既有误差预算比较。检查所有条目的 `passed`、`finite`、`counts_equal`、`cascade_counts_equal`、`checked_tokens` 及 `triangle_metrics`。默认 `--check-tokens 0` 检查全部行；抽查时 Golden 和 benchmark 要使用同一正整数，输出全量有限值与逐专家计数仍须通过。输出目录每次用新名字，Golden 可复用。精度模式另可加 `--timer` 对比打点前后的输出。
+每个 `rank_<r>/bs_<B>/accuracy.json` 都包含全组报告。上例核对 `policy=direct_dual_reference` 和 `reference_kind=prefill`。每个 rank 的融合输出须分别通过 CPU Golden 和相同输入下的 Prefill 小算子直接比对，并满足全量有限值、逐专家计数及累计计数检查。正式验收设 `--check-tokens 0`；抽查时 CPU Golden 与 benchmark 使用同一抽样数，融合对小算子仍比较所有行。矩阵中的 C01–C03 要指定 `--accuracy-cascade decode`。报告判据和小 EP 分支基线见[转测清单](megamoe-topk32-gelu-test-checklist.md#测试验证与复现方法)。
 
 ## EP32 验收清单
 
@@ -87,7 +87,7 @@ done
 | 检查 | 判据或读数 |
 | --- | --- |
 | 拓扑与用例 | 收齐所有 rank 的 `manifest.json`。核对 `ep_size`、`backend`、激活、加权位置和 `mma_type`。MTE+RoCE 应报告 `device_communication=shmem_mte_roce`。 |
-| 精度与计数 | `accuracy.json` 中所有 rank 的 `passed`、`finite`、`counts_equal` 通过。启用双参考时再检查 `cascade_counts_equal` 与 `triangle_metrics`。全量 EP32/K25 均衡用例每卡 25 个专家各接收 39,280 次。 |
+| 精度与计数 | 双参考报告中所有 rank 的 `fused_vs_cpu.passed`、`fused_vs_cascade.passed`、`finite`、`counts_equal`、`cascade_counts_equal`、`cumulative_counts_equal` 与总 `passed` 全部为真。全量 EP32/K25 均衡用例每卡 25 个专家各接收 39,280 次。 |
 | 内存与分窗 | 从 `resources.json` 记录 `symmetric_buffer_bytes`、`workspace_bytes`、分配器峰值及设备剩余显存。从 manifest 核对每次 forward 的窗数。例如 B39280、W256 对应 153 个满窗和 112 行尾窗。 |
 | 端到端 | 使用各轮最慢 rank 的同步时延 `host_e2e.rank_max_mean_us`。集群输入吞吐为 `EP × B × 10⁶ / 时延（µs）`。kernel 总时长另列。 |
 | A/B 与掩盖率 | URMA 使用同一精度、窗口、路由和采样 rank 的 `comparison.json`。成对端到端时延比中位数 A/B ≤ 1，总通信首窗掩盖率 A ≥ B。分列 Dispatch 和 Combine。MTE 系列的正式性能单列并标明后端。 |
@@ -95,6 +95,8 @@ done
 按每种拓扑、激活、精度、K、B 和路由各保留一行结果，附运行 JSON、wheel 摘要、各节点原始目录、通过 rank 数、全量或抽查数量、窗口和性能数据。跨机失败时先查首个错误 rank 的日志、引导地址、网络绑定和实际使用的 wheel。
 
 ## 历次实测记录
+
+下列精度结果沿用各次构建当时的参考实现和判据。当前直接双参考 Q 需另跑并保存两项逐 rank 的比对结果。
 
 2026-11-20 B05 构建日志记录的 wheel SHA-256 为 `3a07b4ae9f6e7bb7726203f4b879d1ce0f0ba0a0b86c81ab41e3caae643273ca`。该轮记录止于编译，下列数据属于各自注明的较早构建。
 

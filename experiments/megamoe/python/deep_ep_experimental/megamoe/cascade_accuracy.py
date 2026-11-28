@@ -6,10 +6,20 @@ from contextlib import nullcontext
 import json
 
 
+def make_accuracy_cascade(kind, model, raw, shared, group):
+    if kind == "decode":
+        from .decode_cascade import DecodeCascade
+        return DecodeCascade(model, raw, host_group=group)
+    if kind == "prefill":
+        from .prefill_cascade import PrefillCascade
+        return PrefillCascade(model, raw, shared, host_group=group)
+    raise ValueError(f"Unknown accuracy cascade: {kind}")
+
+
 def run_cascade_accuracy(args, config, group, rank_dir, sample_peak):
     import torch
     from .benchmark import accuracy, copy_quantized_input, inputs, routed_weights
-    from .cascade import CascadeReference, init_process_group
+    from .cascade import init_process_group
     from .device_memory import DeviceMemorySampler, combine_device_memory_samples, summarize_device_memory_peaks
     from .reference import make_weights
 
@@ -28,7 +38,8 @@ def run_cascade_accuracy(args, config, group, rank_dir, sample_peak):
             shared = make_weights(model["num_shared_experts"], hidden,
                                   model.get("shared_intermediate_hidden", model["intermediate_hidden"]),
                                   config["seed"] + 100000, model.get("activation", "swiglu"))
-        reference = CascadeReference(model, routed_weights(config, world, rank), shared, host_group=group)
+        kind = getattr(args, "accuracy_cascade", None) or "prefill"
+        reference = make_accuracy_cascade(kind, model, routed_weights(config, world, rank), shared, group)
         del shared
     for bs in config["bs_values"]:
         case = rank_dir / f"bs_{bs}"
@@ -45,8 +56,10 @@ def run_cascade_accuracy(args, config, group, rank_dir, sample_peak):
                 quantized = (data, scales)
                 del data, scales
             del x
-            output, counts = reference.forward(activation, torch.from_numpy(ids).npu(), torch.from_numpy(weights).npu(),
-                                               input_kind=args.input, quantized=quantized)
+            output, counts = reference.forward_with_counts(
+                activation, torch.from_numpy(ids).npu(), torch.from_numpy(weights).npu(),
+                input_kind=args.input, quantized=quantized,
+            )
             torch.npu.synchronize()
         if sample_peak:
             peak = combine_device_memory_samples([setup.report(), measurement.report()])
